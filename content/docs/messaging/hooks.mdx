@@ -1,0 +1,218 @@
+---
+title: Lifecycle Hooks
+description: Intercept key moments in the event lifecycle — before dispatch, before send, before consume, and after consume — using PHP attributes.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Lifecycle Hooks
+
+Lifecycle hooks let you intercept specific moments in the event processing pipeline without modifying the framework or adding middleware. Each hook type fires at a precise point — on the producer side, on the consumer side, or both.
+
+## Hook Types
+
+| Attribute | Fires | Side |
+|---|---|---|
+| `#[BeforeDispatch]` | Before `EventBus` routes the event | Producer (backend) |
+| `#[AfterDispatch]` | After `EventBus` completes (or fails) | Producer (backend) |
+| `#[PreSend]` | Before the event is produced to Kafka | Producer (backend) |
+| `#[BeforeConsume]` | Before the handler runs | Consumer (worker) |
+| `#[AfterConsume]` | After the handler runs (or fails) | Consumer (worker) |
+
+## How Discovery Works
+
+At container compile time, `HookDiscoveryCompilerPass` scans all services tagged `tekton.hook`. The tag is applied automatically by `MessagingExtension` to any class with a hook attribute. The pass builds an array of hook descriptors keyed by hook type, stores them in the `tekton.hooks` container parameter, and populates `tekton.hook_locator` with the actual service references.
+
+At runtime, `HookRegistry` reconstructs typed `HookDescriptor` objects from the stored arrays. `HookRunner` reads from the registry and invokes hooks at the correct moment.
+
+<Callout type="info" title="Zero Runtime Overhead">
+All discovery and wiring happens at compile time. At runtime, `HookRunner` just reads a pre-built array and calls services — no reflection, no scanning.
+</Callout>
+
+## Writing a Hook
+
+A hook is a class with one or more hook attributes and an `__invoke` method:
+
+```php
+use Fortizan\Tekton\Messaging\Contract\DomainEventInterface;
+use Fortizan\Tekton\Messaging\Hook\Attribute\BeforeDispatch;
+use Psr\Log\LoggerInterface;
+
+#[BeforeDispatch]
+final class AuditDispatchHook
+{
+    public function __construct(
+        private LoggerInterface $logger
+    ) {}
+
+    public function __invoke(DomainEventInterface $event): void
+    {
+        $this->logger->info('Event dispatching', [
+            'event' => get_class($event),
+        ]);
+    }
+}
+```
+
+No registration needed. Tekton discovers it automatically.
+
+## Hook Signatures
+
+Each hook type receives different arguments:
+
+<Tabs items={['BeforeDispatch', 'AfterDispatch', 'PreSend', 'BeforeConsume', 'AfterConsume']}>
+
+<Tab value="BeforeDispatch">
+```php
+#[BeforeDispatch]
+final class MyHook
+{
+    public function __invoke(DomainEventInterface $event): void
+    {
+        // fires before EventBus routes the event
+    }
+}
+```
+</Tab>
+
+<Tab value="AfterDispatch">
+```php
+#[AfterDispatch]
+final class MyHook
+{
+    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    {
+        // $throwable is null on success, contains exception on failure
+        if ($throwable !== null) {
+            // dispatch failed
+        }
+    }
+}
+```
+</Tab>
+
+<Tab value="PreSend">
+```php
+#[PreSend]
+final class MyHook
+{
+    public function __invoke(DomainEventInterface $event, array &$headers): void
+    {
+        // fires just before producing to Kafka
+        // $headers is passed by reference — you can add/modify headers
+        $headers['x-tenant-id'] = TenantContext::current();
+    }
+}
+```
+</Tab>
+
+<Tab value="BeforeConsume">
+```php
+#[BeforeConsume]
+final class MyHook
+{
+    public function __invoke(DomainEventInterface $event): void
+    {
+        // fires in the worker, before the handler runs
+    }
+}
+```
+</Tab>
+
+<Tab value="AfterConsume">
+```php
+#[AfterConsume]
+final class MyHook
+{
+    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    {
+        // fires after the handler completes or fails
+        // $throwable is null on success
+    }
+}
+```
+</Tab>
+
+</Tabs>
+
+## Filtering by Event or Consumer
+
+Hooks fire for all events by default. You can narrow scope using `event` and `consumer` filters:
+
+```php
+// only fires for UserRegisteredEvent
+#[BeforeDispatch(event: UserRegisteredEvent::class)]
+final class UserRegistrationAuditHook
+{
+    public function __invoke(DomainEventInterface $event): void {}
+}
+
+// only fires for handlers in the 'orders' consumer
+#[BeforeConsume(consumer: 'orders')]
+final class OrderConsumerHook
+{
+    public function __invoke(DomainEventInterface $event): void {}
+}
+
+// only fires on failure
+#[AfterConsume(onFailureOnly: true)]
+final class FailureAlertHook
+{
+    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    {
+        // alert your on-call team
+    }
+}
+```
+
+## Priority
+
+Multiple hooks of the same type run in priority order — higher priority runs first:
+
+```php
+#[BeforeDispatch(priority: 100)]
+final class FirstHook { ... }
+
+#[BeforeDispatch(priority: 50)]
+final class SecondHook { ... }
+```
+
+## Error Isolation
+
+Hook failures never crash the pipeline. Each hook invocation is wrapped individually — if one hook throws, the error is logged and the next hook continues:
+
+```
+BeforeDispatch hooks
+    ├── AuditHook::__invoke() → throws → logged, continues
+    ├── TracingHook::__invoke() → succeeds
+    └── MetricsHook::__invoke() → succeeds
+
+EventBus routing continues normally
+```
+
+This prevents a broken hook from blocking event dispatch or handler execution.
+
+## Execution Order in the Full Pipeline
+
+```
+EventBus::dispatch(event)
+    │
+    ├── [BeforeDispatch hooks]
+    │
+    ├── Route to producer
+    │       └── [PreSend hooks]  ← modify headers here
+    │               └── produce to Kafka / write to outbox
+    │
+    └── [AfterDispatch hooks]
+
+Worker ConsumerRunner
+    │
+    ├── Deserialize event
+    │
+    ├── [BeforeConsume hooks]
+    │
+    ├── MiddlewareStack → Handler::__invoke()
+    │
+    └── [AfterConsume hooks]
+```

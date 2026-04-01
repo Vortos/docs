@@ -1,0 +1,240 @@
+---
+title: Transports
+description: Define Kafka topics, connection settings, and security configuration using Tekton's fluent transport API.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Transports
+
+A **transport** is the connection between your application and a Kafka broker. It describes the topic name, broker address, partition count, replication factor, and optional security settings. Transports are pure configuration — they hold no runtime state and perform no I/O.
+
+## How It Works
+
+At container compile time, Tekton scans your codebase for classes marked with `#[MessagingConfig]`. Inside those classes, any method marked with `#[RegisterTransport]` is called via reflection, and the returned definition is registered in the `TransportRegistry`. By the time your application boots, every transport is fully resolved and available.
+
+```
+Container compile time
+    │
+    ▼
+MessagingConfigCompilerPass
+    ├── Finds all classes with #[MessagingConfig]
+    ├── Calls each #[RegisterTransport] method
+    └── Registers returned definitions in TransportRegistry
+
+Runtime
+    │
+    ▼
+KafkaProducerFactory / KafkaConsumerFactory
+    └── Reads from TransportRegistry to build RdKafka connections
+```
+
+<Callout type="info" title="Compile-time Validation">
+Tekton validates all transport references at container compile time. If a producer references a transport that doesn't exist, or a consumer references a transport that has no matching definition, the application will **refuse to boot** with a clear error message. Misconfiguration is caught before any code runs.
+</Callout>
+
+## Defining a Transport
+
+Create a class anywhere in your `src/` directory, mark it with `#[MessagingConfig]`, and add a method returning a `KafkaTransportDefinition`:
+
+```php
+use Fortizan\Tekton\Messaging\Attribute\MessagingConfig;
+use Fortizan\Tekton\Messaging\Attribute\RegisterTransport;
+use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
+
+#[MessagingConfig]
+final class OrderMessagingConfig
+{
+    #[RegisterTransport]
+    public function ordersTransport(): KafkaTransportDefinition
+    {
+        return KafkaTransportDefinition::create('orders.placed')
+            ->dsn('kafka://kafka:9092')
+            ->topic('orders.placed')
+            ->partitions(12)
+            ->replicationFactor(3);
+    }
+}
+```
+
+The string passed to `create()` is the **transport name** — the unique identifier used everywhere else in your config (producers, consumers, handlers). It must be unique across your entire application.
+
+## Configuration Reference
+
+### `create(string $name)`
+
+The transport name. Used as the lookup key in `TransportRegistry`. Must be unique.
+
+### `dsn(string $dsn)`
+
+The Kafka broker connection string. Format: `kafka://host:port`. For multiple brokers: `kafka://broker1:9092,broker2:9092`.
+
+### `topic(string $topic)`
+
+The Kafka topic name this transport reads from and writes to.
+
+<Callout type="warn" title="Topic Naming">
+Kafka topic names with both `.` and `_` characters can cause metric name collisions. Use one convention consistently — prefer `.` for namespacing (e.g. `orders.placed`) or `_` for word separation, but not both in the same name.
+</Callout>
+
+### `partitions(int $count)`
+
+Number of partitions for this topic. Controls maximum consumer parallelism — you cannot have more active consumers than partitions. Common production values:
+
+- **3** — small to medium throughput, good for most services
+- **12** — high throughput, allows up to 12 parallel consumer processes
+- **24+** — very high throughput, used for global event streams
+
+This setting only affects topic **provisioning** — it has no effect on existing topics.
+
+### `replicationFactor(int $count)`
+
+How many Kafka brokers hold a copy of this topic's data. Must be ≤ number of brokers in your cluster.
+
+- **1** — development and single-broker setups only
+- **3** — standard production setting, tolerates one broker failure
+
+### `serializer(string $format)`
+
+Wire format for serializing events on this transport. Defaults to `'json'`. Other values (`'avro'`, `'protobuf'`) require a matching `SerializerInterface` implementation registered in your container.
+
+## Security Configuration
+
+For production Kafka clusters that require authentication, use SASL and SSL:
+
+<Tabs items={['SASL Plain', 'SASL SCRAM', 'SSL + SASL']}>
+
+<Tab value="SASL Plain">
+```php
+use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+
+#[RegisterTransport]
+public function ordersTransport(): KafkaTransportDefinition
+{
+    return KafkaTransportDefinition::create('orders.placed')
+        ->dsn('kafka://broker:9092')
+        ->topic('orders.placed')
+        ->security(SaslConfig::plain('username', 'password'));
+}
+```
+</Tab>
+
+<Tab value="SASL SCRAM">
+```php
+use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+
+#[RegisterTransport]
+public function ordersTransport(): KafkaTransportDefinition
+{
+    return KafkaTransportDefinition::create('orders.placed')
+        ->dsn('kafka://broker:9092')
+        ->topic('orders.placed')
+        ->security(SaslConfig::scramSha256('username', 'password'));
+        // or: SaslConfig::scramSha512('username', 'password')
+}
+```
+</Tab>
+
+<Tab value="SSL + SASL">
+```php
+use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SslConfig;
+
+#[RegisterTransport]
+public function ordersTransport(): KafkaTransportDefinition
+{
+    return KafkaTransportDefinition::create('orders.placed')
+        ->dsn('kafka://broker:9092')
+        ->topic('orders.placed')
+        ->security(SaslConfig::scramSha256('username', 'password'))
+        ->ssl(SslConfig::fromFiles(
+            caLocation: '/etc/ssl/ca.pem',
+            certificateLocation: '/etc/ssl/client.pem',
+            keyLocation: '/etc/ssl/client.key',
+        ));
+}
+```
+</Tab>
+
+</Tabs>
+
+## Multiple Transports
+
+A single `#[MessagingConfig]` class can register as many transports as needed. It is conventional to group transports by bounded context:
+
+```php
+#[MessagingConfig]
+final class OrderMessagingConfig
+{
+    #[RegisterTransport]
+    public function ordersPlacedTransport(): KafkaTransportDefinition
+    {
+        return KafkaTransportDefinition::create('orders.placed')
+            ->dsn($_ENV['KAFKA_DSN'])
+            ->topic('orders.placed')
+            ->partitions(12)
+            ->replicationFactor(3);
+    }
+
+    #[RegisterTransport]
+    public function ordersDlqTransport(): KafkaTransportDefinition
+    {
+        return KafkaTransportDefinition::create('orders.placed.dlq')
+            ->dsn($_ENV['KAFKA_DSN'])
+            ->topic('orders.placed.dlq')
+            ->partitions(3)
+            ->replicationFactor(3);
+    }
+}
+```
+
+## Listing Registered Transports
+
+To inspect what transports are registered in your running application:
+
+```bash
+php bin/console tekton:transports:list
+```
+
+Example output:
+
+```
+Found 2 transport(s).
+
+▶ orders.placed
+  DSN:        kafka://kafka:9092
+  Topic:      orders.placed
+  Serializer: json
+  Producers (1):
+    - orders.placed
+
+▶ orders.placed.dlq
+  DSN:        kafka://kafka:9092
+  Topic:      orders.placed.dlq
+  Serializer: json
+  Producers:  none
+```
+
+## Environment-Based Configuration
+
+Use PHP's `$_ENV` to avoid hardcoding broker addresses:
+
+```php
+#[RegisterTransport]
+public function ordersTransport(): KafkaTransportDefinition
+{
+    return KafkaTransportDefinition::create('orders.placed')
+        ->dsn('kafka://' . $_ENV['KAFKA_BROKERS'])
+        ->topic('orders.placed')
+        ->partitions(12)
+        ->replicationFactor(3);
+}
+```
+
+With `.env`:
+
+```ini
+KAFKA_BROKERS=kafka:9092
+```

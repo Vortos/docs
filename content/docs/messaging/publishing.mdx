@@ -1,0 +1,188 @@
+---
+title: Publishing Events
+description: Dispatch domain events through the Tekton EventBus — automatic stamping, routing, outbox, and direct Kafka production.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Publishing Events
+
+The `EventBusInterface` is your single entry point for dispatching domain events. It handles routing, stamping, serialization, and broker delivery automatically. Your domain code never touches Kafka directly.
+
+## The EventBus Contract
+
+```php
+interface EventBusInterface
+{
+    public function dispatch(DomainEventInterface $event): void;
+    public function dispatchBatch(DomainEventInterface ...$events): void;
+}
+```
+
+Inject it anywhere in your application layer:
+
+```php
+use Fortizan\Tekton\Messaging\Contract\EventBusInterface;
+
+final class RegisterUserHandler
+{
+    public function __construct(
+        private readonly EventBusInterface $eventBus,
+    ) {}
+
+    public function handle(RegisterUserCommand $command): void
+    {
+        $user = User::register($command->email, $command->name);
+
+        // persist user...
+
+        $this->eventBus->dispatch(new UserRegisteredEvent(
+            id: $user->id(),
+            email: $user->email(),
+        ));
+    }
+}
+```
+
+<Callout type="info" title="Domain Purity">
+Your domain event classes implement `DomainEventInterface` — an empty marker interface. They carry no infrastructure concern. They are plain PHP objects with constructor-promoted properties.
+</Callout>
+
+## What Happens on Dispatch
+
+When you call `$eventBus->dispatch($event)`, the following happens in order:
+
+**1. Stamping**
+
+The event is wrapped in a Symfony Messenger `Envelope` and stamped with:
+
+- `EventIdStamp` — a unique hex ID (`bin2hex(random_bytes(16))`) identifying this specific dispatch
+- `TimestampStamp` — the current `DateTimeImmutable`
+- `CorrelationIdStamp` — pulled from the current trace context if a distributed trace is active, or freshly generated
+
+**2. Hook execution**
+
+`HookRunner::runBeforeDispatch()` fires all `#[BeforeDispatch]` hooks registered in your application.
+
+**3. Internal handler check**
+
+The `HandlerRegistry` is checked for handlers registered to any consumer that handles this event class. If handlers exist and the consumer has no external transport, the event is dispatched in-process via Symfony Messenger.
+
+**4. Producer routing**
+
+The `eventProducerMap` (built at compile time from your `#[RegisterProducer]` definitions) is checked for a producer registered for this event class. If found:
+
+- **Outbox enabled** → `OutboxInterface::store()` is called, writing the event to the `tekton_outbox` database table inside your current transaction. The `OutboxRelayWorker` picks it up asynchronously and produces to Kafka.
+- **Outbox disabled** → `ProducerInterface::produce()` is called directly, sending the event to Kafka immediately.
+
+**5. Warning**
+
+If no handlers and no producer are found, a warning is logged. This is almost always a misconfiguration.
+
+**6. Hook execution**
+
+`HookRunner::runAfterDispatch()` fires all `#[AfterDispatch]` hooks.
+
+## Registering a Producer
+
+Producers are defined in your `#[MessagingConfig]` class:
+
+```php
+use Fortizan\Tekton\Messaging\Attribute\RegisterProducer;
+use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
+
+#[RegisterProducer]
+public function userProducer(): KafkaProducerDefinition
+{
+    return KafkaProducerDefinition::create('user.events')
+        ->transport('user.events')        // must match a registered transport name
+        ->publishes(UserRegisteredEvent::class, UserDeletedEvent::class)
+        ->outbox(true)                    // write to outbox before Kafka (default)
+        ->linger(5);                      // batch wait time in ms for throughput
+}
+```
+
+### `publishes(string ...$eventClasses)`
+
+Declares which domain event classes this producer routes. When `EventBus::dispatch()` is called with any of these events, this producer is selected. Each event class can only be mapped to one producer — duplicates are caught at compile time.
+
+### `transport(string $name)`
+
+The name of the registered transport to produce to. Must match a transport defined with `#[RegisterTransport]` in the same or any other `#[MessagingConfig]` class.
+
+### `outbox(bool $enabled, string $table = 'outbox')`
+
+Whether to use the transactional outbox pattern. Defaults to `true`. See [Outbox Pattern](/docs/messaging/outbox) for full details.
+
+### `linger(int $ms)`
+
+How long RdKafka waits before sending a batch. Higher values increase throughput by batching more messages together. Lower values reduce latency. Default is `5ms`.
+
+### `compression(string $type)`
+
+Compression algorithm: `'snappy'`, `'lz4'`, `'gzip'`, `'zstd'`. Reduces network and storage usage for high-volume topics.
+
+## Domain Events
+
+Domain events are plain PHP objects. The only requirement is that they implement `DomainEventInterface`:
+
+```php
+use Fortizan\Tekton\Messaging\Contract\DomainEventInterface;
+use Symfony\Component\Uid\UuidV7;
+
+final readonly class UserRegisteredEvent implements DomainEventInterface
+{
+    public function __construct(
+        public readonly UuidV7 $id,
+        public readonly string $email,
+        public readonly string $name,
+    ) {}
+}
+```
+
+<Callout type="warn" title="UuidV7 Serialization">
+If your event contains value objects (like `UuidV7`), make sure they implement `Stringable` or have a `fromString()` static factory. Tekton's `JsonSerializer` automatically handles `Stringable` objects by calling `(string) $value` during serialization and `ClassName::fromString($value)` during deserialization.
+</Callout>
+
+## Dispatching a Batch
+
+Use `dispatchBatch()` when a single operation raises multiple events:
+
+```php
+$this->eventBus->dispatchBatch(
+    new OrderPlacedEvent($order->id()),
+    new InventoryReservedEvent($order->id(), $items),
+    new PaymentInitiatedEvent($order->id(), $amount),
+);
+```
+
+Each event is dispatched individually in sequence. If you wrap the calling code in `TransactionalMiddleware`, all three outbox writes happen within the same database transaction.
+
+## Message Payload
+
+Events are serialized to JSON by default. The payload includes all public properties plus a `_class` key for type identification during deserialization:
+
+```json
+{
+  "id": "019d3806-3b1c-7c2b-ac39-1be1b02ac8e1",
+  "email": "user@example.com",
+  "name": "John Doe",
+  "_class": "App\\User\\Domain\\Event\\UserRegisteredEvent"
+}
+```
+
+The `_class` field is used by `JsonSerializer::deserialize()` on the consumer side to instantiate the correct PHP class.
+
+## Message Headers
+
+Every message published to Kafka includes these headers:
+
+| Header | Value |
+|---|---|
+| `event_id` | Unique hex ID for this dispatch |
+| `correlation_id` | Trace correlation ID |
+| `event_class` | Fully qualified PHP class name |
+| `timestamp` | ISO 8601 dispatch timestamp |
+
+These headers are extracted by `ConsumerRunner` and injected into handler parameters marked with `#[MessageId]`, `#[CorrelationId]`, and `#[Timestamp]`.

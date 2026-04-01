@@ -1,0 +1,182 @@
+---
+title: Middleware
+description: Add cross-cutting concerns to the consumer pipeline — tracing, logging, transactions, and custom middleware via a single attribute.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Middleware
+
+The middleware pipeline wraps every handler execution on the consumer side. Middleware runs before and after the handler, in a defined order, and can intercept exceptions. Tekton ships four built-in middleware layers and supports unlimited user-defined middleware via the `#[AsMiddleware]` attribute.
+
+## How the Pipeline Works
+
+The `MiddlewareStack` wraps middleware inside-out using `array_reduce`. The highest priority middleware is the **outermost** layer — it runs first going in and last coming out. The innermost callable is your actual handler:
+
+```
+Message arrives
+    │
+    ▼
+TracingMiddleware (priority: built-in, outermost)
+    │
+    ▼
+LoggingMiddleware (priority: built-in)
+    │
+    ▼
+HookMiddleware (priority: built-in)
+    │
+    ▼
+TransactionalMiddleware (priority: built-in, innermost of core)
+    │
+    ▼
+[Your custom middleware, sorted by priority descending]
+    │
+    ▼
+Handler::__invoke(DomainEvent)
+    │
+    ▼
+[Unwind back through each middleware]
+```
+
+Each middleware calls `$next($envelope)` to continue the chain. If it does not call `$next`, the chain is short-circuited — this is how idempotency works.
+
+## Built-in Middleware
+
+### TracingMiddleware
+
+Creates a distributed tracing span for each handler execution. Span name is the event class name. On success, sets status to `'ok'`. On exception, records the exception and sets status to `'error'`. Span is always ended in a `finally` block — never leaked.
+
+Requires a `TracingInterface` binding in your container. The default is `NoOpTracer` (zero overhead). To enable OpenTelemetry, bind `OpenTelemetryTracer` to `TracingInterface`.
+
+### LoggingMiddleware
+
+Logs every handler execution with timing, correlation ID, and outcome. Uses PSR-3 `LoggerInterface`.
+
+- **Success** → `app.DEBUG: Event dispatched` with `duration_ms`, `event`, `handler`, `correlation_id`
+- **Failure** → `app.ERROR: Event dispatch failed` with the same fields plus `exception`
+
+```
+[2026-03-29T05:17:05] app.DEBUG: Event dispatched {
+    "event": "App\\User\\Domain\\Event\\UserRegisteredEvent",
+    "handler": "unknown",
+    "correlation_id": "d960f34fa44a5e849e8bf82970303ac2",
+    "duration_ms": 12.02
+}
+```
+
+### HookMiddleware
+
+Executes lifecycle hooks registered with `#[BeforeConsume]` and `#[AfterConsume]` attributes. See [Lifecycle Hooks](/docs/messaging/hooks) for details.
+
+### TransactionalMiddleware
+
+Wraps the handler execution in a Doctrine DBAL transaction. On success, commits. On exception, rolls back and rethrows. This guarantees that all database writes inside a handler are atomic — either everything commits or nothing does.
+
+```
+BEGIN TRANSACTION
+    Handler::__invoke(event)
+        → any $connection->insert() / update() / delete() calls
+COMMIT  ← on success
+ROLLBACK ← on exception
+```
+
+<Callout type="info" title="Why This Matters">
+When your handler writes to the database AND publishes another event (via `EventBus::dispatch()` → outbox), both the domain write and the outbox row land in the same transaction. If the transaction rolls back, neither write persists. This is the foundation of the outbox pattern's reliability guarantee.
+</Callout>
+
+## Adding Custom Middleware
+
+Implement `MiddlewareInterface` and mark the class with `#[AsMiddleware]`:
+
+```php
+use Fortizan\Tekton\Messaging\Attribute\AsMiddleware;
+use Fortizan\Tekton\Messaging\Middleware\MiddlewareInterface;
+use Symfony\Component\Messenger\Envelope;
+
+#[AsMiddleware(priority: 500)]
+final class TenantContextMiddleware implements MiddlewareInterface
+{
+    public function __construct(
+        private readonly TenantResolver $tenantResolver,
+    ) {}
+
+    public function handle(Envelope $envelope, callable $next): Envelope
+    {
+        $event = $envelope->getMessage();
+
+        // set tenant context before handler runs
+        $this->tenantResolver->setFromEvent($event);
+
+        try {
+            return $next($envelope);
+        } finally {
+            // clear tenant context after handler completes
+            $this->tenantResolver->clear();
+        }
+    }
+}
+```
+
+That is all. Tekton's `MiddlewareCompilerPass` discovers any class implementing `MiddlewareInterface` with `#[AsMiddleware]` and inserts it into the stack at the correct position based on priority.
+
+## Priority System
+
+Higher priority runs **first** (outermost position in the stack):
+
+| Priority Range | Purpose |
+|---|---|
+| 1000+ | Reserved for framework core (tracing, logging) |
+| 500–999 | Infrastructure concerns (tenant context, auth, feature flags) |
+| 100–499 | Domain concerns (business rule enforcement) |
+| 1–99 | Post-processing (metrics, analytics) |
+| 0 | Default — runs last before the handler |
+
+```php
+#[AsMiddleware(priority: 750)]
+final class RateLimitMiddleware implements MiddlewareInterface { ... }
+
+#[AsMiddleware(priority: 200)]
+final class AuditTrailMiddleware implements MiddlewareInterface { ... }
+```
+
+## MiddlewareInterface Contract
+
+```php
+interface MiddlewareInterface
+{
+    public function handle(Envelope $envelope, callable $next): Envelope;
+}
+```
+
+- **Always return an `Envelope`** — either the result of `$next($envelope)` or a modified envelope
+- **Always call `$next($envelope)`** unless intentionally short-circuiting (e.g. idempotency check)
+- **Use `finally`** to ensure cleanup code runs even if `$next` throws
+- **Rethrow exceptions** after handling them — swallowing exceptions silently breaks retry and dead letter logic
+
+## Accessing the Envelope
+
+The `Envelope` carries the domain event and all stamps. You can read stamps in middleware:
+
+```php
+use Fortizan\Tekton\Messaging\Bus\Stamp\CorrelationIdStamp;
+use Fortizan\Tekton\Messaging\Bus\Stamp\EventIdStamp;
+
+public function handle(Envelope $envelope, callable $next): Envelope
+{
+    $event = $envelope->getMessage();                               // your DomainEvent
+    $eventId = $envelope->last(EventIdStamp::class)?->eventId;     // unique message ID
+    $correlationId = $envelope->last(CorrelationIdStamp::class)?->correlationId;
+
+    // ...
+    return $next($envelope);
+}
+```
+
+## Testing Middleware
+
+To verify middleware behavior in tests, use the `InMemory` driver and dispatch events directly. Check that the expected side effects (DB writes, log entries, context changes) occurred — and that they did NOT occur when the handler throws.
+
+<Callout type="warn" title="Middleware Runs on the Consumer Side Only">
+The `MiddlewareStack` is wired into `ConsumerRunner` — it runs when messages are **consumed**, not when they are published. The `EventBus` publish path does not run through `MiddlewareStack`. If you need to intercept dispatch, use lifecycle hooks (`#[BeforeDispatch]`, `#[PreSend]`).
+</Callout>

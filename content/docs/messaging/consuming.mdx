@@ -1,0 +1,288 @@
+---
+title: Consuming Events
+description: Write event handlers with a single attribute. Tekton discovers, wires, and runs them automatically through the full consumer pipeline.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Consuming Events
+
+Tekton's consumer pipeline runs as a long-lived worker process. It polls Kafka continuously, deserializes incoming messages into typed domain event objects, resolves all registered handlers, and runs them through the middleware stack. You write handlers — the framework does everything else.
+
+## Writing a Handler
+
+The simplest handler is a class with `__invoke` and a single `#[AsEventHandler]` attribute:
+
+```php
+use Fortizan\Tekton\Messaging\Attribute\AsEventHandler;
+
+#[AsEventHandler(
+    handlerId: 'user.registered.send-welcome-email',
+    consumer: 'user.events',
+)]
+final class SendWelcomeEmailHandler
+{
+    public function __construct(
+        private readonly MailerInterface $mailer,
+    ) {}
+
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        $this->mailer->send(
+            to: $event->email,
+            subject: 'Welcome to the platform',
+        );
+    }
+}
+```
+
+That is the entire integration. No registration, no YAML, no service tags. Tekton discovers this class at container compile time via the `#[AsEventHandler]` attribute and wires it into the consumer pipeline automatically.
+
+## How Discovery Works
+
+At container compile time, `HandlerDiscoveryCompilerPass` runs and:
+
+1. Finds all services tagged `tekton.event_handler` (set automatically by the attribute autoconfiguration in `MessagingExtension`)
+2. Reflects the class to find the handler method and its first parameter type
+3. Validates that the parameter implements `DomainEventInterface` — throws at compile time if not
+4. Builds a descriptor array containing the service ID, method name, priority, idempotency flag, and event class
+5. Stores descriptors in the `tekton.handlers` container parameter, keyed by `[consumerName][eventClass]`
+6. Populates `tekton.handler_locator` (a Symfony `ServiceLocator`) with all handler services for lazy resolution at runtime
+
+```
+Compile time:
+HandlerDiscoveryCompilerPass
+    └── Scans tagged services
+        └── Builds handler descriptor:
+            {
+                handlerId: 'user.registered.send-welcome-email',
+                serviceId: 'App\...\SendWelcomeEmailHandler',
+                method: '__invoke',
+                consumer: 'user.events',
+                eventClass: 'App\...\UserRegisteredEvent',
+                priority: 0,
+                idempotent: false,
+            }
+
+Runtime:
+ConsumerRunner::handleMessage()
+    └── HandlerRegistry::getHandlers('user.events', UserRegisteredEvent::class)
+        └── Returns [descriptor1, descriptor2, ...]
+            └── For each descriptor: handlerLocator->get(serviceId)
+```
+
+## Attribute Reference
+
+### `#[AsEventHandler]`
+
+Can be placed on a **class** (uses `__invoke`) or on a **method**:
+
+```php
+// Class-level — __invoke is the handler
+#[AsEventHandler(handlerId: 'user.registered.notify', consumer: 'user.events')]
+final class NotifyAdminHandler
+{
+    public function __invoke(UserRegisteredEvent $event): void {}
+}
+
+// Method-level — multiple handlers in one class
+final class UserEventHandlers
+{
+    #[AsEventHandler(handlerId: 'user.registered.email', consumer: 'user.events')]
+    public function onRegistered(UserRegisteredEvent $event): void {}
+
+    #[AsEventHandler(handlerId: 'user.deleted.cleanup', consumer: 'user.events')]
+    public function onDeleted(UserDeletedEvent $event): void {}
+}
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `handlerId` | `string` | ✓ | Unique ID for this handler. Used for idempotency tracking and logging. |
+| `consumer` | `string` | ✓ | Consumer pipeline name. Must match a consumer registered with `#[RegisterConsumer]`. |
+| `priority` | `int` | — | Execution order when multiple handlers handle the same event. Higher runs first. Default: `0`. |
+| `idempotent` | `bool` | — | If `true`, skips the idempotency cache check — the handler is safe to run multiple times. Default: `false`. |
+| `version` | `int\|null` | — | Optional schema version filter. Only processes messages with a matching version header. |
+
+## Multiple Handlers for the Same Event
+
+Multiple handlers can be registered to the same consumer and event class. They run **sequentially** in priority order within a single message processing cycle. The Kafka offset is committed only after **all** handlers succeed:
+
+```php
+// Runs first (priority: 100)
+#[AsEventHandler(handlerId: 'order.placed.reserve-inventory', consumer: 'orders', priority: 100)]
+final class ReserveInventoryHandler
+{
+    public function __invoke(OrderPlacedEvent $event): void {}
+}
+
+// Runs second (priority: 50)
+#[AsEventHandler(handlerId: 'order.placed.send-confirmation', consumer: 'orders', priority: 50)]
+final class SendOrderConfirmationHandler
+{
+    public function __invoke(OrderPlacedEvent $event): void {}
+}
+
+// Runs third (priority: 0 — default)
+#[AsEventHandler(handlerId: 'order.placed.update-analytics', consumer: 'orders', priority: 0)]
+final class UpdateAnalyticsHandler
+{
+    public function __invoke(OrderPlacedEvent $event): void {}
+}
+```
+
+<Callout type="warn" title="All or Nothing">
+If any handler in the chain throws an exception, the entire message fails — none of the subsequent handlers run, and the offset is not committed. The message will be retried from the beginning of the handler chain. Design your handlers to be idempotent or use the `idempotent: true` flag to skip already-processed handlers on retry.
+</Callout>
+
+## Header Injection
+
+Handlers can receive metadata from message headers as additional parameters using injection attributes:
+
+```php
+use Fortizan\Tekton\Messaging\Attribute\Header\MessageId;
+use Fortizan\Tekton\Messaging\Attribute\Header\CorrelationId;
+use Fortizan\Tekton\Messaging\Attribute\Header\Timestamp;
+
+#[AsEventHandler(handlerId: 'user.registered.audit', consumer: 'user.events')]
+final class AuditUserRegistrationHandler
+{
+    public function __invoke(
+        UserRegisteredEvent $event,
+        #[MessageId] string $messageId,
+        #[CorrelationId] string $correlationId,
+        #[Timestamp] DateTimeImmutable $occurredAt,
+    ): void {
+        // $messageId — unique ID of this message dispatch
+        // $correlationId — trace ID propagated across services
+        // $occurredAt — when the event was dispatched
+    }
+}
+```
+
+These are resolved from the Symfony Messenger envelope stamps — no additional configuration required.
+
+## Registering a Consumer
+
+Consumers are defined in your `#[MessagingConfig]` class alongside your transport:
+
+```php
+use Fortizan\Tekton\Messaging\Retry\RetryPolicy;
+
+#[RegisterConsumer]
+public function userConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('user.events')
+        ->groupId('user-service')         // Kafka consumer group ID
+        ->parallelism(1)                  // message-level parallelism
+        ->batchSize(1)                    // messages per commit cycle
+        ->retry(RetryPolicy::exponential(
+            attempts: 3,
+            initialDelayMs: 500,
+        ))
+        ->dlq('user.events.dlq')          // dead letter transport name
+        ->offsetReset('earliest');        // where to start if no offset committed
+}
+```
+
+The consumer name (`'user.events'`) must match the `consumer:` parameter in your `#[AsEventHandler]` attributes.
+
+## Running the Worker
+
+Each consumer runs as a separate long-lived process managed by supervisord:
+
+```ini title="docker/worker/supervisord.conf"
+[program:consumer-user-events]
+command=php /var/www/html/bin/console tekton:consume user.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/user-events.out.log
+stderr_logfile=/var/log/supervisor/user-events.err.log
+```
+
+To add a new consumer, add a new `[program:...]` block — Docker Compose never needs to change.
+
+<Callout type="info" title="Graceful Shutdown">
+The `tekton:consume` command installs signal handlers for `SIGTERM` and `SIGINT`. When supervisord stops the process, the consumer finishes processing the current message before exiting — the offset is always committed cleanly.
+</Callout>
+
+## Listing Registered Consumers
+
+```bash
+php bin/console tekton:consumers:list
+```
+
+Example output:
+
+```
+Found 2 consumer(s).
+
+▶ user.events
+  Group ID:    user-service
+  Parallelism: 1
+  Transport:   user.events
+  Handlers (2):
+    - user.registered.send-welcome-email  →  UserRegisteredEvent  (priority: 0)
+    - user.deleted.cleanup                →  UserDeletedEvent     (priority: 0)
+
+▶ orders.placed
+  Group ID:    order-service
+  Parallelism: 4
+  Transport:   orders.placed
+  Handlers (1):
+    - order.placed.reserve-inventory  →  OrderPlacedEvent  (priority: 100)
+```
+
+## Consumer Pipeline Internals
+
+When a message arrives from Kafka, `ConsumerRunner::handleMessage()` runs the following sequence:
+
+<Steps>
+
+<Step>
+
+### Extract event class
+
+Read the `event_class` header from the message. If missing, reject the message immediately — it cannot be routed.
+
+</Step>
+
+<Step>
+
+### Deserialize payload
+
+Call `JsonSerializer::deserialize($payload, $eventClass)` to reconstruct the typed domain event object from the JSON payload.
+
+</Step>
+
+<Step>
+
+### Resolve handlers
+
+Call `HandlerRegistry::getHandlers($consumerName, $eventClass)` to get all handler descriptors for this consumer and event type, sorted by priority descending.
+
+</Step>
+
+<Step>
+
+### Process each handler
+
+For each descriptor, fetch the handler service from `handlerLocator`, build the callable, and run it through `MiddlewareStack::process()`. The middleware stack wraps the handler with tracing, logging, hooks, and transaction management.
+
+</Step>
+
+<Step>
+
+### Acknowledge or reject
+
+If all handlers succeeded, call `$consumer->acknowledge($message)` — Kafka offset is committed. If any handler failed after all retries, call `$consumer->reject($message, false)` — offset is committed but the message is written to the dead letter store.
+
+</Step>
+
+</Steps>

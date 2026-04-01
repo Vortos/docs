@@ -1,0 +1,189 @@
+---
+title: Dead Letter
+description: Persistent storage for messages that exhausted all retry attempts — inspect, replay, and recover from failures.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Dead Letter
+
+When a handler fails and exhausts all retry attempts, the message is written to the dead letter store — a `tekton_failed_messages` database table. It is removed from the active processing queue and requires manual intervention to replay.
+
+## Why Dead Letter Exists
+
+Retrying forever is not a solution. If a handler consistently fails — due to a bug, a schema mismatch, or a downstream service being permanently unavailable — infinite retries would consume resources, fill logs, and block other messages in the same partition.
+
+Dead letter is a deliberate stop:
+
+```
+Handler fails
+    └── Retry 1 → fails
+    └── Retry 2 → fails
+    └── Retry 3 → fails (maxAttempts exhausted)
+        └── DeadLetterWriter::write() → persisted to tekton_failed_messages
+        └── Consumer::reject() → Kafka offset committed
+        └── CRITICAL log entry fired → alert your team
+        └── Processing continues for other messages
+```
+
+The message is safe — stored in Postgres with full payload, headers, and failure context. It can be replayed once the root cause is fixed.
+
+## Database Table
+
+Create the table before using the messaging module:
+
+```sql
+CREATE TABLE tekton_failed_messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transport_name  VARCHAR(255) NOT NULL,
+    event_class     VARCHAR(512) NOT NULL,
+    payload         TEXT NOT NULL,
+    headers         JSONB NOT NULL DEFAULT '{}',
+    failure_reason  TEXT NOT NULL,
+    exception_class VARCHAR(512) NOT NULL,
+    attempt_count   INT NOT NULL DEFAULT 0,
+    failed_at       TIMESTAMP NOT NULL DEFAULT NOW(),
+    replayed_at     TIMESTAMP,
+    status          VARCHAR(20) NOT NULL DEFAULT 'failed'
+);
+```
+
+## What Gets Stored
+
+Every dead-lettered message stores:
+
+| Column | Content |
+|---|---|
+| `id` | UuidV7 — time-sortable unique identifier |
+| `transport_name` | Kafka transport the message came from |
+| `event_class` | Fully qualified PHP class name of the event |
+| `payload` | Original JSON payload as received from Kafka |
+| `headers` | Full message headers (event_id, correlation_id, timestamp) |
+| `failure_reason` | Exception message from the last failed attempt |
+| `exception_class` | Exception class name for filtering |
+| `attempt_count` | Total attempts including retries |
+| `failed_at` | When the message was dead-lettered |
+| `replayed_at` | When it was successfully replayed (null until replayed) |
+| `status` | `failed` initially, `replayed` after successful replay |
+
+## Monitoring
+
+Dead letter entries produce a `CRITICAL` log:
+
+```
+app.CRITICAL: Message dead-lettered {
+    "transport": "user.events",
+    "event_class": "App\\User\\Domain\\Event\\UserCreatedEvent",
+    "reason": "Connection refused",
+    "attempts": 4
+}
+```
+
+Set up an alert on `CRITICAL` log entries containing `dead-lettered` — these always require attention. In production, integrate with your alerting stack (PagerDuty, Slack, etc.) to notify your on-call engineer immediately.
+
+## Replaying Messages
+
+Once the root cause is fixed and deployed:
+
+<Steps>
+
+<Step>
+
+### Inspect what will be replayed
+
+```bash
+php bin/console tekton:dlq:replay --dry-run
+```
+
+```
+Found 3 failed message(s).
+
+  • 019d4784-7b26-78a6-ba36-3b74ce5ad751  |  UserCreatedEvent  →  user.events
+  • 019d4784-93cf-718d-86b0-dc2ca02ba16f  |  UserCreatedEvent  →  user.events
+  • 019d4785-1abc-7def-9012-abc123456789  |  OrderPlacedEvent  →  orders.placed
+
+Dry run complete. No messages replayed.
+```
+
+</Step>
+
+<Step>
+
+### Replay all failed messages
+
+```bash
+php bin/console tekton:dlq:replay
+```
+
+```
+Found 3 failed message(s).
+
+  ✔ Replayed: 019d4784-7b26-...  |  UserCreatedEvent
+  ✔ Replayed: 019d4784-93cf-...  |  UserCreatedEvent
+  ✔ Replayed: 019d4785-1abc-...  |  OrderPlacedEvent
+
+Done. Replayed: 3  Failed: 0
+```
+
+</Step>
+
+<Step>
+
+### Verify in the database
+
+```sql
+SELECT id, status, replayed_at
+FROM tekton_failed_messages
+ORDER BY failed_at DESC;
+```
+
+Status changes from `failed` to `replayed` with a `replayed_at` timestamp.
+
+</Step>
+
+</Steps>
+
+## Replay Options
+
+```bash
+# replay up to 100 messages (default: 50)
+php bin/console tekton:dlq:replay --limit=100
+
+# dry run — inspect without replaying
+php bin/console tekton:dlq:replay --dry-run
+```
+
+## What Replay Does
+
+Replay re-produces the original message payload directly to Kafka — it does not re-dispatch through `EventBus`. The message goes back into the Kafka topic and is consumed by the worker as a fresh message, running through the full pipeline: deserialization, handler, middleware, retry.
+
+```
+tekton_failed_messages (status: failed)
+    │
+    ▼
+ReplayDeadLetterCommand
+    ├── deserialize payload → DomainEvent
+    ├── ProducerInterface::produce(transportName, event, headers)
+    │       └── message back in Kafka topic
+    └── markReplayed(id) → status: replayed
+
+Worker picks up from Kafka
+    └── ConsumerRunner → handler runs again
+```
+
+<Callout type="warn" title="Idempotency on Replay">
+Replayed messages have new Kafka offsets but carry the **original** `event_id` header. If your handlers use idempotency (`idempotent: false`, the default), and the original message was successfully processed before it was dead-lettered (unlikely but possible), the handler will be skipped. If you need to force re-execution, temporarily mark your handler `idempotent: true` before replaying.
+</Callout>
+
+## This Command is Manual — By Design
+
+The replay command is not run by supervisord automatically. Dead letter is an intentional stop requiring human intervention. The workflow is:
+
+1. Alert fires on `CRITICAL` log
+2. Engineer investigates root cause
+3. Fix is deployed
+4. Engineer runs `tekton:dlq:replay`
+5. Messages process successfully
+
+Automatic replay would create an infinite loop for persistently broken messages. Human judgment is required.

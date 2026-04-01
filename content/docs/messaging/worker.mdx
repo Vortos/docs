@@ -1,0 +1,268 @@
+---
+title: Worker Setup
+description: Run consumer workers with supervisord — automatic restarts, multiple consumers, and graceful shutdown.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Worker Setup
+
+Tekton consumers run as long-lived PHP CLI processes managed by supervisord. Each consumer pipeline gets its own process. Supervisord handles automatic restarts on crash and graceful shutdown on `SIGTERM`.
+
+## Architecture
+
+```
+Docker container (tekton-worker)
+    │
+    └── supervisord (PID 1)
+            ├── consumer-user-events    → php bin/console tekton:consume user.events
+            ├── consumer-order-events   → php bin/console tekton:consume order.events
+            ├── consumer-payment-events → php bin/console tekton:consume payment.events
+            └── outbox-relay            → php bin/console tekton:outbox:relay
+```
+
+Docker Compose manages the container lifecycle. Supervisord manages the process lifecycle inside the container. You never need to touch `docker-compose.yml` to add a new consumer.
+
+## Dockerfile
+
+The worker container needs supervisord and the Kafka extension installed:
+
+```dockerfile title="docker/worker/Dockerfile"
+FROM php:8.4-fpm-alpine
+
+RUN apk add --no-cache supervisor git unzip linux-headers $PHPIZE_DEPS \
+    postgresql-dev librdkafka-dev
+
+RUN pecl install redis mongodb rdkafka \
+    && docker-php-ext-enable redis mongodb rdkafka \
+    && docker-php-ext-install pdo pdo_pgsql pcntl
+
+RUN mkdir -p /var/log/supervisor
+
+COPY docker/worker/supervisord.conf /etc/supervisord.conf
+
+WORKDIR /var/www/html
+
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
+```
+
+<Callout type="info" title="pcntl Extension">
+The `pcntl` extension is required for signal handling. Without it, `SIGTERM` and `SIGINT` signals cannot be caught and the consumer will not shut down gracefully.
+</Callout>
+
+## supervisord.conf
+
+```ini title="docker/worker/supervisord.conf"
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[unix_http_server]
+file=/var/run/supervisor.sock
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+; ─── Consumers ───────────────────────────────────────────────
+
+[program:consumer-user-events]
+command=php /var/www/html/bin/console tekton:consume user.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/user-events.out.log
+stderr_logfile=/var/log/supervisor/user-events.err.log
+
+[program:consumer-order-events]
+command=php /var/www/html/bin/console tekton:consume order.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/order-events.out.log
+stderr_logfile=/var/log/supervisor/order-events.err.log
+
+; ─── Outbox Relay ────────────────────────────────────────────
+
+[program:outbox-relay]
+command=php /var/www/html/bin/console tekton:outbox:relay
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=10
+stdout_logfile=/var/log/supervisor/outbox-relay.out.log
+stderr_logfile=/var/log/supervisor/outbox-relay.err.log
+```
+
+### Key Settings
+
+| Setting | Value | Purpose |
+|---|---|---|
+| `autostart=true` | — | Start process when supervisord boots |
+| `autorestart=true` | — | Restart if process exits for any reason |
+| `startsecs=3` | 3 | Process must stay up 3 seconds to be considered started |
+| `stopwaitsecs=30` | 30 | Wait up to 30 seconds for graceful shutdown before force-killing |
+
+## docker-compose.yml
+
+```yaml title="docker-compose.yml"
+worker:
+  build:
+    context: .
+    dockerfile: ./docker/worker/Dockerfile
+  restart: always
+  volumes:
+    - ./:/var/www/html
+  depends_on:
+    - kafka
+    - write_db
+    - redis
+  networks:
+    - tekton-net
+```
+
+No `command:` override — the Dockerfile `CMD` runs supervisord. `restart: always` ensures the container restarts if it ever exits (e.g. on server reboot).
+
+## Adding a New Consumer
+
+<Steps>
+
+<Step>
+
+### Register the consumer in your MessagingConfig
+
+```php
+#[RegisterConsumer]
+public function paymentConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('payment.events')
+        ->groupId('payment-service')
+        ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500));
+}
+```
+
+</Step>
+
+<Step>
+
+### Add a program block to supervisord.conf
+
+```ini
+[program:consumer-payment-events]
+command=php /var/www/html/bin/console tekton:consume payment.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/payment-events.out.log
+stderr_logfile=/var/log/supervisor/payment-events.err.log
+```
+
+</Step>
+
+<Step>
+
+### Rebuild and restart the worker container
+
+```bash
+docker compose build worker
+docker compose up -d worker
+```
+
+</Step>
+
+<Step>
+
+### Verify the new process is running
+
+```bash
+docker compose exec worker supervisorctl status
+```
+
+```
+consumer-user-events      RUNNING   pid 7,  uptime 0:12:43
+consumer-order-events     RUNNING   pid 8,  uptime 0:12:43
+consumer-payment-events   RUNNING   pid 9,  uptime 0:00:05
+outbox-relay              RUNNING   pid 10, uptime 0:12:43
+```
+
+</Step>
+
+</Steps>
+
+## Graceful Shutdown
+
+The `tekton:consume` command installs signal handlers for `SIGTERM` and `SIGINT`:
+
+```
+supervisord sends SIGTERM to consumer process
+    │
+    ▼
+ConsumeCommand signal handler calls ConsumerRunner::stop()
+    │
+    ▼
+KafkaConsumer::stop() sets $running = false
+    │
+    ▼
+Current message finishes processing (handler + middleware + commit/reject)
+    │
+    ▼
+Poll loop exits cleanly
+    │
+    ▼
+Process exits with code 0
+```
+
+The `stopwaitsecs=30` in supervisord gives the consumer up to 30 seconds to finish its current message before supervisord force-kills it. If your handlers take longer than 30 seconds, increase this value.
+
+## Monitoring Workers
+
+```bash
+# Check status of all managed processes
+docker compose exec worker supervisorctl status
+
+# Tail logs for a specific consumer
+docker compose exec worker supervisorctl tail -f consumer-user-events
+
+# Read full log file
+docker compose exec worker cat /var/log/supervisor/user-events.out.log
+
+# Restart a specific consumer (useful after config changes)
+docker compose exec worker supervisorctl restart consumer-user-events
+```
+
+## Consumer Parallelism
+
+To run multiple worker processes for the same consumer (for higher throughput), either:
+
+**Option A — Multiple supervisord programs:**
+
+```ini
+[program:consumer-order-events-1]
+command=php /var/www/html/bin/console tekton:consume order.events
+
+[program:consumer-order-events-2]
+command=php /var/www/html/bin/console tekton:consume order.events
+
+[program:consumer-order-events-3]
+command=php /var/www/html/bin/console tekton:consume order.events
+```
+
+All three processes use the same `groupId` — Kafka distributes partitions across them automatically.
+
+**Option B — `numprocs` in supervisord:**
+
+```ini
+[program:consumer-order-events]
+command=php /var/www/html/bin/console tekton:consume order.events
+numprocs=3
+process_name=%(program_name)s_%(process_num)02d
+```
+
+Both approaches achieve the same result. The maximum useful parallelism equals the number of partitions on the topic.

@@ -1,0 +1,125 @@
+---
+title: InMemory Driver
+description: A fully functional in-memory transport for local development and testing — no Kafka required.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# InMemory Driver
+
+The InMemory driver is a complete implementation of the messaging interfaces (`ProducerInterface`, `ConsumerInterface`) that stores messages in PHP memory instead of Kafka. It is designed for local development and testing environments where running a Kafka broker is unnecessary or undesirable.
+
+## How It Works
+
+`InMemoryBroker` is a singleton service that holds an in-memory queue keyed by transport name. `InMemoryProducer` enqueues messages into it. `InMemoryConsumer` dequeues and processes them.
+
+```
+InMemoryProducer::produce('user.events', $event)
+    └── serializes event
+    └── InMemoryBroker::enqueue('user.events', $receivedMessage)
+
+InMemoryBroker (shared singleton)
+    └── ['user.events'] => [ReceivedMessage, ReceivedMessage, ...]
+
+InMemoryConsumer::consume('user.events', $handler)
+    └── InMemoryBroker::dequeue('user.events')
+    └── $handler($receivedMessage)
+
+// for assertions in tests:
+InMemoryBroker::all('user.events') → all messages without consuming
+InMemoryBroker::count('user.events') → message count
+InMemoryBroker::reset() → clear all queues
+```
+
+## Enabling InMemory Driver
+
+The driver is configured via the env-based config override system. Create `config/test/messaging.php`:
+
+```php
+<?php
+use Fortizan\Tekton\Messaging\DependencyInjection\TektonMessagingConfig;
+use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryProducer;
+use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryConsumer;
+
+return static function(TektonMessagingConfig $config): void {
+    $config->driver()
+        ->producer(InMemoryProducer::class)
+        ->consumer(InMemoryConsumer::class);
+};
+```
+
+Then set `APP_ENV=test` in your `.env`. When the container compiles, `MessagingExtension` reads `config/test/messaging.php` and binds `ProducerInterface → InMemoryProducer` and `ConsumerInterface → InMemoryConsumer` instead of their Kafka counterparts.
+
+<Callout type="info" title="No Other Changes Required">
+Your application code stays identical. Everything that injects `EventBusInterface`, `ProducerInterface`, or `ConsumerInterface` automatically uses the InMemory implementation when `APP_ENV=test`. No mocking, no conditionals.
+</Callout>
+
+## Using InMemoryBroker Directly
+
+In tests or diagnostic controllers, inject `InMemoryBroker` to inspect or assert on messages:
+
+```php
+use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryBroker;
+
+final class TestController
+{
+    public function __construct(
+        private EventBusInterface $eventBus,
+        private InMemoryBroker $broker,
+    ) {}
+
+    public function __invoke(): JsonResponse
+    {
+        $this->eventBus->dispatch(new UserCreatedEvent(
+            id: new UuidV7(),
+            name: 'test',
+            email: 'test@example.com',
+        ));
+
+        return new JsonResponse([
+            'messages_in_broker' => $this->broker->count('user.events'),
+            'payload'            => $this->broker->all('user.events')[0]->payload ?? null,
+        ]);
+    }
+}
+```
+
+## Differences from Kafka Driver
+
+| Feature | Kafka | InMemory |
+|---|---|---|
+| Persistence | Durable, survives restarts | Lost on process exit |
+| Delivery guarantee | At-least-once | In-process only |
+| Offset tracking | Full Kafka consumer group | Not applicable |
+| Multiple consumers | Partition-distributed | Single process |
+| Outbox support | Full (via `tekton_outbox`) | Bypassed — direct enqueue |
+| SASL/SSL | Configurable | Not applicable |
+
+<Callout type="warn" title="Outbox Behavior">
+With `outbox(true)` on your producer and `APP_ENV=test`, the outbox write still goes to the database — only the Kafka produce step is replaced by InMemory enqueue. To bypass the outbox entirely in tests, set `outbox(false)` on your producer definition.
+</Callout>
+
+## Resetting Between Tests
+
+Call `InMemoryBroker::reset()` in your test `tearDown()` to clear all queued messages:
+
+```php
+protected function tearDown(): void
+{
+    $this->getContainer()->get(InMemoryBroker::class)->reset();
+}
+```
+
+Without resetting, messages from one test bleed into the next.
+
+## Environment Config Files
+
+The full config loading order when `APP_ENV=test`:
+
+```
+config/messaging.php          ← base config, loaded first
+config/test/messaging.php     ← test overrides, loaded second, wins on conflict
+```
+
+Only the keys you set in the override file change — everything else from the base config remains. This means you can override just the driver and keep all your transport/producer/consumer definitions identical.

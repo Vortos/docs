@@ -1,0 +1,201 @@
+---
+title: Retry & Dead Letter
+description: Automatic retry with exponential backoff and dead letter storage — Tekton handles failure recovery so your handlers don't have to.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Retry & Dead Letter
+
+When a handler throws an exception, Tekton does not immediately discard the message. It retries the handler with a configurable backoff policy. Only after all retry attempts are exhausted does the message get written to the dead letter store — where it can be inspected and replayed manually.
+
+## How Retry Works
+
+The retry logic lives in `ConsumerRunner::processHandler()`. On the first failure, it reads the consumer's retry policy from `ConsumerRegistry`, then enters a retry loop:
+
+```
+Handler throws exception
+    │
+    ▼
+Read RetryPolicy from ConsumerRegistry
+    │
+    ▼
+attempt = 1
+    │
+    ▼
+RetryDecider::shouldRetry(policy, attempt)?
+    ├── YES → sleep(getDelayMs(policy, attempt)) → retry handler
+    │             │
+    │          SUCCESS → commit cache key, return true
+    │          FAILURE → attempt++, lastException = e, loop again
+    │
+    └── NO → DeadLetterWriter::write(...) → return false
+```
+
+The `shouldRetry()` method returns `true` as long as `attemptNumber <= policy.maxAttempts`. The delay between attempts is calculated by `RetryDelayCalculator` based on the backoff strategy.
+
+## Configuring Retry Policy
+
+Retry is configured per consumer in your `#[MessagingConfig]` class:
+
+<Tabs items={['Exponential', 'Fixed']}>
+
+<Tab value="Exponential">
+```php
+use Fortizan\Tekton\Messaging\Retry\RetryPolicy;
+
+#[RegisterConsumer]
+public function userConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('user.events')
+        ->groupId('user-service')
+        ->retry(RetryPolicy::exponential(
+            attempts: 3,          // max retry attempts
+            initialDelayMs: 500,  // first retry waits 500ms
+            maxDelayMs: 30000,    // cap delay at 30 seconds
+            jitter: true,         // add ±20% randomness to prevent thundering herd
+        ));
+}
+```
+
+**Delays with `initialDelayMs: 500, multiplier: 2.0`:**
+
+| Attempt | Delay (no jitter) |
+|---|---|
+| 1 | 500ms |
+| 2 | 1000ms |
+| 3 | 2000ms |
+
+With `jitter: true`, each delay is randomized by ±20% to prevent all consumers retrying simultaneously after a shared failure.
+</Tab>
+
+<Tab value="Fixed">
+```php
+->retry(RetryPolicy::fixed(
+    attempts: 5,     // max retry attempts
+    delayMs: 2000,   // wait exactly 2 seconds between each retry
+))
+```
+
+All retries wait the same duration. Use for predictable, low-frequency events where timing consistency matters more than throughput.
+</Tab>
+
+</Tabs>
+
+## RetryPolicy Reference
+
+```php
+RetryPolicy::exponential(
+    attempts: int,           // maximum number of retry attempts
+    initialDelayMs: int,     // delay before first retry (ms)
+    maxDelayMs: int = 30000, // maximum delay cap (ms)
+    jitter: bool = true,     // randomize delay to prevent thundering herd
+): RetryPolicy
+
+RetryPolicy::fixed(
+    attempts: int,   // maximum number of retry attempts
+    delayMs: int,    // fixed delay between each retry (ms)
+): RetryPolicy
+```
+
+## Kafka Offset and Retry
+
+It is important to understand that Tekton's retry is **in-process** — it retries the handler directly without re-consuming from Kafka. The Kafka offset is **not committed** during retries. This means:
+
+- If the worker process crashes mid-retry, Kafka redelivers the message on restart (at-least-once guarantee)
+- The retry delay is a PHP `usleep()` — the consumer process is blocked during this time
+- For very long retry delays with many consumers, consider reducing `maxDelayMs` and accepting more retries instead
+
+<Callout type="info" title="At-Least-Once Delivery">
+Kafka only knows about the message being processed after the offset is committed. Tekton commits the offset only on success (acknowledge) or after dead-lettering (reject). During retries, the offset remains uncommitted — Kafka will redeliver if the process restarts.
+</Callout>
+
+## Dead Letter
+
+After all retry attempts are exhausted, `DeadLetterWriter::write()` is called with the full context of the failure:
+
+```php
+$this->deadLetterWriter->write(
+    transportName: $message->transportName,
+    eventClass: $message->headers['event_class'],
+    payload: $message->payload,
+    headers: $message->headers,
+    failureReason: $lastException->getMessage(),
+    exceptionClass: get_class($lastException),
+    attemptCount: 1 + $retryPolicy->maxAttempts,
+);
+```
+
+This writes a `CRITICAL` log entry:
+
+```
+app.CRITICAL: Message dead-lettered {
+    "transport": "user.events",
+    "event_class": "App\\User\\Domain\\Event\\UserRegisteredEvent",
+    "reason": "Connection refused",
+    "attempts": 4
+}
+```
+
+After dead-lettering, the message is **rejected** — `$consumer->reject($message, false)` — which commits the Kafka offset. The message will not be redelivered by Kafka automatically.
+
+## Configuring a DLQ Transport
+
+To route dead-lettered messages to a Kafka DLQ topic, configure a DLQ transport name in your consumer definition:
+
+```php
+#[RegisterConsumer]
+public function userConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('user.events')
+        ->groupId('user-service')
+        ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500))
+        ->dlq('user.events.dlq');  // must be a registered transport name
+}
+```
+
+And register the DLQ transport:
+
+```php
+#[RegisterTransport]
+public function userDlqTransport(): KafkaTransportDefinition
+{
+    return KafkaTransportDefinition::create('user.events.dlq')
+        ->dsn('kafka://kafka:9092')
+        ->topic('user.events.dlq')
+        ->partitions(1)
+        ->replicationFactor(1);
+}
+```
+
+## Replaying Dead-Lettered Messages
+
+Once the root cause of failures is fixed, use the CLI command to replay:
+
+```bash
+php bin/console tekton:dlq:replay user.events
+```
+
+Options:
+
+```bash
+php bin/console tekton:dlq:replay user.events --limit=100
+php bin/console tekton:dlq:replay user.events --event-class="App\User\Domain\Event\UserRegisteredEvent"
+php bin/console tekton:dlq:replay user.events --from-date="2026-01-01" --to-date="2026-01-31"
+```
+
+Replayed messages are re-dispatched through the same consumer pipeline — they go through deserialization, handler execution, middleware, and retry again as if they were fresh messages.
+
+## Observing Failures
+
+All retry and dead letter events are logged at appropriate levels:
+
+| Event | Log Level |
+|---|---|
+| Handler executed successfully | `DEBUG` |
+| Handler threw exception | `ERROR` |
+| Retry attempt | `ERROR` (via LoggingMiddleware) |
+| Message dead-lettered | `CRITICAL` |
+
+Monitor your logs for `CRITICAL` entries containing `dead-lettered` — these require attention.

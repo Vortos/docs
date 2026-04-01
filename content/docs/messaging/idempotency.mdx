@@ -1,0 +1,105 @@
+---
+title: Idempotency
+description: Prevent duplicate handler execution when Kafka redelivers messages using Redis-backed idempotency tracking.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Idempotency
+
+In an at-least-once delivery system, the same message can be delivered more than once — after a worker restart, a rebalance, or a failed offset commit. Idempotency ensures your handler only executes once per unique message, even if the message arrives multiple times.
+
+## How It Works
+
+Every message published by `EventBus` carries a unique `event_id` header. When `ConsumerRunner` processes a message, it checks a Redis cache before invoking the handler:
+
+```
+Message arrives with event_id: "abc123"
+    │
+    ▼
+cache.has("tekton_idempotency_{handlerId}_{eventId}")
+    ├── YES → skip handler, return success (already processed)
+    └── NO  → run handler
+                │
+            SUCCESS → cache.set(key, true, 86400s)
+            FAILURE → do NOT cache → message will retry
+```
+
+The cache key includes both the `handlerId` and `event_id` — so the same event can be handled by multiple handlers, each with independent idempotency tracking.
+
+<Callout type="info" title="Cache TTL">
+Idempotency keys expire after 24 hours (86400 seconds) by default. After expiry, the handler will execute again if the same message arrives. This is intentional — keeping keys forever would cause unbounded cache growth.
+</Callout>
+
+## Cache Backend
+
+Tekton uses Redis as the idempotency cache via PSR-16 (`Psr\SimpleCache\CacheInterface`). Redis is the correct choice for production — it persists across worker restarts and is shared across multiple worker processes.
+
+The binding is registered automatically in `MessagingExtension` using Symfony Cache's `RedisAdapter` wrapped in `Psr16Cache`:
+
+```
+Redis (redis:6379)
+    └── RedisAdapter (namespace: tekton_messaging)
+            └── Psr16Cache
+                    └── CacheInterface binding
+                            └── ConsumerRunner injects it
+```
+
+## Configuration
+
+By default the framework connects to `redis://redis:6379`. To use a different Redis instance, bind `CacheInterface` yourself in your container config before `MessagingExtension` runs — the extension checks `hasAlias(CacheInterface::class)` and skips registration if already bound:
+
+```php
+// in your services.php or a container extension
+$container->setAlias(CacheInterface::class, 'your.custom.cache.service');
+```
+
+## Marking a Handler as Idempotent
+
+By default, all handlers participate in idempotency checking — duplicate messages are skipped. If a handler is **safe to run multiple times** (truly idempotent by nature), mark it with `idempotent: true` to bypass the cache check:
+
+```php
+#[AsEventHandler(
+    handlerId: 'user.registered.sync-read-model',
+    consumer: 'user.events',
+    idempotent: true,  // safe to run multiple times — always produces the same result
+)]
+final class SyncUserReadModelHandler
+{
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        // upsert into read model — running twice produces the same result
+    }
+}
+```
+
+<Callout type="warn" title="Default is Safe">
+By default `idempotent: false` — the cache check runs and duplicates are skipped. Only set `idempotent: true` when you are certain running the handler twice produces identical results with no side effects.
+</Callout>
+
+## Testing Idempotency
+
+To verify idempotency works, publish the same `event_id` twice. The easiest way is to temporarily hardcode the event ID in `EventBus::dispatch()`:
+
+```php
+// temporary — for testing only
+$eventId = 'test-fixed-event-id';
+```
+
+Hit your publish endpoint twice. Check logs:
+
+```
+First message:
+app.INFO: UserCreatedHandler executed {...}
+app.DEBUG: Event dispatched {...}
+
+Second message (same event_id):
+app.DEBUG: Skipping duplicate handler execution
+app.DEBUG: Event dispatched {...}
+```
+
+The handler log line does not appear the second time — the handler was skipped.
+
+## Idempotency TTL
+
+The default TTL is 86400 seconds (24 hours). To change it, the `ConsumerRunner` constructor accepts `$idempotencyTtl` as a parameter. Override it in your container configuration if needed.

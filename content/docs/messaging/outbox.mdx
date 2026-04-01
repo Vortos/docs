@@ -1,0 +1,227 @@
+---
+title: Outbox Pattern
+description: Guarantee at-least-once event delivery by writing events transactionally to the database before sending to Kafka.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Outbox Pattern
+
+The transactional outbox pattern solves a fundamental problem in event-driven systems: **how do you guarantee that a domain change and its corresponding event are always published together?**
+
+Without outbox, there is a race condition:
+
+```
+1. Write user to database    ← succeeds
+2. Publish event to Kafka    ← Kafka is down → event is lost forever
+```
+
+Or in the opposite order:
+
+```
+1. Publish event to Kafka    ← succeeds
+2. Write user to database    ← fails → event published for a change that didn't happen
+```
+
+The outbox pattern eliminates this by making the event write part of the same database transaction as the domain write:
+
+```
+BEGIN TRANSACTION
+    1. Write user to database
+    2. Write event to tekton_outbox table   ← same connection, same transaction
+COMMIT (or ROLLBACK — both writes succeed or both fail)
+
+[Separately, OutboxRelayWorker polls tekton_outbox]
+    3. Read pending outbox rows
+    4. Publish to Kafka
+    5. Mark rows as published
+```
+
+## Enabling Outbox
+
+Outbox is enabled by default on all producers. Set `outbox(true)` explicitly or rely on the default:
+
+```php
+#[RegisterProducer]
+public function userProducer(): KafkaProducerDefinition
+{
+    return KafkaProducerDefinition::create('user.events')
+        ->transport('user.events')
+        ->publishes(UserRegisteredEvent::class)
+        ->outbox(true);  // default — can be omitted
+}
+```
+
+To bypass outbox and produce directly to Kafka (synchronously, no delivery guarantee):
+
+```php
+->outbox(false)
+```
+
+<Callout type="warn" title="Direct Production Risk">
+Disabling outbox means events can be lost if Kafka is unavailable when `dispatch()` is called. Only disable outbox for non-critical events where occasional loss is acceptable, or in development environments.
+</Callout>
+
+## Database Table
+
+You must create the outbox table in your database. Run this migration:
+
+```sql
+CREATE TABLE tekton_outbox (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    transport   VARCHAR(255) NOT NULL,
+    event_class VARCHAR(512) NOT NULL,
+    payload     TEXT NOT NULL,
+    headers     JSONB NOT NULL DEFAULT '{}',
+    status      VARCHAR(20) NOT NULL DEFAULT 'pending',
+    attempt_count INT NOT NULL DEFAULT 0,
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    published_at TIMESTAMP,
+    next_attempt_at TIMESTAMP,
+    failure_reason TEXT
+);
+
+CREATE INDEX idx_tekton_outbox_status_created
+    ON tekton_outbox (status, created_at)
+    WHERE status = 'pending';
+```
+
+<Callout type="info" title="FOR UPDATE SKIP LOCKED">
+The outbox poller uses `SELECT ... FOR UPDATE SKIP LOCKED` to safely support multiple relay processes running in parallel. Each relay process locks the rows it is processing — other processes skip locked rows and pick up different ones. This prevents duplicate publishing.
+</Callout>
+
+## How the Relay Works
+
+The `OutboxRelayWorker` runs in a loop, polling the outbox table and producing pending messages to Kafka:
+
+<Steps>
+
+<Step>
+
+### Poll for pending rows
+
+```sql
+SELECT * FROM tekton_outbox
+WHERE status = 'pending'
+  AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+ORDER BY created_at ASC
+LIMIT 100
+FOR UPDATE SKIP LOCKED
+```
+
+</Step>
+
+<Step>
+
+### Produce to Kafka
+
+For each pending row, deserialize the payload and call `ProducerInterface::produce()` to send to the Kafka topic specified in `transport`.
+
+</Step>
+
+<Step>
+
+### Mark as published
+
+On success, update the row:
+```sql
+UPDATE tekton_outbox
+SET status = 'published', published_at = NOW()
+WHERE id = $id
+```
+
+</Step>
+
+<Step>
+
+### Handle failure
+
+On failure, increment `attempt_count` and set `next_attempt_at` to apply backoff before the next retry:
+```sql
+UPDATE tekton_outbox
+SET attempt_count = attempt_count + 1,
+    next_attempt_at = NOW() + INTERVAL '...',
+    failure_reason = $reason
+WHERE id = $id
+```
+
+</Step>
+
+</Steps>
+
+## Running the Relay
+
+The outbox relay runs as a separate long-lived process alongside your consumers. Add it to `supervisord.conf`:
+
+```ini title="docker/worker/supervisord.conf"
+[program:outbox-relay]
+command=php /var/www/html/bin/console tekton:outbox:relay
+autostart=true
+autorestart=true
+startsecs=3
+stdout_logfile=/var/log/supervisor/outbox-relay.out.log
+stderr_logfile=/var/log/supervisor/outbox-relay.err.log
+```
+
+Or run manually:
+
+```bash
+php bin/console tekton:outbox:relay
+php bin/console tekton:outbox:relay --batch-size=50
+php bin/console tekton:outbox:relay --sleep-ms=100
+```
+
+## Transaction Ownership
+
+The outbox writer **does not open its own transaction**. It writes to the outbox table using the caller's existing database connection — which must already be inside a transaction.
+
+This is correct behavior. The transaction boundary belongs to your application, not the framework:
+
+```php
+// The TransactionalMiddleware wraps the entire handler in a transaction.
+// Any outbox writes inside the handler are automatically included.
+
+#[AsEventHandler(handlerId: 'order.placed.process', consumer: 'orders')]
+final class ProcessOrderHandler
+{
+    public function __construct(
+        private readonly OrderRepository $orders,
+        private readonly EventBusInterface $eventBus,  // dispatches to outbox
+    ) {}
+
+    public function __invoke(OrderPlacedEvent $event): void
+    {
+        $order = $this->orders->find($event->orderId);
+        $order->process();
+
+        $this->orders->save($order);  // domain write
+
+        // This outbox write happens in the SAME transaction as the save above.
+        // If the transaction rolls back, neither write persists.
+        $this->eventBus->dispatch(new OrderProcessedEvent($order->id()));
+    }
+}
+```
+
+<Callout type="warn" title="Dispatch Outside a Handler">
+If you call `$eventBus->dispatch()` from a controller or service that is NOT wrapped in `TransactionalMiddleware`, you are responsible for the transaction boundary. Call `$connection->beginTransaction()` before your domain write and `$connection->commit()` after. If you dispatch without an active transaction, the outbox write will succeed independently of your domain write — defeating the purpose of the outbox.
+</Callout>
+
+## Monitoring Outbox Health
+
+Check for stuck or failed outbox rows:
+
+```sql
+-- Pending rows older than 5 minutes (relay may be down)
+SELECT COUNT(*) FROM tekton_outbox
+WHERE status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes';
+
+-- Failed rows that need attention
+SELECT * FROM tekton_outbox
+WHERE status = 'failed'
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Set up an alert if pending rows older than your relay's expected processing time accumulate — this indicates the relay worker is down or unable to reach Kafka.
