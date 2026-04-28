@@ -1,0 +1,172 @@
+---
+title: Cache Warmers
+description: Pre-populate critical cache entries on deployment with CacheWarmerInterface — discovered via vortos.cache_warmer tag.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Cache Warmers
+
+Cache warmers pre-populate the cache before traffic arrives. Run them after every deployment once the cache is cleared. Each warmer is a PHP class implementing `CacheWarmerInterface` — discovered automatically via the `vortos.cache_warmer` tag.
+
+## CacheWarmerInterface
+
+```php
+interface CacheWarmerInterface
+{
+    public function warmUp(): void;
+}
+```
+
+`warmUp()` must be:
+- **Idempotent** — safe to run multiple times, same result every time
+- **Non-throwing for recoverable errors** — log and continue, don't abort the warmup run
+- **Reasonably fast** — it blocks the deployment pipeline
+
+## Write a Warmer
+
+```php title="src/Infrastructure/Cache/PermissionMatrixCacheWarmer.php"
+use Vortos\Cache\Contract\CacheWarmerInterface;
+use Vortos\Cache\Contract\TaggedCacheInterface;
+
+final class PermissionMatrixCacheWarmer implements CacheWarmerInterface
+{
+    public function __construct(
+        private PermissionRepository $permissions,
+        private TaggedCacheInterface $cache,
+    ) {}
+
+    public function warmUp(): void
+    {
+        // Load everything from DB once
+        $matrix = $this->permissions->getFullMatrix();
+
+        // Store tagged — invalidated when roles change
+        $this->cache->setWithTags(
+            'auth:permission_matrix',
+            $matrix,
+            ['permissions', 'roles'],
+            ttl: 3600,
+        );
+    }
+}
+```
+
+## Register a Warmer
+
+Tag the service with `vortos.cache_warmer` in `config/services.php`:
+
+```php title="config/services.php"
+$services->set(PermissionMatrixCacheWarmer::class)
+    ->tag('vortos.cache_warmer');
+
+$services->set(ActiveCompetitionsCacheWarmer::class)
+    ->tag('vortos.cache_warmer');
+```
+
+`CacheWarmupCommand` uses a tagged iterator — it discovers all `vortos.cache_warmer` services automatically.
+
+## Run Warmers
+
+```bash
+# Typical deployment sequence:
+php bin/console vortos:cache:clear   # 1. clear stale entries
+php bin/console vortos:cache:warmup  # 2. pre-populate critical entries
+```
+
+Output:
+
+```
+Vortos Cache Warmup
+
+  ✔ App\Cache\PermissionMatrixCacheWarmer
+  ✔ App\Cache\ActiveCompetitionsCacheWarmer
+  ✘ App\Cache\ExternalApiCacheWarmer: Connection timed out
+
+Done. 2 warmer(s) ran successfully.
+```
+
+Failed warmers are logged and skipped — they do not abort the warmup run. The application starts with warm cache where possible.
+
+## Practical Warmer Examples
+
+### Configuration Warmer
+
+```php
+final class AppConfigCacheWarmer implements CacheWarmerInterface
+{
+    public function __construct(
+        private ConfigRepository $config,
+        private TaggedCacheInterface $cache,
+    ) {}
+
+    public function warmUp(): void
+    {
+        $settings = $this->config->loadAll();
+
+        foreach ($settings as $key => $value) {
+            $this->cache->setWithTags(
+                "config:{$key}",
+                $value,
+                ['config'],
+                3600,
+            );
+        }
+    }
+}
+```
+
+### Ranking Cache Warmer
+
+```php
+final class RankingsCacheWarmer implements CacheWarmerInterface
+{
+    public function __construct(
+        private RankingRepository $rankings,
+        private TaggedCacheInterface $cache,
+    ) {}
+
+    public function warmUp(): void
+    {
+        // Cache top 100 per category
+        foreach (['overall', 'junior', 'senior'] as $category) {
+            $top = $this->rankings->getTop(category: $category, limit: 100);
+
+            $this->cache->setWithTags(
+                "rankings:{$category}:top100",
+                $top,
+                ['rankings', "rankings:{$category}"],
+                1800,
+            );
+        }
+    }
+}
+```
+
+### External API Warmer with Error Handling
+
+```php
+final class ExchangeRateCacheWarmer implements CacheWarmerInterface
+{
+    public function __construct(
+        private ExchangeRateClient $client,
+        private TaggedCacheInterface $cache,
+        private \Psr\Log\LoggerInterface $logger,
+    ) {}
+
+    public function warmUp(): void
+    {
+        try {
+            $rates = $this->client->getLatestRates();
+            $this->cache->setWithTags('exchange_rates', $rates, ['exchange_rates'], 900);
+        } catch (\Throwable $e) {
+            // Log but don't throw — warmup continues with other warmers
+            $this->logger->warning('Failed to warm exchange rates: ' . $e->getMessage());
+        }
+    }
+}
+```
+
+<Callout type="info" title="Warmers Run in Registration Order">
+Warmers run in the order they are tagged in `config/services.php`. If one warmer depends on data populated by another, register the dependency first.
+</Callout>

@@ -1,0 +1,194 @@
+---
+title: Controllers
+description: Write controllers with #[ApiController] and Symfony #[Route] — auto-discovered, auto-wired, service-injected.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Controllers
+
+## #[ApiController]
+
+Mark any class with `#[ApiController]` to register it as an HTTP controller:
+
+```php title="src/User/Infrastructure/Http/GetUserController.php"
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Attribute\Route;
+use Vortos\Http\Attribute\ApiController;
+use Vortos\Auth\Attribute\RequiresAuth;
+use Vortos\Auth\Identity\CurrentUserProvider;
+use Vortos\Cqrs\Query\QueryBusInterface;
+
+#[ApiController]
+#[Route('/users/{id}', methods: ['GET'])]
+#[RequiresAuth]
+final class GetUserController
+{
+    public function __construct(
+        private QueryBusInterface $queryBus,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function __invoke(string $id, Request $request): JsonResponse
+    {
+        $user = $this->queryBus->ask(new GetUserById($id));
+
+        if ($user === null) {
+            return new JsonResponse(['error' => 'Not Found'], 404);
+        }
+
+        return new JsonResponse($user);
+    }
+}
+```
+
+## What #[ApiController] Does
+
+`#[ApiController]` is an autoconfiguration attribute. When detected, `HttpExtension` autoconfiguration:
+- Sets the service as `public: true`
+- Adds the tag `vortos.api.controller`
+
+`RouteCompilerPass` then scans all services tagged `vortos.api.controller` for `#[Route]` attributes and builds the `RouteCollection`.
+
+## Route Attribute
+
+Vortos uses Symfony's standard `#[Route]` attribute:
+
+```php
+use Symfony\Component\Routing\Attribute\Route;
+
+// Simple GET
+#[Route('/users', methods: ['GET'])]
+
+// With path parameter
+#[Route('/users/{id}', methods: ['GET'])]
+
+// POST
+#[Route('/users', methods: ['POST'])]
+
+// Multiple methods
+#[Route('/users/{id}', methods: ['PUT', 'PATCH'])]
+
+// Named route
+#[Route('/users/{id}', name: 'user.show', methods: ['GET'])]
+
+// With requirements (regex constraint on parameter)
+#[Route('/users/{id}', methods: ['GET'], requirements: ['id' => '[0-9a-f-]{36}'])]
+```
+
+## Class-Level vs Method-Level Routes
+
+Routes can be on the class or on individual methods:
+
+```php
+// Class-level — single-action controller (recommended for simple cases)
+#[ApiController]
+#[Route('/users/{id}', methods: ['GET'])]
+final class GetUserController
+{
+    public function __invoke(string $id): JsonResponse { ... }
+}
+
+// Method-level — multi-action controller
+#[ApiController]
+#[Route('/users')]
+final class UserController
+{
+    #[Route('', methods: ['GET'])]
+    public function index(Request $request): JsonResponse { ... }
+
+    #[Route('/{id}', methods: ['GET'])]
+    public function show(string $id): JsonResponse { ... }
+
+    #[Route('', methods: ['POST'])]
+    public function create(Request $request): JsonResponse { ... }
+
+    #[Route('/{id}', methods: ['PUT'])]
+    public function update(string $id, Request $request): JsonResponse { ... }
+
+    #[Route('/{id}', methods: ['DELETE'])]
+    public function delete(string $id): JsonResponse { ... }
+}
+```
+
+## Service Injection
+
+Inject any service in the constructor — `ContainerControllerResolver` resolves controllers from the container:
+
+```php
+#[ApiController]
+#[Route('/documents', methods: ['POST'])]
+final class CreateDocumentController
+{
+    public function __construct(
+        private CommandBusInterface $commandBus,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function __invoke(Request $request): JsonResponse
+    {
+        $data = $request->toArray();
+        $identity = $this->currentUser->get();
+
+        $this->commandBus->dispatch(new CreateDocument(
+            title: $data['title'],
+            content: $data['content'],
+            authorId: $identity->id(),
+        ));
+
+        return new JsonResponse(['status' => 'created'], 201);
+    }
+}
+```
+
+## Route Parameters
+
+Route parameters are injected as method arguments by `ArgumentResolver`:
+
+```php
+#[Route('/users/{id}/documents/{docId}', methods: ['GET'])]
+public function __invoke(string $id, string $docId): JsonResponse
+{
+    // $id and $docId come from the URL
+}
+```
+
+## Request Body
+
+```php
+public function __invoke(Request $request): JsonResponse
+{
+    // JSON body
+    $data = $request->toArray();
+
+    // Query string
+    $page = $request->query->get('page', 1);
+
+    // Headers
+    $token = $request->headers->get('Authorization');
+}
+```
+
+## Combining Middleware Attributes
+
+Stack security attributes on controllers freely:
+
+```php
+#[ApiController]
+#[Route('/exports/bulk', methods: ['POST'])]
+#[RequiresAuth]
+#[RequiresPermission('exports.create.any')]
+#[RequiresFeatureAccess(Feature::BulkExport)]
+#[RequiresQuota(Quota::Exports, cost: 1)]
+#[AuditLog(AuditAction::ExportCreated)]
+final class CreateBulkExportController
+{
+    // All middleware runs before __invoke() is called
+    public function __invoke(Request $request): JsonResponse { ... }
+}
+```
+
+<Callout type="info" title="Single-Action Controllers">
+Prefer single-action controllers with `__invoke()` over multi-action controllers. Single-action controllers are easier to test, easier to apply per-route attributes to, and follow the single responsibility principle. Multi-action controllers are fine for simple CRUD resources.
+</Callout>

@@ -1,0 +1,115 @@
+---
+title: Getting Started
+description: Install Vortos and create your first application in minutes.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Getting Started
+
+Vortos is a modern PHP framework built for domain-driven, event-driven applications. It provides a complete infrastructure layer — HTTP, auth, authorization, messaging, persistence, caching, CQRS, and tracing — with zero magic and full compile-time safety.
+
+<Callout type="info" title="Design Philosophy">
+Every feature in Vortos is designed to have zero reflection at runtime. Discovery happens at compile time. Runtime is O(1) map lookups. Your application is fast by default.
+</Callout>
+
+## Requirements
+
+| Requirement | Version |
+|---|---|
+| PHP | 8.2 or higher |
+| Composer | 2.x |
+| Redis | 7.x (for rate limiting, sessions, tokens) |
+| PostgreSQL | 14+ (recommended for persistence) |
+
+## Installation
+
+```bash
+composer create-project vortos/vortos my-app --stability=alpha
+cd my-app
+```
+
+After installation, publish the Docker files:
+
+```bash
+# FrankenPHP (recommended — single binary, worker mode)
+php bin/console vortos:docker:publish
+
+# php-fpm + nginx (traditional)
+php bin/console vortos:docker:publish --runtime=phpfpm
+```
+
+Start the application:
+
+```bash
+docker compose up -d
+```
+
+## Project Structure
+
+```
+my-app/
+├── bin/
+│   └── console              ← CLI entry point
+├── bootstrap/
+│   └── app.php              ← Application bootstrap
+├── config/
+│   ├── services.php         ← Service registration
+│   ├── auth.php             ← JWT, lockout, session config
+│   ├── authorization.php    ← Role hierarchy config
+│   ├── cache.php            ← Cache adapter config
+│   ├── messaging.php        ← Messaging driver config
+│   ├── persistence.php      ← Database connection config
+│   └── tracing.php          ← Tracing sampler config
+├── public/
+│   └── index.php            ← HTTP entry point
+└── src/                     ← Your application code
+    └── YourContext/
+        ├── Domain/          ← Aggregates, events, value objects
+        ├── Application/     ← Command handlers, query handlers
+        └── Infrastructure/  ← Repositories, controllers
+```
+
+## First Controller
+
+```php title="src/User/Infrastructure/Http/UserController.php"
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\Routing\Attribute\Route;
+use Vortos\Http\Attribute\ApiController;
+use Vortos\Auth\Attribute\RequiresAuth;
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+#[ApiController]
+#[Route('/users')]
+#[RequiresAuth]
+final class UserController
+{
+    public function __construct(
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    #[Route('/me', methods: ['GET'])]
+    public function me(): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+
+        return new JsonResponse([
+            'id'    => $identity->id(),
+            'roles' => $identity->roles(),
+        ]);
+    }
+}
+```
+
+## What's Next
+
+<Cards>
+  <Card title="Authentication" href="/docs/auth" description="JWT authentication, password hashing, token storage, and built-in login controllers." />
+  <Card title="Authorization" href="/docs/authorization" description="Policy-based authorization, role hierarchy, scoped permissions, and ownership checks." />
+  <Card title="Rate Limiting" href="/docs/auth/rate-limiting" description="Per-user, per-IP, and global rate limiting with pluggable policies." />
+  <Card title="Messaging" href="/docs/messaging" description="Event-driven messaging with Kafka, outbox pattern, retry, and dead letter." />
+  <Card title="CQRS" href="/docs/cqrs" description="Command and query buses with idempotency and handler auto-discovery." />
+  <Card title="Persistence" href="/docs/persistence" description="Repository pattern with DBAL, MongoDB, and in-memory testing support." />
+</Cards>

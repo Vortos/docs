@@ -1,0 +1,129 @@
+---
+title: Event Subscribers
+description: How EventSubscriberInterface implementations are auto-wired to the EventDispatcher via RegisterEventSubscribersPass.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Event Subscribers
+
+All Symfony `EventSubscriberInterface` implementations are automatically wired to the `EventDispatcher` at compile time. No manual listener registration needed.
+
+## How Auto-Wiring Works
+
+`RegisterEventSubscribersPass` (priority 90) runs at compile time:
+
+```
+1. Find all services tagged kernel.event_subscriber
+2. For each service: call static::getSubscribedEvents()
+3. For each event → listener mapping: call $dispatcher->addListener(...)
+   (as method call on the container definition — resolved at runtime)
+```
+
+Vortos's `HttpExtension` adds autoconfiguration so any class implementing `EventSubscriberInterface` gets the tag automatically:
+
+```php
+$container->registerForAutoconfiguration(EventSubscriberInterface::class)
+    ->addTag('kernel.event_subscriber');
+```
+
+## Write an Event Subscriber
+
+```php
+use Symfony\Component\EventDispatcher\EventSubscriberInterface;
+use Symfony\Component\HttpKernel\Event\RequestEvent;
+use Symfony\Component\HttpKernel\KernelEvents;
+
+// Auto-discovered — just implement EventSubscriberInterface
+final class MaintenanceModeMiddleware implements EventSubscriberInterface
+{
+    public static function getSubscribedEvents(): array
+    {
+        return [
+            KernelEvents::REQUEST => ['onKernelRequest', 10], // priority 10
+        ];
+    }
+
+    public function onKernelRequest(RequestEvent $event): void
+    {
+        if (!$event->isMainRequest()) return;
+
+        if ($this->isMaintenanceMode()) {
+            $event->setResponse(new JsonResponse(
+                ['error' => 'Service temporarily unavailable'],
+                503
+            ));
+        }
+    }
+}
+```
+
+Register in `config/services.php`:
+
+```php
+$services->set(MaintenanceModeMiddleware::class)->public();
+// No tag needed — EventSubscriberInterface triggers autoconfiguration
+```
+
+## Middleware Priority Chain
+
+All authentication and authorization middleware are event subscribers on `KernelEvents::REQUEST`:
+
+```
+priority 8: RouterListener          — route matching
+priority 7: RateLimitMiddleware     — rate limits
+priority 6: AuthMiddleware          — JWT validation
+priority 5.5: TwoFactorMiddleware   — 2FA check
+priority 5: AuthorizationMiddleware — permission check
+priority 4.5: OwnershipMiddleware   — ownership check
+priority 4: FeatureAccessMiddleware — feature plan
+priority 3: QuotaMiddleware         — quota check
+priority 2: AuditMiddleware         — audit log
+```
+
+Higher number = runs first. Your subscribers can slot into any position by choosing a priority.
+
+## Kernel Events
+
+| Event | When | Common Use |
+|---|---|---|
+| `KernelEvents::REQUEST` | Before controller runs | Auth, middleware, routing |
+| `KernelEvents::CONTROLLER` | Controller resolved | Modify controller |
+| `KernelEvents::CONTROLLER_ARGUMENTS` | Arguments resolved | Modify arguments |
+| `KernelEvents::RESPONSE` | After controller | Add headers, transform response |
+| `KernelEvents::TERMINATE` | After response sent | Async cleanup, logging |
+| `KernelEvents::EXCEPTION` | On uncaught exception | Custom error handling |
+
+## Stopping Propagation
+
+Set a response on `RequestEvent` to stop the chain — no lower-priority listeners run:
+
+```php
+public function onKernelRequest(RequestEvent $event): void
+{
+    if ($this->isBlocked($event->getRequest())) {
+        $event->setResponse(new JsonResponse(['error' => 'Blocked'], 403));
+        // No further listeners run for this request
+    }
+}
+```
+
+All Vortos middleware uses this pattern — if a check fails, a response is set and processing stops.
+
+## Subrequests
+
+Always check `$event->isMainRequest()` in `KernelEvents::REQUEST` listeners:
+
+```php
+public function onKernelRequest(RequestEvent $event): void
+{
+    if (!$event->isMainRequest()) return; // skip sub-requests
+    // ...
+}
+```
+
+Subrequests are generated internally (e.g. for error pages) — most middleware should not apply to them.
+
+<Callout type="info" title="Tags vs Autoconfiguration">
+You never need to add `kernel.event_subscriber` tag manually. Any class implementing `EventSubscriberInterface` that is registered as a service gets tagged automatically. If your subscriber is not being wired, check that it is registered in `config/services.php`.
+</Callout>

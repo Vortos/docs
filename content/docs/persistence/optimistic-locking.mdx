@@ -1,0 +1,162 @@
+---
+title: Optimistic Locking
+description: How version-based concurrency control works, what triggers OptimisticLockException, and how to handle conflicts in your application.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Optimistic Locking
+
+Vortos uses version-based optimistic concurrency control on every aggregate save. When two processes load the same aggregate and both try to save, the second save fails instead of silently overwriting the first.
+
+## How It Works
+
+Every aggregate table has a `version` column starting at 0:
+
+```
+Load:    SELECT * FROM users WHERE id = 'user-1'  → version = 3
+Modify:  user.email = 'new@example.com'
+Save:    UPDATE users SET email = 'new@example.com', version = version + 1
+         WHERE id = 'user-1' AND version = 3      ← expected version
+```
+
+If `version` in the database is still 3 when the UPDATE runs → 1 row affected → success. If another process already saved (version is now 4) → 0 rows affected → `OptimisticLockException` thrown.
+
+## Version Lifecycle
+
+```
+new User()        → version = 0   (new aggregate, not in DB)
+save() insert     → version = 1   (first INSERT)
+save() update     → version = 2   (UPDATE, version + 1 in DB)
+save() update     → version = 3   (UPDATE again)
+findById()        → version = 3   (restored from DB)
+save() update     → version = 4   (another UPDATE)
+```
+
+`getVersion()` always reflects the current version. `incrementVersion()` is called by `save()` after a successful write — never call it yourself.
+
+## OptimisticLockException
+
+```php
+use Vortos\Domain\Repository\Exception\OptimisticLockException;
+```
+
+Thrown by `DbalWriteRepository::save()` and `DbalWriteRepository::delete()` when a version conflict is detected.
+
+The exception message includes the aggregate class, ID, expected version, and a description:
+
+```
+Optimistic lock conflict on App\User\Domain\User#user-123:
+expected version 3 but found -1.
+Another process modified this aggregate concurrently.
+```
+
+(The actual stored version reads as -1 when detected via affected-rows count rather than a SELECT — the `-1` indicates "unknown actual version".)
+
+## Handling Conflicts
+
+### Option 1: Retry (for commands where last-write-wins is acceptable)
+
+```php
+use Vortos\Domain\Repository\Exception\OptimisticLockException;
+
+final class UpdateUserNameHandler
+{
+    public function __invoke(UpdateUserName $command): void
+    {
+        $maxRetries = 3;
+
+        for ($attempt = 0; $attempt < $maxRetries; $attempt++) {
+            try {
+                $this->unitOfWork->run(function() use ($command) {
+                    // Fresh load on every attempt
+                    $user = $this->users->findById(UserId::fromString($command->userId));
+                    $user->updateName($command->name);
+                    $this->users->save($user);
+                });
+                return; // success
+            } catch (OptimisticLockException $e) {
+                if ($attempt === $maxRetries - 1) {
+                    throw $e; // give up after max retries
+                }
+                // Brief pause before retry to reduce contention
+                usleep(random_int(10000, 50000)); // 10–50ms
+            }
+        }
+    }
+}
+```
+
+### Option 2: Return 409 Conflict (for commands where concurrent modification is a user error)
+
+```php
+final class TransferFundsHandler
+{
+    public function __invoke(TransferFunds $command): void
+    {
+        try {
+            $this->unitOfWork->run(function() use ($command) {
+                $account = $this->accounts->findById(AccountId::fromString($command->accountId));
+                $account->debit($command->amount);
+                $this->accounts->save($account);
+            });
+        } catch (OptimisticLockException $e) {
+            // Let the controller translate this to HTTP 409
+            throw new ConcurrentModificationException(
+                'Account was modified by another operation. Please retry.',
+                previous: $e,
+            );
+        }
+    }
+}
+```
+
+In your controller or exception listener:
+
+```php
+if ($e instanceof ConcurrentModificationException) {
+    return new JsonResponse(['error' => $e->getMessage()], 409);
+}
+```
+
+## Delete with Optimistic Locking
+
+`delete()` also applies version checking:
+
+```php
+// Safe — throws if modified since load
+$userRepository->delete($user);
+```
+
+If the aggregate was modified between your load and delete call, `OptimisticLockException` is thrown. Handle it the same way as save conflicts.
+
+## batchUpdate and Optimistic Locking
+
+`batchUpdate()` behaviour depends on which base class you use:
+
+| Method | `DbalWriteRepository::batchUpdate()` | `PostgresWriteRepository::batchUpdate()` |
+|---|---|---|
+| Implementation | Calls `save()` per aggregate | Single `UPDATE FROM VALUES` |
+| On conflict | Throws `OptimisticLockException` for the conflicting aggregate | Silent — conflicting rows skipped (0 rows affected for those rows) |
+
+For batch updates where you need strict conflict detection, use `DbalWriteRepository::batchUpdate()` (or call `save()` in a loop yourself). For bulk imports or projections where last-write-wins is acceptable, `PostgresWriteRepository::batchUpdate()` is more efficient.
+
+## InMemory and Optimistic Locking
+
+`InMemoryWriteRepository` also enforces optimistic locking — even in tests. This is intentional: tests that pass with `InMemory` will behave correctly in production.
+
+```php
+$repo = new InMemoryUserRepository();
+$user = User::register('test@example.com', 'Alice');
+$repo->save($user); // version = 1
+
+// Simulate loading the same version twice
+$userA = $repo->findById($user->getId()); // version = 1
+$userB = $repo->findById($user->getId()); // version = 1
+
+$userA->updateName('Alice A');
+$repo->save($userA); // version = 2 → success
+
+$userB->updateName('Alice B');
+$repo->save($userB); // version = 1, stored is 2 → OptimisticLockException
+```

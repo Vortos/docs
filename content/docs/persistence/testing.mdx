@@ -1,0 +1,234 @@
+---
+title: Testing
+description: In-memory write and read repositories for fast, dependency-free persistence tests.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing Persistence
+
+Vortos ships in-memory implementations for both write and read repositories. Tests run without PostgreSQL, MongoDB, or any external dependency.
+
+## InMemoryWriteRepository
+
+Extend `InMemoryWriteRepository` to create a test double for your write repository:
+
+```php
+use Vortos\Persistence\Write\InMemoryWriteRepository;
+
+final class InMemoryUserRepository extends InMemoryWriteRepository
+{
+    // Add any custom query methods your interface requires
+    public function findByEmail(Email $email): ?User
+    {
+        foreach ($this->all() as $user) {
+            if ($user->getEmail()->equals($email)) {
+                return $user;
+            }
+        }
+        return null;
+    }
+}
+```
+
+### Key Behaviours
+
+**Stores clones, not references.** After `save()`, mutating the aggregate does not affect the stored version. You must call `findById()` to get fresh state — just like with a real database.
+
+```php
+$user = User::register('test@example.com', 'Alice');
+$repo->save($user);
+
+$user->updateName('Alice Updated'); // does NOT change stored version
+
+$stored = $repo->findById($user->getId());
+$this->assertSame('Alice', $stored->getName()); // original name
+```
+
+**Optimistic locking is enforced.** Concurrent modification throws `OptimisticLockException` — same as production.
+
+**`all()` is available for assertions.** Not on `WriteRepositoryInterface` — test-only helper.
+
+### Full Test Example
+
+```php
+final class RegisterUserHandlerTest extends TestCase
+{
+    private InMemoryUserRepository $users;
+    private RegisterUserHandler $handler;
+
+    protected function setUp(): void
+    {
+        $this->users = new InMemoryUserRepository();
+        $this->handler = new RegisterUserHandler(
+            users: $this->users,
+            hasher: new ArgonPasswordHasher(),
+        );
+    }
+
+    protected function tearDown(): void
+    {
+        $this->users->clear(); // reset between tests
+    }
+
+    public function test_registers_user(): void
+    {
+        $this->handler->__invoke(new RegisterUser(
+            email: 'alice@example.com',
+            password: 'secret',
+        ));
+
+        $this->assertCount(1, $this->users->all());
+    }
+
+    public function test_stored_user_has_hashed_password(): void
+    {
+        $this->handler->__invoke(new RegisterUser('alice@example.com', 'secret'));
+
+        $user = $this->users->findByEmail(new Email('alice@example.com'));
+
+        $this->assertNotSame('secret', $user->getPasswordHash());
+        $this->assertStringStartsWith('$argon2id$', $user->getPasswordHash());
+    }
+
+    public function test_optimistic_lock_conflict(): void
+    {
+        $user = User::register(new Email('test@example.com'), 'Alice');
+        $this->users->save($user);
+
+        // Load same version twice
+        $userA = $this->users->findById($user->getId());
+        $userB = $this->users->findById($user->getId());
+
+        $userA->updateName('Alice A');
+        $this->users->save($userA);
+
+        $userB->updateName('Alice B');
+
+        $this->expectException(OptimisticLockException::class);
+        $this->users->save($userB);
+    }
+}
+```
+
+## InMemoryReadRepository
+
+Extend `InMemoryReadRepository` for read-side query tests:
+
+```php
+use Vortos\Persistence\Read\InMemoryReadRepository;
+
+final class InMemoryUserReadRepository extends InMemoryReadRepository {}
+```
+
+### Seeding Test Data
+
+```php
+$repo = new InMemoryUserReadRepository();
+
+$repo->seed('user-1', [
+    '_id'    => 'user-1',
+    'email'  => 'alice@example.com',
+    'name'   => 'Alice',
+    'role'   => 'admin',
+    'status' => 'active',
+]);
+
+$repo->seed('user-2', [
+    '_id'    => 'user-2',
+    'email'  => 'bob@example.com',
+    'name'   => 'Bob',
+    'role'   => 'user',
+    'status' => 'active',
+]);
+```
+
+### Available Methods
+
+```php
+// Find by ID
+$user = $repo->findById('user-1');
+
+// Filter with criteria (strict equality)
+$admins = $repo->findByCriteria(['role' => 'admin']);
+$active = $repo->findByCriteria(['status' => 'active', 'role' => 'user']);
+
+// Sort
+$sorted = $repo->findByCriteria([], sort: ['email' => 'asc']);
+
+// Paginate
+$page = $repo->findPage(criteria: ['status' => 'active'], limit: 10);
+
+// Count
+$count = $repo->countByCriteria(['role' => 'admin']); // 1
+
+// Reset
+$repo->clear();
+```
+
+### Criteria Limitations
+
+`InMemoryReadRepository` uses strict equality matching only — no MongoDB operators like `$gt`, `$in`, `$regex`.
+
+```php
+// WORKS — exact value match
+$repo->findByCriteria(['status' => 'active']);
+
+// DOES NOT WORK — no operator support
+$repo->findByCriteria(['age' => ['$gt' => 18]]);
+```
+
+For tests that require complex criteria, write integration tests against real MongoDB.
+
+### Full Query Handler Test
+
+```php
+final class ListActiveUsersHandlerTest extends TestCase
+{
+    private InMemoryUserReadRepository $repo;
+    private ListActiveUsersHandler $handler;
+
+    protected function setUp(): void
+    {
+        $this->repo = new InMemoryUserReadRepository();
+        $this->handler = new ListActiveUsersHandler($this->repo);
+
+        $this->repo->seed('user-1', ['_id' => 'user-1', 'status' => 'active', 'name' => 'Alice']);
+        $this->repo->seed('user-2', ['_id' => 'user-2', 'status' => 'inactive', 'name' => 'Bob']);
+        $this->repo->seed('user-3', ['_id' => 'user-3', 'status' => 'active', 'name' => 'Carol']);
+    }
+
+    protected function tearDown(): void
+    {
+        $this->repo->clear();
+    }
+
+    public function test_returns_only_active_users(): void
+    {
+        $result = $this->handler->__invoke(new ListActiveUsers());
+
+        $this->assertCount(2, $result);
+        $names = array_column($result, 'name');
+        $this->assertContains('Alice', $names);
+        $this->assertContains('Carol', $names);
+        $this->assertNotContains('Bob', $names);
+    }
+}
+```
+
+## Config Swap for Integration Tests
+
+If you need real DB integration tests, override the persistence config in the test environment:
+
+```php title="config/test/persistence.php"
+return static function (VortosPersistenceConfig $config): void {
+    $config
+        ->writeDsn('pgsql://postgres:test@write_db:5432/myapp_test')
+        ->readDsn('mongodb://root:test@read_db:27017')
+        ->readDatabase('myapp_test');
+};
+```
+
+<Callout type="info" title="Always call clear() in tearDown()">
+Call `$repo->clear()` in `tearDown()` to reset state between tests. Without it, data from one test leaks into the next. PHPUnit does not reset object state between tests — the same instance is reused if injected via `setUp()`.
+</Callout>

@@ -1,0 +1,116 @@
+---
+title: Commands
+description: AbstractCommand and CommandInterface — define commands with readonly properties, idempotency keys via method override or #[AsIdempotencyKey].
+---
+
+# Commands
+
+## Define a Command
+
+Commands extend `AbstractCommand` — a `readonly` abstract class:
+
+```php title="src/User/Application/Command/RegisterUser.php"
+use Vortos\Domain\Command\AbstractCommand;
+
+final readonly class RegisterUser extends AbstractCommand
+{
+    public function __construct(
+        public string $email,
+        public string $name,
+        public string $password,
+    ) {}
+}
+```
+
+Commands are `readonly` — their properties cannot be changed after construction. They carry exactly the data needed to perform the operation.
+
+## CommandInterface
+
+```php
+interface CommandInterface
+{
+    public function idempotencyKey(): ?string;
+}
+```
+
+`AbstractCommand` provides a default `idempotencyKey()` returning `null` — no idempotency by default. Override to enable it.
+
+## Idempotency Key — Method Override
+
+Override `idempotencyKey()` for custom logic:
+
+```php
+final readonly class ProcessPayment extends AbstractCommand
+{
+    public function __construct(
+        public string $paymentId,
+        public int $amount,
+        public string $currency,
+    ) {}
+
+    public function idempotencyKey(): ?string
+    {
+        return $this->paymentId;
+    }
+}
+```
+
+## Idempotency Key — Property Attribute
+
+Mark a single property with `#[AsIdempotencyKey]` for the common case:
+
+```php
+use Vortos\Domain\Command\AsIdempotencyKey;
+
+final readonly class RegisterUser extends AbstractCommand
+{
+    public function __construct(
+        #[AsIdempotencyKey]
+        public string $requestId,   // client-generated UUID
+        public string $email,
+        public string $name,
+    ) {}
+}
+```
+
+The `IdempotencyKeyPass` compiler pass detects `#[AsIdempotencyKey]` at compile time. At runtime the `CommandBus` reads `$command->requestId` directly — no reflection.
+
+## When to Add Idempotency
+
+Add an idempotency key to commands where duplicate execution has bad consequences:
+
+| Command | Need Idempotency? | Why |
+|---|---|---|
+| `RegisterUser` | Yes | Duplicate creates two accounts |
+| `ProcessPayment` | Yes | Duplicate charges the customer twice |
+| `SendWelcomeEmail` | Yes | Duplicate sends two emails |
+| `UpdateUserName` | No | Last-write-wins is acceptable |
+| `LogPageView` | No | Duplicates are harmless |
+
+## Naming Convention
+
+Commands are named in the imperative mood: `RegisterUser`, `PlaceOrder`, `CancelBooking`. They express intent — what should happen.
+
+```
+RegisterUser        ✔
+PlaceOrder          ✔
+CancelBooking       ✔
+
+UserRegistered      ✗ (past tense — that is an event)
+UserData            ✗ (noun — ambiguous)
+```
+
+## Client-Side Key Generation
+
+The client generates the idempotency key before sending the request:
+
+```javascript
+// Frontend — generate before form submit
+const requestId = crypto.randomUUID();
+fetch('/api/users/register', {
+    method: 'POST',
+    body: JSON.stringify({ requestId, email, name, password })
+});
+```
+
+The same `requestId` is reused on retry. The server recognizes it as already processed and returns success without re-executing the handler.

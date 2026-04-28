@@ -1,0 +1,132 @@
+---
+title: Spans
+description: SpanInterface and NoOpSpan — recording attributes, exceptions, status, and always calling end() in a finally block.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Spans
+
+## SpanInterface
+
+```php
+interface SpanInterface
+{
+    public function end(): void;
+    public function addAttribute(string $key, mixed $value): void;
+    public function recordException(\Throwable $e): void;
+    public function setStatus(string $status): void;
+}
+```
+
+## Always Use finally
+
+```php
+$span = $this->tracer->startSpan('operation.name');
+
+try {
+    // ... work
+    $span->setStatus('ok');
+} catch (\Throwable $e) {
+    $span->recordException($e);
+    $span->setStatus('error', $e->getMessage());
+    throw $e;
+} finally {
+    $span->end(); // ALWAYS call end — even if an exception is thrown
+}
+```
+
+If `end()` is not called, the span may never be exported to the tracing backend, or may leak memory in the OpenTelemetry SDK.
+
+## Adding Attributes
+
+```php
+$span = $this->tracer->startSpan('user.register', [
+    // Attributes at span creation
+    'user.email' => $command->email,
+    'user.plan'  => $command->plan,
+]);
+
+// Add attributes later
+$span->addAttribute('user.id', (string) $user->getId());
+$span->addAttribute('user.created_at', $user->getCreatedAt()->format('c'));
+```
+
+Attribute naming convention follows OpenTelemetry semantic conventions — dot-separated lowercase:
+
+```
+user.id          payment.amount    db.statement
+http.method      cache.key         messaging.destination
+```
+
+## setStatus
+
+```php
+// Success
+$span->setStatus('ok');
+
+// Error — include a description
+$span->setStatus('error', 'Payment gateway timeout');
+$span->setStatus('error', $exception->getMessage());
+```
+
+Standard status values: `ok`, `error`, `unset`. `unset` is the default — no explicit status set.
+
+## recordException
+
+```php
+try {
+    $this->paymentGateway->charge($payment);
+} catch (PaymentGatewayException $e) {
+    $span->recordException($e);  // captures message, type, stack trace
+    $span->setStatus('error', $e->getMessage());
+    throw $e;
+}
+```
+
+`recordException()` adds the exception as a structured event on the span — visible in the tracing UI as a separate event within the span timeline.
+
+## NoOpSpan
+
+When tracing is disabled (sampled out, module disabled, or `NoOpTracer` is the inner), `startSpan()` returns `NoOpSpan`. All `NoOpSpan` methods do nothing:
+
+```php
+// This code works identically whether tracing is on or off:
+$span = $this->tracer->startSpan('my.operation');
+$span->addAttribute('key', 'value'); // no-op if NoOpSpan
+$span->setStatus('ok');              // no-op if NoOpSpan
+$span->end();                        // no-op if NoOpSpan
+```
+
+No conditionals needed — write tracing code once, it works everywhere.
+
+## Correlation ID
+
+```php
+// Get the current trace/correlation ID
+$correlationId = $this->tracer->currentCorrelationId();
+
+// Returns null when no active span (CLI, before first request)
+// EventBus uses this to carry HTTP request trace ID into dispatched events
+```
+
+## Header Propagation (Distributed Tracing)
+
+For calls between services, propagate trace context via HTTP headers:
+
+```php
+// Before making an outgoing HTTP call:
+$headers = [];
+$this->tracer->injectHeaders($headers);
+// $headers now contains W3C traceparent/tracestate
+
+// When receiving an incoming call:
+$this->tracer->extractContext($request->headers->all());
+// Restores trace context from the incoming headers
+```
+
+`KafkaProducer` and `KafkaConsumer` use these methods automatically to propagate trace context across message boundaries.
+
+<Callout type="info" title="NoOpTracer Always Returns null for currentCorrelationId">
+`NoOpTracer::currentCorrelationId()` always returns `null`. `EventBus` falls back to generating a fresh correlation ID when the tracer returns null. This is the correct behaviour when OpenTelemetry is not configured.
+</Callout>

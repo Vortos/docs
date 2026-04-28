@@ -1,0 +1,161 @@
+---
+title: Resource Ownership
+description: Enforce that users can only access resources they own — with an override permission for admins.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Resource Ownership
+
+Ownership middleware enforces that a user owns the resource they are trying to access. It runs at priority 4.5 — after authorization, before feature access.
+
+<Callout type="info" title="Compile-Time Map">
+All `#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` attributes are scanned at compile time. Runtime middleware does a single array lookup — zero reflection.
+</Callout>
+
+## Implement an Ownership Policy
+
+```php title="src/Document/Infrastructure/DocumentOwnershipPolicy.php"
+use Symfony\Component\HttpFoundation\Request;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Authorization\Ownership\Contract\OwnershipPolicyInterface;
+
+// Auto-discovered — no registration needed
+final class DocumentOwnershipPolicy implements OwnershipPolicyInterface
+{
+    public function __construct(
+        private DocumentRepository $documents,
+    ) {}
+
+    public function isOwner(UserIdentityInterface $identity, string $resourceId): bool
+    {
+        $document = $this->documents->findById($resourceId);
+
+        if ($document === null) {
+            return false; // Resource not found → deny, not 404 (let the controller handle that)
+        }
+
+        return $document->getAuthorId() === $identity->id();
+    }
+
+    public function getResourceIdFrom(Request $request): string
+    {
+        return $request->attributes->get('id') ?? '';
+    }
+}
+```
+
+## Require Ownership
+
+```php
+use Vortos\Authorization\Ownership\Attribute\RequiresOwnership;
+
+// User must own this resource — period.
+#[RequiresOwnership(DocumentOwnershipPolicy::class)]
+final class DeleteDocumentController { ... }
+
+#[RequiresOwnership(InvoiceOwnershipPolicy::class)]
+final class DownloadInvoiceController { ... }
+```
+
+## Ownership OR Override Permission
+
+For resources where admins should be able to bypass the ownership check:
+
+```php
+use Vortos\Authorization\Ownership\Attribute\RequiresOwnershipOrPermission;
+
+// User must own the resource OR have this permission (e.g., admins)
+#[RequiresOwnershipOrPermission(
+    policy: DocumentOwnershipPolicy::class,
+    override: 'documents.delete.any',
+)]
+final class DeleteDocumentController { ... }
+
+// Using an enum for the override permission
+enum Permission: string {
+    case DocumentsDeleteAny = 'documents.delete.any';
+    case InvoicesViewAll    = 'invoices.view.any';
+}
+
+#[RequiresOwnershipOrPermission(
+    policy: DocumentOwnershipPolicy::class,
+    override: Permission::DocumentsDeleteAny,
+)]
+final class DeleteDocumentController { ... }
+```
+
+## Responses
+
+```json
+// #[RequiresOwnership] — user is not the owner
+HTTP 403 Forbidden
+{
+  "error": "Forbidden",
+  "message": "You do not own this resource."
+}
+
+// #[RequiresOwnershipOrPermission] — not owner and lacks override permission
+HTTP 403 Forbidden
+{
+  "error": "Forbidden",
+  "message": "You do not own this resource and lack the required permission."
+}
+```
+
+## Multiple Resource Types
+
+Implement one policy per resource type:
+
+```php
+// Each policy handles one resource type
+final class DocumentOwnershipPolicy implements OwnershipPolicyInterface { ... }
+final class InvoiceOwnershipPolicy implements OwnershipPolicyInterface { ... }
+final class CommentOwnershipPolicy implements OwnershipPolicyInterface { ... }
+
+// Each controller references its specific policy
+#[RequiresOwnership(DocumentOwnershipPolicy::class)]
+final class DeleteDocumentController { ... }
+
+#[RequiresOwnership(InvoiceOwnershipPolicy::class)]
+final class DeleteInvoiceController { ... }
+```
+
+## getResourceIdFrom
+
+The `getResourceIdFrom` method extracts the resource identifier from the request. It is called once per request and must be fast:
+
+```php
+// Route param
+public function getResourceIdFrom(Request $request): string
+{
+    return $request->attributes->get('id');
+}
+
+// Named route param
+public function getResourceIdFrom(Request $request): string
+{
+    return $request->attributes->get('document_id');
+}
+
+// From request body
+public function getResourceIdFrom(Request $request): string
+{
+    return $request->toArray()['document_id'] ?? '';
+}
+```
+
+<Callout type="info" title="Resource Not Found">
+When `isOwner()` returns false because the resource doesn't exist, the middleware returns 403, not 404. This is intentional — it does not leak information about whether a resource exists to users who should not see it. The controller should handle the 404 case for authorized users.
+</Callout>
+
+## Middleware Priority
+
+```
+priority 6: AuthMiddleware            — authenticate
+priority 5: AuthorizationMiddleware   — check permissions
+priority 4.5: OwnershipMiddleware     — check ownership ← here
+priority 4: FeatureAccessMiddleware   — check feature plan
+```
+
+Ownership runs after permission checks — so a user must first pass `#[RequiresPermission]` (if present) before ownership is evaluated.

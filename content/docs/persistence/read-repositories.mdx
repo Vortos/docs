@@ -1,0 +1,262 @@
+---
+title: Read Repositories
+description: Implement MongoReadRepository for query-optimised read models with cursor pagination, index management, and bulk write operations.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Read Repositories
+
+`MongoReadRepository` is the abstract base for all read-side query repositories. Extend it and implement three methods — all standard CRUD operations, cursor pagination, index management, and bulk writes are provided free.
+
+## Required: Store `_id` as String UUID
+
+Always store the `_id` field as a string UUID (UuidV7). Never use MongoDB's `ObjectId` for documents that have UuidV7 identities. Mixing types causes silent type mismatch bugs when querying by ID.
+
+```php
+// CORRECT — _id is a string
+['_id' => 'user-019d4784-7b26-...', 'email' => 'alice@example.com']
+
+// WRONG — _id is an ObjectId
+['_id' => new ObjectId(), 'email' => 'alice@example.com']
+```
+
+## Implement the Three Methods
+
+```php title="src/User/Infrastructure/Repository/UserReadRepository.php"
+use Vortos\PersistenceMongo\Read\MongoReadRepository;
+
+final class UserReadRepository extends MongoReadRepository
+{
+    // 1. Collection name
+    protected function collectionName(): string
+    {
+        return 'users';
+    }
+
+    // 2. Raw MongoDB document → your shape
+    protected function fromDocument(array $doc): array
+    {
+        return [
+            'id'        => $doc['_id'],
+            'email'     => $doc['email'],
+            'name'      => $doc['name'],
+            'createdAt' => $doc['createdAt'],
+        ];
+    }
+
+    // 3. Index definitions
+    protected function indexes(): array
+    {
+        return [
+            ['key' => ['email' => 1], 'options' => ['unique' => true]],
+            ['key' => ['createdAt' => -1, '_id' => -1], 'options' => []],
+        ];
+    }
+}
+```
+
+## Register the Repository
+
+```php title="config/services.php"
+use MongoDB\Client;
+
+$services->set(UserReadRepository::class)
+    ->arg('$client', service(Client::class))
+    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
+    ->tag('vortos.read_repository')  // required for vortos:setup:persistence
+    ->public();
+```
+
+The `vortos.read_repository` tag registers the repository for index management via `vortos:setup:persistence`.
+
+## Built-In Operations
+
+### `findById(string $id): ?array`
+
+```php
+$user = $userReadRepository->findById('user-019d...');
+// Returns null if not found
+```
+
+### `findByCriteria(array $criteria, array $sort, int $limit, ?string $cursor): array`
+
+```php
+// Simple filter
+$activeUsers = $userReadRepository->findByCriteria(['status' => 'active']);
+
+// With sort and limit
+$recent = $userReadRepository->findByCriteria(
+    criteria: ['role' => 'admin'],
+    sort: ['createdAt' => 'desc'],
+    limit: 20,
+);
+```
+
+Criteria is flat key-value — exact equality matching. For complex queries (range filters, `$in`, aggregation), use the protected `collection()` method.
+
+### `findPage(array $criteria, int $limit, ?string $cursor, array $sort): PageResult`
+
+See the [Pagination](/docs/persistence/pagination) page for full details.
+
+### `countByCriteria(array $criteria): int`
+
+```php
+$count = $userReadRepository->countByCriteria(['status' => 'active']);
+```
+
+<Callout type="warn" title="count() is Expensive">
+`countByCriteria()` uses `countDocuments()` which scans all matching documents. On large collections without a supporting index this is expensive. Prefer `hasMore` from `PageResult` for pagination UI — avoid count unless you need the exact total.
+</Callout>
+
+### `upsert(string $id, array $document): void`
+
+Insert or replace a single document:
+
+```php
+$userReadRepository->upsert('user-123', [
+    '_id'       => 'user-123',
+    'email'     => 'alice@example.com',
+    'name'      => 'Alice',
+    'createdAt' => (new \DateTimeImmutable())->format('c'),
+]);
+```
+
+### `bulkUpsert(array $documents): void`
+
+Insert or replace multiple documents in a single bulk write:
+
+```php
+$userReadRepository->bulkUpsert([
+    ['_id' => 'user-1', 'email' => 'alice@example.com', 'name' => 'Alice'],
+    ['_id' => 'user-2', 'email' => 'bob@example.com', 'name' => 'Bob'],
+]);
+```
+
+More efficient than calling `upsert()` in a loop. Each document must contain `_id`.
+
+### `bulkDelete(array $ids): void`
+
+```php
+$userReadRepository->bulkDelete(['user-1', 'user-2', 'user-3']);
+```
+
+Single `deleteMany` operation.
+
+## Custom Queries
+
+Use the protected `collection()` method for queries beyond `findByCriteria()`:
+
+```php
+// Range filter
+public function findByEmailDomain(string $domain): array
+{
+    $cursor = $this->collection()->find([
+        'email' => ['$regex' => '@' . preg_quote($domain) . '$'],
+    ]);
+
+    return array_map(
+        fn($doc) => $this->fromDocument((array) $doc),
+        iterator_to_array($cursor),
+    );
+}
+
+// Aggregation pipeline
+public function countByRole(): array
+{
+    $pipeline = [
+        ['$group' => ['_id' => '$role', 'count' => ['$sum' => 1]]],
+        ['$sort' => ['count' => -1]],
+    ];
+
+    return iterator_to_array($this->collection()->aggregate($pipeline));
+}
+
+// Text search (requires text index)
+public function search(string $query): array
+{
+    $cursor = $this->collection()->find([
+        '$text' => ['$search' => $query],
+    ]);
+
+    return array_map(
+        fn($doc) => $this->fromDocument((array) $doc),
+        iterator_to_array($cursor),
+    );
+}
+```
+
+## Index Management
+
+Declare indexes in `indexes()`. They are created by `vortos:setup:persistence` — safe to run on every deploy:
+
+```php
+protected function indexes(): array
+{
+    return [
+        // Unique index on email
+        ['key' => ['email' => 1], 'options' => ['unique' => true]],
+
+        // Compound index for common query + sort
+        ['key' => ['status' => 1, 'createdAt' => -1], 'options' => []],
+
+        // Descending sort with _id tiebreaker (recommended for pagination)
+        ['key' => ['createdAt' => -1, '_id' => -1], 'options' => []],
+
+        // Sparse index (only indexes documents where field exists)
+        ['key' => ['deletedAt' => 1], 'options' => ['sparse' => true]],
+
+        // Text index for full-text search
+        ['key' => ['name' => 'text', 'bio' => 'text'], 'options' => []],
+
+        // TTL index (auto-delete documents after N seconds)
+        ['key' => ['expiresAt' => 1], 'options' => ['expireAfterSeconds' => 0]],
+    ];
+}
+```
+
+Key direction: `1` = ascending, `-1` = descending.
+
+Run index setup:
+
+```bash
+php bin/console vortos:setup:persistence
+
+# Output:
+#   ✔ Indexes ensured (3): users
+#   ✔ Indexes ensured (2): orders
+```
+
+## Projections in Event Handlers
+
+The most common way to populate read repositories is via projection handlers:
+
+```php
+use Vortos\Cqrs\Attribute\AsProjectionHandler;
+
+#[AsProjectionHandler]
+final class UserProjectionHandler
+{
+    public function __construct(
+        private UserReadRepository $readRepository,
+    ) {}
+
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        $this->readRepository->upsert($event->userId, [
+            '_id'       => $event->userId,
+            'email'     => $event->email,
+            'name'      => $event->name,
+            'createdAt' => $event->occurredAt()->format('c'),
+        ]);
+    }
+
+    public function onUserNameUpdated(UserNameUpdatedEvent $event): void
+    {
+        // For partial updates, load + modify + upsert
+        $doc = $this->readRepository->findById($event->userId) ?? [];
+        $doc['name'] = $event->newName;
+        $this->readRepository->upsert($event->userId, $doc);
+    }
+}
+```

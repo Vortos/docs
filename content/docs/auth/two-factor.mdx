@@ -1,0 +1,155 @@
+---
+title: Two-Factor Authentication
+description: Enforce 2FA on sensitive routes — pluggable verifier interface, configurable challenge URL, and grace period support.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Two-Factor Authentication
+
+Vortos provides a `#[Requires2FA]` attribute that enforces two-factor verification on specific controllers or methods. The verification logic is pluggable — you implement `TwoFactorVerifierInterface` using TOTP, SMS, or any other method.
+
+<Callout type="info" title="Compile-Time Map">
+All `#[Requires2FA]` attributes are scanned at compile time. Runtime middleware does a single array lookup — zero reflection.
+</Callout>
+
+## Middleware Priority
+
+`TwoFactorMiddleware` runs at priority 5.5 — between `AuthMiddleware` (6) and `AuthorizationMiddleware` (5):
+
+```
+priority 6: AuthMiddleware         — validate token, set identity
+priority 5.5: TwoFactorMiddleware  — check 2FA verification
+priority 5: AuthorizationMiddleware — check permissions
+```
+
+This ensures the user is authenticated before 2FA is checked, and 2FA is verified before permissions are evaluated.
+
+## Implement a Verifier
+
+```php title="src/Auth/TotpVerifier.php"
+use Symfony\Component\HttpFoundation\Request;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Auth\TwoFactor\Contract\TwoFactorVerifierInterface;
+
+// Auto-discovered — no registration needed
+final class TotpVerifier implements TwoFactorVerifierInterface
+{
+    public function isVerified(UserIdentityInterface $identity, Request $request): bool
+    {
+        // Check if 2FA was verified in this session and is still within grace period
+        $sessionKey = '2fa_verified_at_' . $identity->id();
+        $verifiedAt = $request->getSession()->get($sessionKey);
+
+        if (!$verifiedAt) {
+            return false;
+        }
+
+        // Grace period: 5 minutes after 2FA completion
+        return (time() - $verifiedAt) < 300;
+    }
+
+    public function getChallengeUrl(): string
+    {
+        return '/auth/2fa/challenge';
+    }
+}
+```
+
+## Apply to Routes
+
+```php
+use Vortos\Auth\TwoFactor\Attribute\Requires2FA;
+
+// Entire controller requires 2FA
+#[Requires2FA]
+final class DeleteAccountController { ... }
+
+// Specific high-value actions
+#[Requires2FA]
+final class TransferFundsController { ... }
+
+#[Requires2FA]
+final class ExportAllDataController { ... }
+```
+
+## Response When 2FA Not Verified
+
+```
+HTTP 403 Forbidden
+
+{
+  "error": "Two-Factor Authentication Required",
+  "message": "This action requires 2FA verification.",
+  "challenge_url": "/auth/2fa/challenge"
+}
+```
+
+The frontend uses `challenge_url` to redirect the user to complete 2FA, then retry the original request.
+
+## Challenge Controller
+
+You implement the challenge controller in your application — Vortos does not provide one because every 2FA method is different:
+
+```php title="src/Auth/Http/TwoFactorChallengeController.php"
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+#[RequiresAuth]
+final class TwoFactorChallengeController
+{
+    public function __construct(
+        private TotpService $totp,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    #[Route('/auth/2fa/challenge', methods: ['POST'])]
+    public function verify(Request $request): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+        $code = $request->toArray()['code'] ?? '';
+
+        if (!$this->totp->verify($identity->id(), $code)) {
+            return new JsonResponse(['error' => 'Invalid code'], 422);
+        }
+
+        // Mark 2FA as verified in session with current timestamp
+        $request->getSession()->set('2fa_verified_at_' . $identity->id(), time());
+
+        return new JsonResponse(['verified' => true]);
+    }
+}
+```
+
+## Grace Period
+
+The grace period is how long after completing 2FA a user can access protected routes without being challenged again. Implement this in your verifier:
+
+```php
+public function isVerified(UserIdentityInterface $identity, Request $request): bool
+{
+    $verifiedAt = $request->getSession()->get('2fa_verified_at_' . $identity->id());
+
+    if (!$verifiedAt) return false;
+
+    $gracePeriodSeconds = 300; // 5 minutes
+
+    return (time() - $verifiedAt) < $gracePeriodSeconds;
+}
+```
+
+A shorter grace period is more secure but more disruptive for users who perform multiple sensitive actions in quick succession. A longer grace period is more convenient but increases the window of exposure if a session is hijacked.
+
+## When to Use 2FA
+
+Apply `#[Requires2FA]` to routes that are:
+
+- **Destructive**: Delete account, delete all data, bulk delete
+- **Financial**: Transfer funds, change payment method, update billing
+- **Administrative**: Change email, change password, revoke API keys
+- **Sensitive exports**: Export all personal data, export payment history
+
+Do not apply it to read-only routes or routine actions — the disruption outweighs the security benefit.
+
+## Skipped for Anonymous Users
+
+`TwoFactorMiddleware` skips the check if the user is not authenticated. `AuthMiddleware` handles the 401 for unauthenticated requests on protected routes.

@@ -1,0 +1,163 @@
+---
+title: Tagged Cache
+description: setWithTags() and invalidateTags() — group related cache entries and invalidate them all at once without knowing individual keys.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Tagged Cache
+
+Tags group related cache entries so they can all be invalidated together. When a user updates their profile, you invalidate `['user:123']` — every cache entry tagged with that value is gone, atomically, without you needing to track what keys exist.
+
+## TaggedCacheInterface
+
+```php
+interface TaggedCacheInterface extends CacheInterface
+{
+    public function setWithTags(string $key, mixed $value, array $tags, ?int $ttl = null): bool;
+    public function invalidateTags(array $tags): bool;
+}
+```
+
+Extends PSR-16 `CacheInterface` — all standard `get`, `set`, `delete`, `has`, `clear` methods are available too.
+
+## setWithTags
+
+```php
+use Vortos\Cache\Contract\TaggedCacheInterface;
+
+// Store with one tag
+$cache->setWithTags('user:123:profile', $profile, ['user:123'], 3600);
+
+// Store with multiple tags — key is in ALL tag indices
+$cache->setWithTags('user:123:permissions', $perms, ['user:123', 'permissions'], 3600);
+
+// TTL null = use configured defaultTtl
+$cache->setWithTags('config:theme', $theme, ['config'], null);
+```
+
+## invalidateTags
+
+```php
+// Invalidate everything tagged with user:123
+$cache->invalidateTags(['user:123']);
+
+// Invalidate multiple tags at once
+$cache->invalidateTags(['user:123', 'permissions']);
+
+// Safe to call with tags that have no entries — returns true
+$cache->invalidateTags(['nonexistent_tag']);
+```
+
+## Practical Examples
+
+### User Profile Cache
+
+```php
+final class UserProfileService
+{
+    public function __construct(private TaggedCacheInterface $cache) {}
+
+    public function getProfile(string $userId): array
+    {
+        $key = "user:{$userId}:profile";
+
+        if ($this->cache->has($key)) {
+            return $this->cache->get($key);
+        }
+
+        $profile = $this->loadFromDb($userId);
+
+        // Tag with user ID — invalidated when user data changes
+        $this->cache->setWithTags($key, $profile, ["user:{$userId}"], 3600);
+
+        return $profile;
+    }
+
+    public function onProfileUpdated(string $userId): void
+    {
+        // Invalidates all cache entries tagged with this user
+        $this->cache->invalidateTags(["user:{$userId}"]);
+    }
+}
+```
+
+### Permission Matrix Cache
+
+```php
+final class PermissionService
+{
+    public function getMatrix(string $tenantId): array
+    {
+        $key = "permissions:matrix:{$tenantId}";
+
+        if ($this->cache->has($key)) {
+            return $this->cache->get($key);
+        }
+
+        $matrix = $this->loadPermissionsFromDb($tenantId);
+
+        $this->cache->setWithTags(
+            $key,
+            $matrix,
+            ["permissions", "tenant:{$tenantId}"],
+            3600,
+        );
+
+        return $matrix;
+    }
+
+    public function onRoleChanged(string $tenantId): void
+    {
+        // Invalidates permission matrix for this tenant only
+        $this->cache->invalidateTags(["tenant:{$tenantId}"]);
+    }
+
+    public function onGlobalPermissionsChanged(): void
+    {
+        // Invalidates ALL permission matrices across all tenants
+        $this->cache->invalidateTags(['permissions']);
+    }
+}
+```
+
+### Multi-Layer Tags
+
+A single cache entry can have multiple tags at different granularities:
+
+```php
+// Tags: specific user + general category
+$cache->setWithTags(
+    "user:{$userId}:orders:recent",
+    $orders,
+    ["user:{$userId}", "orders", "tenant:{$tenantId}"],
+    1800,
+);
+
+// Invalidate just this user's data
+$cache->invalidateTags(["user:{$userId}"]);
+
+// Invalidate all orders cache (e.g. after order schema migration)
+$cache->invalidateTags(["orders"]);
+
+// Invalidate entire tenant's cache
+$cache->invalidateTags(["tenant:{$tenantId}"]);
+```
+
+## Standard set() vs setWithTags()
+
+Use `set()` for data with no related invalidation needs. Use `setWithTags()` when the data must be invalidated when a related entity changes:
+
+```php
+// No invalidation needed — config never changes mid-deploy
+$cache->set('app:version', '1.2.3', 86400);
+
+// Invalidation needed — user data changes
+$cache->setWithTags('user:123:settings', $settings, ['user:123'], 3600);
+```
+
+`set()` and `get()` are slightly faster than `setWithTags()` — no tag index write. For high-frequency keys with no invalidation requirement, use `set()`.
+
+<Callout type="info" title="Tag TTL in Redis">
+In `RedisAdapter`, each tag's index SET has a 7-day TTL. This means if a tagged key naturally expires before invalidation, the tag index entry remains for up to 7 days. When `invalidateTags()` is called, it may try to delete already-expired keys — this is safe and a no-op in Redis.
+</Callout>

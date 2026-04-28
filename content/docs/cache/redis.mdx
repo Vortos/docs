@@ -1,0 +1,162 @@
+---
+title: Redis
+description: Redis connection DSN format, key prefix strategy, SCAN-based clear, tag index internals, and database selection.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Redis
+
+`RedisAdapter` uses PHP's `ext-redis` C extension — installed in the Vortos Docker image. `RedisConnectionFactory` handles connection, authentication, and database selection from a DSN string.
+
+## DSN Format
+
+```
+redis://[:password@]host[:port][/database]
+```
+
+| Component | Required | Default | Example |
+|---|---|---|---|
+| `host` | Yes | — | `redis`, `127.0.0.1` |
+| `port` | No | `6379` | `6380` |
+| `password` | No | none | `secretpassword` |
+| `database` | No | `0` | `/1` |
+
+### Examples
+
+```bash
+# Local development — no auth, default port, database 0
+redis://redis:6379
+
+# With password
+redis://:secretpassword@redis:6379
+
+# Custom port
+redis://redis:6380
+
+# With password and database 1
+redis://:secretpassword@redis:6379/1
+
+# Remote with all options
+redis://:p@ssw0rd@cache.example.com:6380/2
+```
+
+Set in environment:
+
+```bash
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=
+```
+
+```php title="config/cache.php"
+$config->dsn(sprintf(
+    'redis://%s%s:%s',
+    $_ENV['REDIS_PASSWORD'] ? ':' . $_ENV['REDIS_PASSWORD'] . '@' : '',
+    $_ENV['REDIS_HOST'],
+    $_ENV['REDIS_PORT'],
+));
+```
+
+## Key Prefix
+
+All cache keys are automatically prefixed. Always include `APP_ENV` and app name:
+
+```php
+$config->prefix($_ENV['APP_ENV'] . '_myapp_');
+// dev environment:  dev_myapp_user:123:profile
+// prod environment: prod_myapp_user:123:profile
+```
+
+This lets `dev` and `prod` safely share one Redis instance without key collisions. It is also why `clear()` uses SCAN+DEL with the prefix instead of `FLUSHDB` — only this app's keys are affected.
+
+## Key Format Internals
+
+```
+{prefix}{key}                    — cached value
+{prefix}__tag__{tagName}         — Redis SET of prefixed keys for this tag
+```
+
+Example with prefix `prod_myapp_`:
+
+```
+prod_myapp_user:123:profile      → serialized profile value
+prod_myapp___tag__user:123       → SET { "prod_myapp_user:123:profile", "prod_myapp_user:123:settings" }
+prod_myapp___tag__permissions    → SET { "prod_myapp_permissions:matrix:tenant-1", ... }
+```
+
+## Serialization
+
+Values are serialized with PHP's native `serialize()`/`unserialize()`. This handles all PHP types including objects, arrays, nested structures, and custom classes. `ext-redis`'s built-in serializer is disabled — `RedisConnectionFactory` sets `Redis::OPT_SERIALIZER` to `Redis::SERIALIZER_NONE` explicitly.
+
+## clear() Uses SCAN, Not FLUSHDB
+
+```php
+// CORRECT — only deletes keys with this adapter's prefix
+$cache->clear();
+
+// NEVER do this directly — wipes entire Redis database
+// $redis->flushDb(); // ← destroys Kafka offsets, sessions, messaging keys
+```
+
+`clear()` uses Redis `SCAN` with cursor iteration and the configured prefix pattern. It deletes only this adapter's keys in batches of 100:
+
+```
+SCAN 0 MATCH "prod_myapp_*" COUNT 100
+→ delete batch
+SCAN cursor MATCH "prod_myapp_*" COUNT 100
+→ delete batch
+... until cursor = 0
+```
+
+This is safe on large keyspaces — never blocks Redis.
+
+## Tag Index in Redis
+
+`setWithTags()` uses Redis `MULTI`/`EXEC` (pipeline) for atomicity:
+
+```
+MULTI
+SETEX prod_myapp_user:123:profile 3600 <serialized>
+SADD  prod_myapp___tag__user:123  "prod_myapp_user:123:profile"
+EXPIRE prod_myapp___tag__user:123 604800  (7 days)
+EXEC
+```
+
+`invalidateTags()` reads the SET and deletes all members:
+
+```
+SMEMBERS prod_myapp___tag__user:123
+→ ["prod_myapp_user:123:profile", "prod_myapp_user:123:settings"]
+
+DEL prod_myapp_user:123:profile prod_myapp_user:123:settings
+DEL prod_myapp___tag__user:123
+```
+
+## Redis Database Selection
+
+Redis supports 16 logical databases (0-15). The default database is 0. Use database index separation when sharing a Redis instance across multiple applications or concerns:
+
+```bash
+redis://:password@redis:6379/0   # application cache (default)
+redis://:password@redis:6379/1   # sessions
+redis://:password@redis:6379/2   # rate limiting
+```
+
+Key prefixes are usually sufficient for separation within one application. Use different databases for complete isolation between unrelated applications on the same Redis host.
+
+## Redis Connection is Not Lazy
+
+Unlike DBAL, the Redis connection is established immediately on container construction. If Redis is unreachable at boot time, the application fails to start. Use health checks in your deployment pipeline:
+
+```yaml
+# docker-compose.yml
+backend:
+  depends_on:
+    redis:
+      condition: service_healthy
+```
+
+<Callout type="warn" title="ext-redis Required">
+`RedisAdapter` requires `ext-redis` (the C extension), not `predis/predis` (pure PHP). `ext-redis` is pre-installed in the Vortos Docker image via `pecl install redis`. If you see `Class "Redis" not found`, the extension is not installed.
+</Callout>

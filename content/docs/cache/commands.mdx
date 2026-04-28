@@ -1,0 +1,92 @@
+---
+title: Commands
+description: vortos:cache:clear and vortos:cache:warmup — clear, tag-invalidate, and pre-populate the cache from the command line.
+---
+
+# Commands
+
+## vortos:cache:clear
+
+Clears the cache or invalidates specific tags.
+
+```bash
+# Clear ALL keys matching the configured prefix
+php bin/console vortos:cache:clear
+
+# Invalidate a single tag
+php bin/console vortos:cache:clear --tag=user:123
+
+# Invalidate multiple tags
+php bin/console vortos:cache:clear --tag=user:123 --tag=permissions
+
+# Short option
+php bin/console vortos:cache:clear -t user:123
+```
+
+### Without --tag
+
+Calls `TaggedCacheInterface::clear()` — deletes all keys matching the configured prefix using Redis `SCAN`. Only this application's prefixed keys are removed. Redis system keys, Kafka offsets, and session data are untouched.
+
+```
+✔ Cache cleared.
+Run vortos:cache:warmup to pre-populate critical entries.
+```
+
+### With --tag
+
+Calls `TaggedCacheInterface::invalidateTags()` for each specified tag. Only keys tagged with those values are removed — surgical invalidation. All other cache entries survive.
+
+```
+✔ Invalidated tags: user:123, permissions
+```
+
+## vortos:cache:warmup
+
+Runs all registered cache warmers in sequence.
+
+```bash
+php bin/console vortos:cache:warmup
+```
+
+```
+Vortos Cache Warmup
+
+  ✔ App\Cache\PermissionMatrixCacheWarmer
+  ✔ App\Cache\ActiveCompetitionsCacheWarmer
+  ✔ App\Cache\ConfigCacheWarmer
+  ✘ App\Cache\ExternalApiCacheWarmer: Connection timed out
+
+Done. 3 warmer(s) ran successfully.
+```
+
+Failed warmers are logged and skipped — they do not stop the run. Exit code is always 0 (success) even if some warmers fail — deployment should not be blocked by an unreachable external API.
+
+## Deployment Workflow
+
+```bash
+# Standard deployment sequence
+php bin/console vortos:cache:clear    # 1. remove stale cache entries
+php bin/console vortos:cache:warmup   # 2. pre-populate critical entries
+php bin/console vortos:setup:persistence  # 3. ensure MongoDB indexes
+```
+
+## Selective Invalidation in Handlers
+
+For fine-grained invalidation without clearing everything:
+
+```php
+use Vortos\Cache\Contract\TaggedCacheInterface;
+
+final class UpdateUserProfileHandler
+{
+    public function __construct(private TaggedCacheInterface $cache) {}
+
+    public function __invoke(UpdateUserProfile $command): void
+    {
+        // ... update user in DB
+
+        // Invalidate only this user's cached data
+        $this->cache->invalidateTags(["user:{$command->userId}"]);
+    }
+}
+```

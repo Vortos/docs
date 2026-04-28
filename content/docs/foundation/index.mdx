@@ -1,0 +1,213 @@
+---
+title: Foundation
+description: The application bootstrap layer — Runner, Container auto-discovery, PackageInterface, container caching, and FrankenPHP worker mode.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Foundation
+
+`vortos-foundation` is the bootstrap layer. It wires `Runner` (handles HTTP requests and manages the DI container), `Container.php` (package auto-discovery), and `PackageInterface` (the contract every module implements).
+
+## Runner
+
+`Runner` is the entry point for every HTTP request. It builds the container, handles the request, and cleans up between requests in worker mode.
+
+```php title="public/index.php"
+use Vortos\Foundation\Runner;
+
+$runner = new Runner(
+    environment: $_ENV['APP_ENV'] ?? 'prod',
+    debug:       $_ENV['APP_ENV'] === 'dev',
+    projectRoot: dirname(__DIR__),
+    context:     'http',
+);
+
+$response = $runner->run();
+$response->send();
+$runner->cleanUp();
+```
+
+### Constructor Parameters
+
+| Parameter | Type | Description |
+|---|---|---|
+| `$environment` | `string` | `prod`, `dev`, `test` — controls caching and log level |
+| `$debug` | `bool` | `true` = debug error pages, full exception messages |
+| `$projectRoot` | `string` | Absolute path to project root (`dirname(__DIR__)` from `public/`) |
+| `$context` | `string` | `http` (default) or `worker` — controls route loading and cleanup |
+
+### run()
+
+```
+run()
+├── Request::createFromGlobals()
+├── getContainer()
+│       ├── prod + http + dump exists → load CachedContainer (zero compile)
+│       └── otherwise → include Container.php → compile → dump if prod
+├── $kernel->handle($request) → Response
+└── return Response
+```
+
+On container compile failure, `run()` returns a `503` response rather than crashing — logs the error prominently with full stack trace.
+
+### setParameter() / setParameters()
+
+Inject custom container parameters before the container builds:
+
+```php
+$runner
+    ->setParameter('app.name', 'Squaura')
+    ->setParameter('app.version', '2.1.0')
+    ->setParameters([
+        'feature.beta' => $_ENV['FEATURE_BETA'] === 'true',
+        'stripe.key'   => $_ENV['STRIPE_KEY'],
+    ]);
+```
+
+Parameters set here are available in services via `%parameter.name%`.
+
+### cleanUp()
+
+Call after `$response->send()`. In standard PHP-FPM mode, clears the `ArrayAdapter` and resets the container. In FrankenPHP worker mode, only clears `ArrayAdapter` — the container stays alive across requests:
+
+```php
+// Standard PHP-FPM
+$response->send();
+$runner->cleanUp(); // container = null, ArrayAdapter cleared
+
+// FrankenPHP worker mode (detected via function_exists('frankenphp_handle_request'))
+$response->send();
+$runner->cleanUp(); // ArrayAdapter cleared, container kept alive
+```
+
+<Callout type="warn" title="Always call cleanUp()">
+`cleanUp()` must be called after every request. Without it, `ArrayAdapter` data leaks between requests in worker mode — user A's identity could be visible to user B.
+</Callout>
+
+## Container Auto-Discovery
+
+`Bootstrap/Container.php` automatically discovers and registers all Vortos packages by scanning two sources:
+
+**Source 1 — `vendor/composer/installed.json`** (Packagist-installed packages):
+
+Any installed package that declares `extra.vortos.package` in its `composer.json` is discovered automatically:
+
+```json title="packages/Vortos/src/Cache/composer.json"
+{
+  "extra": {
+    "vortos": {
+      "package": "Vortos\\Cache\\DependencyInjection\\CachePackage",
+      "order": 10
+    }
+  }
+}
+```
+
+**Source 2 — path repositories** (local monorepo packages):
+
+The root `composer.json`'s `repositories` array is scanned for `type: path` entries. Their `composer.json` files are read and packages discovered the same way.
+
+### Discovery Order
+
+The `order` field controls registration sequence. Lower = earlier:
+
+```
+order 1:  HttpPackage
+order 5:  CachePackage
+order 10: LoggerPackage
+order 15: TracingPackage
+order 20: PersistencePackage
+order 25: DbalPersistencePackage
+order 30: MongoPersistencePackage
+order 40: MessagingPackage
+order 50: CqrsPackage
+order 60: AuthPackage
+order 70: AuthorizationPackage
+order 80: DockerPackage
+```
+
+This order matches the dependency requirements covered in each module's docs.
+
+## PackageInterface
+
+Every module implements `PackageInterface`:
+
+```php
+interface PackageInterface
+{
+    // Return the DI Extension for this package
+    public function getContainerExtension(): ?ExtensionInterface;
+
+    // Register compiler passes here — runs before container compiles
+    public function build(ContainerBuilder $container): void;
+}
+```
+
+Implement this to create your own package:
+
+```php
+final class MyFeaturePackage implements PackageInterface
+{
+    public function getContainerExtension(): ?ExtensionInterface
+    {
+        return new MyFeatureExtension();
+    }
+
+    public function build(ContainerBuilder $container): void
+    {
+        $container->addCompilerPass(new MyFeatureCompilerPass());
+    }
+}
+```
+
+## Container Caching
+
+In `prod` + `http` context, the compiled container is dumped to `var/cache/container_dump.php` as `CachedContainer`. On subsequent requests it is loaded directly — zero compilation overhead:
+
+```
+First prod request:
+    Container.php → compile → dump to var/cache/container_dump.php
+
+Subsequent prod requests:
+    require_once var/cache/container_dump.php
+    new CachedContainer() → instant, no compile
+```
+
+In `dev`, the container is recompiled on every request — config changes take effect immediately.
+
+Clear the cache dump when deploying:
+
+```bash
+rm -f var/cache/container_dump.php
+```
+
+## ConsoleCommandPass
+
+`ConsoleCommandPass` is added by `Runner` automatically. It discovers all services tagged `console.command` and registers them with Symfony's `Application`:
+
+```php
+// This happens automatically — you never call this directly
+$container->addCompilerPass(new ConsoleCommandPass());
+```
+
+Any command registered as a service with `->addTag('console.command')` is available in `bin/console` — Vortos packages use this automatically via `#[AsCommand]`.
+
+## CLI Context
+
+For worker processes and console commands, boot with `context: 'worker'` to skip HTTP route compilation:
+
+```php title="bin/console"
+$runner = new Runner(
+    environment: $_ENV['APP_ENV'] ?? 'prod',
+    debug:       false,
+    projectRoot: dirname(__DIR__),
+    context:     'worker',   // no routes, no RouterListener
+);
+
+$container = $runner->getContainer();
+$app = $container->get(\Symfony\Component\Console\Application::class);
+$app->run();
+```
+
+With `context: 'worker'`, `kernel.enable_routes` is set to `false` — `RouteCompilerPass` and `HttpListenerCompilerPass` both skip, making the container cheaper to build for CLI use.

@@ -1,0 +1,13 @@
+{
+  "title": "Vortos Framework",
+  "pages": [
+    "getting-started",
+    "auth",
+    "authorization",
+    "messaging",
+    "cqrs",
+    "persistence",
+    "cache",
+    "tracing"
+  ]
+}

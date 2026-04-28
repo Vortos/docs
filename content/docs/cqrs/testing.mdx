@@ -1,0 +1,246 @@
+---
+title: Testing
+description: Test command handlers, query handlers, and projection handlers in isolation — no container, no infrastructure.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing CQRS
+
+## Testing Command Handlers
+
+Command handlers are plain PHP classes — test them directly:
+
+```php
+use Vortos\Cache\Adapter\InMemoryAdapter;
+use Vortos\Cqrs\Command\Idempotency\InMemoryCommandIdempotencyStore;
+
+final class RegisterUserHandlerTest extends TestCase
+{
+    private InMemoryUserRepository $users;
+    private RegisterUserHandler $handler;
+
+    protected function setUp(): void
+    {
+        $this->users = new InMemoryUserRepository();
+        $this->handler = new RegisterUserHandler(
+            users: $this->users,
+            hasher: new ArgonPasswordHasher(),
+        );
+    }
+
+    protected function tearDown(): void
+    {
+        $this->users->clear();
+    }
+
+    public function test_registers_user(): void
+    {
+        $user = $this->handler->__invoke(new RegisterUser(
+            email: 'alice@example.com',
+            name: 'Alice',
+            password: 'secret',
+        ));
+
+        $this->assertInstanceOf(User::class, $user);
+        $this->assertCount(1, $this->users->all());
+    }
+
+    public function test_raises_domain_event(): void
+    {
+        $user = $this->handler->__invoke(new RegisterUser('alice@example.com', 'Alice', 'secret'));
+        $events = $user->pullDomainEvents();
+
+        $this->assertCount(1, $events);
+        $this->assertInstanceOf(UserRegisteredEvent::class, $events[0]);
+        $this->assertSame('alice@example.com', $events[0]->email);
+    }
+
+    public function test_rejects_duplicate_email(): void
+    {
+        $this->handler->__invoke(new RegisterUser('alice@example.com', 'Alice', 'secret'));
+
+        $this->expectException(EmailAlreadyTakenException::class);
+        $this->handler->__invoke(new RegisterUser('alice@example.com', 'Alice 2', 'secret'));
+    }
+}
+```
+
+## Testing with CommandBus (Integration)
+
+Test the full command bus pipeline — idempotency, transaction, event dispatch:
+
+```php
+use NullLogger;
+use Symfony\Component\DependencyInjection\ServiceLocator;
+use Vortos\Cqrs\Command\CommandBus;
+use Vortos\Cqrs\Command\Idempotency\InMemoryCommandIdempotencyStore;
+
+final class CommandBusIntegrationTest extends TestCase
+{
+    private function makeBus(object $handler, array $strategies = []): CommandBus
+    {
+        $commandClass = (new \ReflectionMethod($handler, '__invoke'))
+            ->getParameters()[0]->getType()->getName();
+
+        $locator = new ServiceLocator([$commandClass => fn() => $handler]);
+
+        $uow = $this->createMock(\Vortos\Persistence\Transaction\UnitOfWorkInterface::class);
+        $uow->method('run')->willReturnCallback(fn(callable $fn) => $fn());
+
+        $eventBus = $this->createMock(\Vortos\Messaging\Contract\EventBusInterface::class);
+
+        return new CommandBus(
+            $locator,
+            $uow,
+            $eventBus,
+            new InMemoryCommandIdempotencyStore(),
+            new \Psr\Log\NullLogger(),
+            $strategies,
+        );
+    }
+
+    public function test_dispatches_command(): void
+    {
+        $handled = false;
+        $handler = new class($handled) {
+            public function __construct(private bool &$handled) {}
+            public function __invoke(RegisterUser $command): void { $this->handled = true; }
+        };
+
+        $bus = $this->makeBus($handler);
+        $bus->dispatch(new RegisterUser('alice@example.com', 'Alice', 'secret'));
+
+        $this->assertTrue($handled);
+    }
+
+    public function test_idempotency_skips_duplicate(): void
+    {
+        $callCount = 0;
+        $handler = new class($callCount) {
+            public function __construct(private int &$callCount) {}
+            public function __invoke(RegisterUser $command): void { $this->callCount++; }
+        };
+
+        $strategies = [RegisterUser::class => ['strategy' => 'property', 'property' => 'requestId']];
+        $bus = $this->makeBus($handler, $strategies);
+
+        $command = new RegisterUser('alice@example.com', 'Alice', 'secret');
+        // Manually give it a requestId via a subclass for testing
+        $bus->dispatch($command);
+        $bus->dispatch($command); // duplicate — same object, same key
+
+        // With 'none' strategy, both run. With 'property', second is skipped.
+        // Adjust assertion based on your command's idempotency setup.
+        $this->assertSame(1, $callCount);
+    }
+}
+```
+
+## Testing Query Handlers
+
+```php
+final class GetUserByIdHandlerTest extends TestCase
+{
+    private InMemoryUserReadRepository $repo;
+
+    protected function setUp(): void
+    {
+        $this->repo = new InMemoryUserReadRepository();
+        $this->repo->seed('user-1', ['_id' => 'user-1', 'email' => 'alice@example.com', 'name' => 'Alice']);
+    }
+
+    protected function tearDown(): void { $this->repo->clear(); }
+
+    public function test_returns_user_by_id(): void
+    {
+        $handler = new GetUserByIdHandler($this->repo);
+        $result = $handler->__invoke(new GetUserById('user-1'));
+
+        $this->assertSame('alice@example.com', $result['email']);
+    }
+
+    public function test_returns_null_for_unknown_id(): void
+    {
+        $handler = new GetUserByIdHandler($this->repo);
+        $this->assertNull($handler->__invoke(new GetUserById('unknown')));
+    }
+}
+```
+
+## Testing Idempotency Store
+
+```php
+use Vortos\Cqrs\Command\Idempotency\InMemoryCommandIdempotencyStore;
+
+final class IdempotencyStoreTest extends TestCase
+{
+    public function test_not_processed_initially(): void
+    {
+        $store = new InMemoryCommandIdempotencyStore();
+        $this->assertFalse($store->wasProcessed('key-1'));
+    }
+
+    public function test_mark_and_check(): void
+    {
+        $store = new InMemoryCommandIdempotencyStore();
+        $store->markProcessed('key-1');
+        $this->assertTrue($store->wasProcessed('key-1'));
+    }
+
+    public function test_clear_resets(): void
+    {
+        $store = new InMemoryCommandIdempotencyStore();
+        $store->markProcessed('key-1');
+        $store->clear();
+        $this->assertFalse($store->wasProcessed('key-1'));
+    }
+}
+```
+
+## Testing Projection Handlers
+
+```php
+final class UserProjectionHandlerTest extends TestCase
+{
+    private InMemoryUserReadRepository $repo;
+    private UserProjectionHandler $handler;
+
+    protected function setUp(): void
+    {
+        $this->repo = new InMemoryUserReadRepository();
+        $this->handler = new UserProjectionHandler($this->repo);
+    }
+
+    public function test_creates_read_model_from_event(): void
+    {
+        $event = new UserRegisteredEvent('user-1', 'alice@example.com', 'Alice');
+        $this->handler->__invoke($event);
+
+        $doc = $this->repo->findById('user-1');
+        $this->assertSame('alice@example.com', $doc['email']);
+    }
+
+    public function test_idempotent_on_duplicate_event(): void
+    {
+        $event = new UserRegisteredEvent('user-1', 'alice@example.com', 'Alice');
+
+        $this->handler->__invoke($event);
+        $this->handler->__invoke($event); // second delivery — must not throw
+
+        $this->assertSame('alice@example.com', $this->repo->findById('user-1')['email']);
+    }
+}
+```
+
+<Callout type="info" title="Test config/test/cqrs.php">
+Swap the idempotency store for tests:
+
+```php title="config/test/cqrs.php"
+use Vortos\Cqrs\Command\Idempotency\InMemoryCommandIdempotencyStore;
+
+return static function (\Vortos\Cqrs\DependencyInjection\VortosCqrsConfig $config): void {
+    $config->commandBus()->idempotencyStore(InMemoryCommandIdempotencyStore::class);
+};
+```
+</Callout>

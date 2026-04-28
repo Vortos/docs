@@ -1,0 +1,145 @@
+---
+title: RoleVoter
+description: Role-based checks with hierarchy expansion — hasRole, atLeast, hasAny, hasAll. Inject in policies for clean role decisions.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# RoleVoter
+
+`RoleVoter` provides role-based checks with role hierarchy support. Inject it in your policies for clean, readable authorization logic. The hierarchy is resolved at compile time — expansion is O(1) at runtime.
+
+## Methods
+
+```php
+use Vortos\Authorization\Voter\RoleVoter;
+
+// Check exact role or any inherited role via hierarchy
+$roles->hasRole($identity, 'ROLE_ADMIN')          // bool
+
+// Alias for hasRole — reads better in policy match statements
+$roles->atLeast($identity, 'ROLE_USER')           // bool
+
+// User must have ANY of these roles (or inherit one via hierarchy)
+$roles->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN'])  // bool
+
+// User must have ALL of these roles (or inherit all via hierarchy)
+$roles->hasAll($identity, ['ROLE_USER', 'ROLE_VERIFIED'])      // bool
+```
+
+## Role Hierarchy
+
+Define role inheritance in `config/authorization.php`. A parent role automatically grants all child roles:
+
+```php title="config/authorization.php"
+use Vortos\Authorization\DependencyInjection\VortosAuthorizationConfig;
+
+return static function (VortosAuthorizationConfig $config): void {
+    $config->roleHierarchy([
+        'ROLE_SUPER_ADMIN'      => ['ROLE_ADMIN'],
+        'ROLE_ADMIN'            => ['ROLE_MANAGER', 'ROLE_SUPPORT'],
+        'ROLE_MANAGER'          => ['ROLE_USER'],
+        'ROLE_SUPPORT'          => ['ROLE_USER'],
+        'ROLE_USER'             => [],
+    ]);
+};
+```
+
+With this hierarchy, a user with `ROLE_ADMIN` passes any check for `ROLE_MANAGER`, `ROLE_SUPPORT`, or `ROLE_USER`. Hierarchy resolution is recursive — `ROLE_SUPER_ADMIN` also passes checks for `ROLE_MANAGER`, `ROLE_SUPPORT`, and `ROLE_USER`.
+
+### Hierarchy Expansion Example
+
+```
+User has: ['ROLE_ADMIN']
+
+expandRoles(['ROLE_ADMIN'])
+    → add ROLE_MANAGER (child of ROLE_ADMIN)
+    → add ROLE_SUPPORT (child of ROLE_ADMIN)
+    → add ROLE_USER    (child of ROLE_MANAGER and ROLE_SUPPORT)
+
+Result: ['ROLE_ADMIN', 'ROLE_MANAGER', 'ROLE_SUPPORT', 'ROLE_USER']
+```
+
+`hasRole($identity, 'ROLE_USER')` returns `true` even though the user only has `ROLE_ADMIN` in their JWT.
+
+## Inject in a Policy
+
+```php
+#[AsPolicy(resource: 'competitions')]
+final class CompetitionPolicy implements PolicyInterface
+{
+    public function __construct(private RoleVoter $roles) {}
+
+    public function can(
+        UserIdentityInterface $identity,
+        string $action,
+        string $scope,
+        mixed $resource = null,
+    ): bool {
+        return match($action) {
+            'list'   => $this->roles->atLeast($identity, 'ROLE_USER'),
+            'read'   => $this->roles->atLeast($identity, 'ROLE_USER'),
+            'create' => $this->roles->atLeast($identity, 'ROLE_FEDERATION_ADMIN'),
+            'update' => $this->roles->atLeast($identity, 'ROLE_FEDERATION_ADMIN'),
+            'delete' => $this->roles->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN']),
+            default  => false,
+        };
+    }
+
+    public function supports(string $resource): bool { return $resource === 'competitions'; }
+}
+```
+
+## Without Hierarchy
+
+If you do not configure a role hierarchy, `hasRole()` does exact matching only:
+
+```php
+// No hierarchy configured — these are equivalent:
+$roles->hasRole($identity, 'ROLE_ADMIN')
+in_array('ROLE_ADMIN', $identity->roles(), true)
+```
+
+## hasAll Example
+
+Require multiple roles simultaneously — for multi-factor authorization:
+
+```php
+// User must be both authenticated AND email-verified
+$roles->hasAll($identity, ['ROLE_USER', 'ROLE_EMAIL_VERIFIED'])
+
+// User must have both admin and auditor roles
+$roles->hasAll($identity, ['ROLE_ADMIN', 'ROLE_AUDITOR'])
+```
+
+## Direct Injection (without a policy)
+
+You can inject `RoleVoter` directly in controllers or handlers for quick checks without writing a full policy:
+
+```php
+use Vortos\Authorization\Voter\RoleVoter;
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+final class AdminDashboardController
+{
+    public function __construct(
+        private RoleVoter $roles,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function dashboard(): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+
+        if (!$this->roles->atLeast($identity, 'ROLE_ADMIN')) {
+            return new JsonResponse(['error' => 'Forbidden'], 403);
+        }
+
+        // ...
+    }
+}
+```
+
+<Callout type="info" title="RoleVoter vs PolicyEngine">
+Use `RoleVoter` directly for simple role checks in controllers or handlers. Use `PolicyEngine` when you need the full resource permission system — policy lookup, resource loading, scope handling, and structured `AccessDeniedException`.
+</Callout>

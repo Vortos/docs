@@ -1,0 +1,138 @@
+---
+title: Collections
+description: Collection — type-safe ordered collections of domain objects with add, remove, contains, filter, and first.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Collections
+
+`Collection` is the abstract base for typed domain collections. It enforces type safety at runtime — only items of the declared type can be added. It implements `Countable` and `IteratorAggregate`.
+
+## Define a Collection
+
+```php title="src/Order/Domain/OrderLines.php"
+use Vortos\Domain\Collection\Collection;
+
+final class OrderLines extends Collection
+{
+    protected function itemType(): string
+    {
+        return OrderLine::class;
+    }
+}
+```
+
+One line. The base class provides everything else.
+
+## API
+
+```php
+$lines = new OrderLines();
+
+// Add items — throws InvalidArgumentException for wrong type
+$lines->add(new OrderLine(...));
+$lines->add(new OrderLine(...));
+$lines->add(new WrongType()); // throws InvalidArgumentException
+
+// Remove by reference (or by value equality for ValueObjects)
+$lines->remove($line);
+
+// Check membership
+$lines->contains($line);           // bool
+
+// Count
+count($lines);                     // int
+$lines->isEmpty();                 // bool
+
+// Convert to array
+$lines->toArray();                 // OrderLine[]
+
+// Filter — returns new collection of same type
+$expensiveLines = $lines->filter(fn(OrderLine $l) => $l->getPrice() > 100);
+
+// First matching item
+$line = $lines->first(fn(OrderLine $l) => $l->getSku() === 'SKU-001');
+// returns null if not found
+
+// Iterate
+foreach ($lines as $line) { ... }
+```
+
+## Use Inside an Aggregate
+
+```php
+final class Order extends AggregateRoot
+{
+    private OrderLines $lines;
+
+    private function __construct(private OrderId $id)
+    {
+        $this->lines = new OrderLines();
+    }
+
+    public function addLine(OrderLine $line): void
+    {
+        if ($this->lines->contains($line)) {
+            return; // idempotent
+        }
+
+        $this->lines->add($line);
+        $this->recordEvent(new OrderLineAddedEvent((string) $this->id, $line->getSku()));
+    }
+
+    public function removeLine(OrderLine $line): void
+    {
+        $this->lines->remove($line);
+        $this->recordEvent(new OrderLineRemovedEvent((string) $this->id, $line->getSku()));
+    }
+
+    public function getTotal(): Money
+    {
+        return array_reduce(
+            $this->lines->toArray(),
+            fn(Money $carry, OrderLine $line) => $carry->add($line->getSubtotal()),
+            Money::of(0, 'USD'),
+        );
+    }
+}
+```
+
+## Type Safety
+
+```php
+$lines = new OrderLines(); // accepts OrderLine only
+
+$lines->add(new OrderLine(...)); // OK
+$lines->add(new ProductLine(...)); // throws InvalidArgumentException
+$lines->add('string');            // throws InvalidArgumentException
+```
+
+The error message: `"Provided items type doesn't match with collections type"`.
+
+## ValueObject Equality in remove() and contains()
+
+When the item implements `ValueObject`, `remove()` and `contains()` use `equals()` for comparison — not reference equality:
+
+```php
+final class EmailList extends Collection
+{
+    protected function itemType(): string { return Email::class; }
+}
+
+$list = new EmailList();
+$list->add(Email::fromString('alice@example.com'));
+
+// Different object instance, same value
+$email = Email::fromString('alice@example.com');
+$list->contains($email); // true — uses equals()
+$list->remove($email);   // removes — uses equals()
+```
+
+For non-ValueObject items, strict reference equality (`===`) is used.
+
+<Callout type="info" title="Collections Are Mutable">
+Unlike value objects, collections are mutable — `add()` and `remove()` modify the collection in place. This is intentional: collections model the aggregate's current state, which changes as commands are processed.
+
+Collections are never `readonly` — you cannot have a `readonly` class with a mutable property.
+</Callout>

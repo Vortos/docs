@@ -1,0 +1,109 @@
+---
+title: Protecting Routes
+description: Requiring authentication on controllers.
+---
+
+# Protecting Routes
+
+## Public routes (default)
+
+All routes are public by default. `CurrentUserProvider::get()` returns `AnonymousIdentity` on public routes.
+
+## Protected routes
+
+Add `#[RequiresAuth]` to any controller class:
+
+```php
+<?php
+declare(strict_types=1);
+namespace App\User\Representation\Controller;
+
+use Symfony\Component\HttpFoundation\JsonResponse;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Routing\Attribute\Route;
+use Vortos\Attribute\ApiController;
+use Vortos\Auth\Attribute\RequiresAuth;
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+#[ApiController]
+#[Route('/api/users/me', methods: ['GET'])]
+#[RequiresAuth]
+final class GetCurrentUserController
+{
+    public function __construct(
+        private CurrentUserProvider $currentUser,
+        private QueryBusInterface $queryBus,
+    ) {}
+
+    public function __invoke(Request $request): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+
+        $user = $this->queryBus->ask(new GetUserQuery(userId: $identity->id()));
+
+        return new JsonResponse($user);
+    }
+}
+```
+
+## What happens on missing/invalid token
+
+`AuthMiddleware` returns HTTP 401 before your controller runs:
+
+```json
+{
+  "error": "Unauthorized",
+  "message": "A valid Bearer token is required."
+}
+```
+
+## How `#[RequiresAuth]` works
+
+`AuthMiddleware` checks the matched controller class for the `#[RequiresAuth]` attribute. If present and no valid token is in the `Authorization` header, it returns 401. If the token is valid, `UserIdentity` is stored in the request-scoped `ArrayAdapter` and the controller runs.
+
+## Login controller example
+
+```php
+#[ApiController]
+#[Route('/api/auth/login', methods: ['POST'])]
+final class LoginController
+{
+    public function __construct(
+        private JwtService $jwtService,
+        private PasswordHasherInterface $hasher,
+        private UserRepository $userRepository,
+    ) {}
+
+    public function __invoke(Request $request): JsonResponse
+    {
+        $data = json_decode($request->getContent(), true, 512, JSON_THROW_ON_ERROR);
+
+        $user = $this->userRepository->findByEmail($data['email'] ?? '');
+
+        if ($user === null || !$this->hasher->verify($data['password'] ?? '', $user->getPasswordHash())) {
+            return new JsonResponse(['error' => 'Invalid credentials'], 401);
+        }
+
+        $identity = new UserIdentity(
+            id: (string) $user->getId(),
+            roles: $user->getRoles(),
+        );
+
+        return new JsonResponse($this->jwtService->issue($identity)->toArray());
+    }
+}
+```
+
+## Rate limiting on auth endpoints
+
+Auth endpoints are rate-limited at the Caddy layer — before PHP runs:
+
+
+```text
+@auth_endpoints { path /api/auth/* }
+rate_limit @auth_endpoints {
+    zone auth_ip { key {http.request.remote.host}; window 1m; events 10 }
+}
+```
+
+10 requests per IP per minute on `/api/auth/*`. No application code needed.

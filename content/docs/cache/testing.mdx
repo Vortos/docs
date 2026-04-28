@@ -1,0 +1,175 @@
+---
+title: Testing
+description: Use InMemoryAdapter as the driver in tests, inject ArrayAdapter directly, and test cache warmers in isolation.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing Cache
+
+## Swap Driver in Test Environment
+
+The simplest approach — swap the entire driver in `config/test/cache.php`:
+
+```php title="config/test/cache.php"
+use Vortos\Cache\Adapter\InMemoryAdapter;
+
+return static function (\Vortos\Cache\DependencyInjection\VortosCacheConfig $config): void {
+    $config->driver(InMemoryAdapter::class);
+    // No Redis connection registered — faster container boot
+};
+```
+
+When `InMemoryAdapter` is the driver, `CacheInterface` and `TaggedCacheInterface` both point to it. No Redis connection is attempted. Tests run with no external dependencies.
+
+## Use InMemoryAdapter Directly
+
+For unit tests that do not use the container:
+
+```php
+use Vortos\Cache\Adapter\InMemoryAdapter;
+
+final class UserProfileServiceTest extends TestCase
+{
+    private InMemoryAdapter $cache;
+    private UserProfileService $service;
+
+    protected function setUp(): void
+    {
+        $this->cache = new InMemoryAdapter();
+        $this->service = new UserProfileService($this->cache);
+    }
+
+    protected function tearDown(): void
+    {
+        $this->cache->clear(); // reset between tests
+    }
+
+    public function test_profile_is_cached_on_first_load(): void
+    {
+        $this->service->getProfile('user-1');
+        $this->service->getProfile('user-1'); // second call
+
+        // Profile should be in cache after first call
+        $this->assertTrue($this->cache->has('user:user-1:profile'));
+    }
+
+    public function test_cache_invalidated_on_profile_update(): void
+    {
+        $this->service->getProfile('user-1');
+        $this->service->onProfileUpdated('user-1');
+
+        $this->assertFalse($this->cache->has('user:user-1:profile'));
+    }
+}
+```
+
+## Test Tag Invalidation
+
+```php
+public function test_tag_invalidation(): void
+{
+    $cache = new InMemoryAdapter();
+
+    $cache->setWithTags('user:1:profile', ['name' => 'Alice'], ['user:1', 'profiles'], 3600);
+    $cache->setWithTags('user:1:settings', ['theme' => 'dark'], ['user:1'], 3600);
+    $cache->setWithTags('user:2:profile', ['name' => 'Bob'], ['user:2', 'profiles'], 3600);
+
+    // Invalidate user:1 — only user:1 entries removed
+    $cache->invalidateTags(['user:1']);
+
+    $this->assertNull($cache->get('user:1:profile'));
+    $this->assertNull($cache->get('user:1:settings'));
+    $this->assertSame(['name' => 'Bob'], $cache->get('user:2:profile')); // untouched
+}
+```
+
+## Test TTL Behaviour
+
+`InMemoryAdapter` respects TTL with lazy expiry — useful for testing cache expiry logic:
+
+```php
+public function test_expired_key_returns_null(): void
+{
+    $cache = new InMemoryAdapter();
+    $cache->set('key', 'value', 1); // 1 second TTL
+
+    $this->assertSame('value', $cache->get('key'));
+
+    sleep(2);
+
+    $this->assertNull($cache->get('key')); // expired
+    $this->assertFalse($cache->has('key')); // removed on access
+}
+```
+
+## Test ArrayAdapter Directly
+
+```php
+use Vortos\Cache\Adapter\ArrayAdapter;
+
+final class AuthMiddlewareTest extends TestCase
+{
+    public function test_identity_stored_in_array_adapter(): void
+    {
+        $adapter = new ArrayAdapter();
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+
+        $adapter->set('auth:identity', $identity);
+
+        $retrieved = $adapter->get('auth:identity');
+        $this->assertSame($identity, $retrieved);
+    }
+
+    public function test_clear_removes_all_entries(): void
+    {
+        $adapter = new ArrayAdapter();
+        $adapter->set('key1', 'value1');
+        $adapter->set('key2', 'value2');
+
+        $adapter->clear();
+
+        $this->assertFalse($adapter->has('key1'));
+        $this->assertFalse($adapter->has('key2'));
+    }
+}
+```
+
+## Test a Cache Warmer
+
+```php
+final class PermissionMatrixCacheWarmerTest extends TestCase
+{
+    public function test_warms_permission_matrix(): void
+    {
+        $cache = new InMemoryAdapter();
+
+        $permissions = $this->createMock(PermissionRepository::class);
+        $permissions->method('getFullMatrix')->willReturn(['admin' => ['read', 'write']]);
+
+        $warmer = new PermissionMatrixCacheWarmer($permissions, $cache);
+        $warmer->warmUp();
+
+        $this->assertTrue($cache->has('auth:permission_matrix'));
+        $this->assertSame(['admin' => ['read', 'write']], $cache->get('auth:permission_matrix'));
+    }
+
+    public function test_warmup_is_idempotent(): void
+    {
+        $cache = new InMemoryAdapter();
+        $permissions = $this->createMock(PermissionRepository::class);
+        $permissions->method('getFullMatrix')->willReturn(['admin' => ['read']]);
+
+        $warmer = new PermissionMatrixCacheWarmer($permissions, $cache);
+
+        $warmer->warmUp();
+        $warmer->warmUp(); // second call — same result
+
+        $this->assertSame(['admin' => ['read']], $cache->get('auth:permission_matrix'));
+    }
+}
+```
+
+<Callout type="info" title="Always call clear() in tearDown()">
+Call `$cache->clear()` in `tearDown()` to reset state between tests. `InMemoryAdapter` does not reset automatically between test cases — data from one test leaks into the next if you share the instance across tests without clearing.
+</Callout>

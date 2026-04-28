@@ -1,0 +1,169 @@
+---
+title: Rate Limiting
+description: Per-user, per-IP, and global rate limiting with pluggable policies — applied before authentication so IP limits work even for anonymous requests.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Rate Limiting
+
+Vortos provides attribute-driven rate limiting with Redis-backed counters. Rate limit policies are auto-discovered — implement the interface, add the attribute to your controller, and everything wires itself.
+
+<Callout type="info" title="Compile-Time Map">
+All `#[RateLimit]` attributes are scanned at compile time by `RateLimitCompilerPass`. At runtime, the middleware does a single array lookup — zero reflection, O(1) cost.
+</Callout>
+
+## How It Works
+
+```
+HTTP Request
+    │
+    ▼
+RateLimitMiddleware (priority 7 — before auth)
+    ├── Lookup controller in compile-time route map
+    ├── For each rule: resolve policy, compute key, check Redis counter
+    ├── Counter within limit → increment and continue
+    └── Counter exceeded → 429 + Retry-After header
+```
+
+Running at priority 7 — before `AuthMiddleware` at priority 6 — means IP-based rate limits protect unauthenticated routes too.
+
+## Implement a Policy
+
+```php title="src/Billing/Infrastructure/SubscriptionRateLimitPolicy.php"
+use Vortos\Auth\RateLimit\Contract\RateLimitPolicyInterface;
+use Vortos\Auth\RateLimit\RateLimitRule;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+// Auto-discovered — no registration needed
+final class SubscriptionRateLimitPolicy implements RateLimitPolicyInterface
+{
+    public function getLimit(UserIdentityInterface $identity): RateLimitRule
+    {
+        return match($identity->getAttribute('plan') ?? 'free') {
+            'enterprise' => RateLimitRule::unlimited(),
+            'pro'        => new RateLimitRule(limit: 1000, windowSeconds: 60),
+            default      => new RateLimitRule(limit: 100, windowSeconds: 60),
+        };
+    }
+}
+```
+
+## Apply to a Controller
+
+```php
+use Vortos\Auth\RateLimit\Attribute\RateLimit;
+use Vortos\Auth\RateLimit\RateLimitScope;
+
+// Per-user rate limit
+#[RateLimit(SubscriptionRateLimitPolicy::class)]
+final class CreatePostController { ... }
+
+// Per-IP rate limit (applies even to anonymous requests)
+#[RateLimit(GlobalBurstPolicy::class, per: RateLimitScope::Ip)]
+final class SearchController { ... }
+
+// Stack multiple — both are checked, most restrictive wins
+#[RateLimit(SubscriptionRateLimitPolicy::class, per: RateLimitScope::User)]
+#[RateLimit(GlobalBurstPolicy::class, per: RateLimitScope::Ip)]
+final class ExportController { ... }
+```
+
+## Scopes
+
+| Scope | Redis Key | Use Case |
+|---|---|---|
+| `RateLimitScope::User` | `rl:user:{userId}:{controller}:{policy}` | Per-authenticated-user limits based on plan |
+| `RateLimitScope::Ip` | `rl:ip:{ip}:{controller}:{policy}` | Anonymous endpoint protection, abuse prevention |
+| `RateLimitScope::Global` | `rl:global:{controller}:{policy}` | Hard cap on total requests regardless of who |
+
+## Rate Limit Rule
+
+```php
+use Vortos\Auth\RateLimit\RateLimitRule;
+
+// 100 requests per 60-second window
+new RateLimitRule(limit: 100, windowSeconds: 60)
+
+// Unlimited — skip the check entirely for this identity
+RateLimitRule::unlimited()
+```
+
+Return `RateLimitRule::unlimited()` from your policy for plan tiers that should not be rate-limited. The middleware skips the Redis check entirely when the rule is unlimited.
+
+## Response on Limit Exceeded
+
+```
+HTTP 429 Too Many Requests
+Retry-After: 47
+
+{
+  "error": "Too Many Requests",
+  "message": "Rate limit exceeded. Please slow down.",
+  "limit": 100,
+  "window": 60
+}
+```
+
+The `Retry-After` header contains the number of seconds until the window resets.
+
+## Expired Subscription Example
+
+Rate limiting and feature access can work together to degrade access when a subscription expires:
+
+```php
+final class SubscriptionRateLimitPolicy implements RateLimitPolicyInterface
+{
+    public function __construct(
+        private SubscriptionRepository $subscriptions,
+    ) {}
+
+    public function getLimit(UserIdentityInterface $identity): RateLimitRule
+    {
+        $subscription = $this->subscriptions->findByUserId($identity->id());
+
+        // Expired — apply free-tier limits regardless of what plan they were on
+        if (!$subscription || $subscription->isExpired()) {
+            return new RateLimitRule(limit: 10, windowSeconds: 60);
+        }
+
+        return match($subscription->getPlan()) {
+            'pro'        => new RateLimitRule(limit: 1000, windowSeconds: 60),
+            'enterprise' => RateLimitRule::unlimited(),
+            default      => new RateLimitRule(limit: 100, windowSeconds: 60),
+        };
+    }
+}
+```
+
+## Multiple Policies on One Route
+
+When multiple `#[RateLimit]` attributes are stacked, all are evaluated in order. The first one that exceeds its limit returns 429 — remaining policies are not checked.
+
+```php
+#[RateLimit(SubscriptionRateLimitPolicy::class, per: RateLimitScope::User)]
+#[RateLimit(IpAbusePolicy::class, per: RateLimitScope::Ip)]
+#[RateLimit(GlobalCapPolicy::class, per: RateLimitScope::Global)]
+final class SensitiveEndpointController { ... }
+```
+
+## Redis Key Format
+
+Rate limit counters use the following key format:
+
+```
+rl:{scope}:{identifier}:{controllerClass}:{policyClass}
+```
+
+Examples:
+```
+rl:user:user-123:App\Controller\ExportController:App\Policy\SubscriptionRateLimitPolicy
+rl:ip:192.168.1.1:App\Controller\SearchController:App\Policy\GlobalBurstPolicy
+```
+
+TTL is set to `windowSeconds` on the first increment. Redis auto-expires the key at the end of the window — no cron cleanup needed.
+
+<Callout type="warn" title="Redis Restart">
+Rate limit counters are ephemeral. A Redis restart resets all counters — users get a free burst until the window refills. This is acceptable for rate limiting. For hard security limits (lockouts), use the lockout system which supports a database-backed store.
+</Callout>

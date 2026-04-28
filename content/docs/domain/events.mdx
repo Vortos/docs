@@ -1,0 +1,127 @@
+---
+title: Domain Events
+description: DomainEvent — immutable facts about what happened, schema versioning with eventVersion(), and the DomainEventInterface contract.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Domain Events
+
+Domain events are immutable records of something that happened in the domain. They are named in the past tense and carry the aggregate ID that raised them.
+
+## Define an Event
+
+```php title="src/User/Domain/Event/UserRegisteredEvent.php"
+use Vortos\Domain\Event\DomainEvent;
+
+final readonly class UserRegisteredEvent extends DomainEvent
+{
+    public function __construct(
+        string $aggregateId,           // passes to DomainEvent base
+        public readonly string $email,
+        public readonly string $name,
+    ) {
+        parent::__construct($aggregateId);
+    }
+}
+```
+
+`DomainEvent` is `abstract readonly` — all subclasses must be `readonly`. Events are immutable facts — no setters, no mutable state.
+
+## DomainEventInterface
+
+All domain events implement `DomainEventInterface`:
+
+```php
+interface DomainEventInterface
+{
+    public function aggregateId(): string;         // which aggregate raised this
+    public function occurredAt(): \DateTimeImmutable; // when it happened
+    public function eventVersion(): int;           // schema version (default: 1)
+}
+```
+
+## occurredAt
+
+Set automatically by `DomainEvent` base constructor — `new \DateTimeImmutable()` at construction time. You never set it explicitly:
+
+```php
+$event = new UserRegisteredEvent('user-123', 'alice@example.com', 'Alice');
+$event->occurredAt(); // \DateTimeImmutable — moment of construction
+```
+
+## eventVersion — Schema Versioning
+
+`eventVersion()` returns `1` by default. Override when your event's payload shape changes in a breaking way:
+
+```php
+// Version 1 — original shape
+final readonly class UserRegisteredEvent extends DomainEvent
+{
+    public function __construct(string $aggregateId, public string $email) {
+        parent::__construct($aggregateId);
+    }
+    // eventVersion() returns 1 (default)
+}
+
+// Version 2 — added name field (breaking change)
+final readonly class UserRegisteredEvent extends DomainEvent
+{
+    public function __construct(
+        string $aggregateId,
+        public string $email,
+        public string $name,  // new field
+    ) {
+        parent::__construct($aggregateId);
+    }
+
+    public function eventVersion(): int { return 2; }
+}
+```
+
+Consumers check `eventVersion()` to route to the correct handler version. This enables forward compatibility — consumers that understand version 2 can handle new events; consumers that only understand version 1 can use an upcaster.
+
+## Naming Convention
+
+Domain events are named in past tense: `UserRegistered`, `OrderPlaced`, `PaymentFailed`. They describe a fact that occurred, not an intent.
+
+```
+UserRegistered      ✔
+OrderPlaced         ✔
+PaymentCharged      ✔
+
+RegisterUser        ✗ (imperative — that is a command)
+PlaceOrder          ✗ (imperative — that is a command)
+```
+
+## Recording Events in Aggregates
+
+```php
+final class User extends AggregateRoot
+{
+    public function deactivate(): void
+    {
+        if ($this->status === 'inactive') return; // idempotent guard
+
+        $this->status = 'inactive';
+
+        $this->recordEvent(new UserDeactivatedEvent(
+            aggregateId: (string) $this->id,
+        ));
+    }
+}
+```
+
+Events are recorded inside command methods. The `CommandBus` pulls them after the handler returns and writes them to the outbox — inside the same transaction as the aggregate save.
+
+<Callout type="warn" title="Events Are Facts, Not Commands">
+Domain events describe what happened — they do not describe what should happen next. A `UserDeactivatedEvent` says "the user was deactivated". What happens in response (send email, cancel subscriptions) is handled by event handlers in other bounded contexts.
+
+Never add business logic to an event's constructor. Events carry data only.
+</Callout>
+
+## DomainEventInterface vs DomainEvent
+
+`DomainEventInterface` is defined in `vortos-domain` so aggregates can record events without depending on any infrastructure. `DomainEvent` is the abstract base class providing `aggregateId()`, `occurredAt()`, and `eventVersion()`.
+
+Always extend `DomainEvent` for your events — `DomainEventInterface` alone is for special cases where the base class behaviour must be replaced.

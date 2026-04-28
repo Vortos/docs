@@ -1,0 +1,73 @@
+---
+title: Current User
+description: Accessing the authenticated user identity.
+---
+
+# Current User
+
+## CurrentUserProvider
+
+Retrieves the current user identity from the request-scoped `ArrayAdapter`. The identity is set by `AuthMiddleware` at the start of every request.
+
+```php
+use Vortos\Auth\Identity\CurrentUserProvider;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+final class SomeHandler
+{
+    public function __construct(private CurrentUserProvider $currentUser) {}
+
+    public function __invoke(SomeCommand $command): void
+    {
+        $user = $this->currentUser->get();
+
+        if (!$user->isAuthenticated()) {
+            throw new UnauthorizedException();
+        }
+
+        // $user->id()             — user ID string
+        // $user->roles()          — ['ROLE_USER', 'ROLE_ADMIN']
+        // $user->hasRole('ROLE_ADMIN')   — bool
+    }
+}
+```
+
+## Always returns an identity
+
+`get()` never returns null. For unauthenticated requests it returns `AnonymousIdentity`. Always check `isAuthenticated()` before using the identity on public routes.
+
+```php
+$user = $this->currentUser->get();
+
+// Safe pattern:
+if (!$user->isAuthenticated()) {
+    // handle public access
+}
+
+// On #[RequiresAuth] controllers, identity is always authenticated:
+$userId = $user->id(); // safe, guaranteed authenticated
+```
+
+## UserIdentity properties
+
+```php
+interface UserIdentityInterface
+{
+    public function id(): string;            // User aggregate ID
+    public function roles(): array;          // ['ROLE_USER', 'ROLE_ADMIN']
+    public function isAuthenticated(): bool; // always true for UserIdentity
+    public function hasRole(string $role): bool;
+}
+```
+
+## Why not inject the full User aggregate
+
+Injecting a full `User` aggregate as "the current user" requires a database query on every request even when the full aggregate is not needed. `UserIdentity` carries only what is in the JWT — zero database queries for identity access.
+
+When your handler needs the full `User` aggregate, load it explicitly:
+
+```php
+$user = $this->userRepository->findById(
+    UserId::fromString($this->currentUser->get()->id())
+);
+```

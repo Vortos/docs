@@ -1,0 +1,250 @@
+---
+title: Scoped Permissions
+description: Grant permissions within an organization, team, or project — users can have different permissions in different contexts.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Scoped Permissions
+
+Scoped permissions let you grant a user a permission within a specific context — an organization, a team, a project. A user can be an editor in org A but only a viewer in org B.
+
+## How It Works
+
+```
+User 456 → grant 'documents.edit' in scope org:org-123
+User 456 → grant 'reports.view' in scope team:team-789
+
+Request to /orgs/org-123/documents → scope resolved to org-123
+AuthorizationMiddleware checks: does user-456 have 'documents.edit' in org:org-123? → yes
+```
+
+## Register a Scope Resolver
+
+A `ScopeResolverInterface` extracts the scope value from the current request. One resolver per scope name. All are auto-discovered.
+
+```php title="src/Organization/Infrastructure/OrgScopeResolver.php"
+use Symfony\Component\HttpFoundation\Request;
+use Vortos\Authorization\Scope\Contract\ScopeResolverInterface;
+
+// Auto-discovered — no registration needed
+final class OrgScopeResolver implements ScopeResolverInterface
+{
+    public function getScopeName(): string
+    {
+        return 'org';  // matches scope: 'org' in #[RequiresPermission]
+    }
+
+    public function resolveScope(Request $request): string
+    {
+        $orgId = $request->attributes->get('org_id');
+
+        if (!$orgId) {
+            throw new \RuntimeException('org_id route parameter is required for org-scoped routes');
+        }
+
+        return $orgId;
+    }
+}
+```
+
+Register as many resolvers as you need — one per scope type:
+
+```php title="src/Team/Infrastructure/TeamScopeResolver.php"
+final class TeamScopeResolver implements ScopeResolverInterface
+{
+    public function getScopeName(): string { return 'team'; }
+
+    public function resolveScope(Request $request): string
+    {
+        return $request->attributes->get('team_id')
+            ?? throw new \RuntimeException('team_id required');
+    }
+}
+```
+
+## Use in a Controller
+
+```php
+use Vortos\Authorization\Attribute\RequiresPermission;
+use Vortos\Authorization\Scope\Contract\ScopeMode;
+
+// Check permission in org scope
+#[RequiresPermission('documents.edit', scope: 'org')]
+final class EditDocumentController { ... }
+
+// Check in team scope
+#[RequiresPermission('reports.view', scope: 'team')]
+final class ViewReportController { ... }
+
+// Must have permission in BOTH org AND team
+#[RequiresPermission('documents.edit', scope: ['org', 'team'])]
+final class EditDocumentController { ... }
+
+// Must have permission in org OR team (either is enough)
+#[RequiresPermission('documents.edit', scope: ['org', 'team'], scopeMode: ScopeMode::Any)]
+final class EditDocumentController { ... }
+
+// Enum permission — type-safe
+enum Permission: string { case DocumentsEdit = 'documents.edit'; }
+#[RequiresPermission(Permission::DocumentsEdit, scope: 'org')]
+final class EditDocumentController { ... }
+```
+
+## Grant and Revoke Permissions
+
+Inject `ScopedAuthorizationManager` in your command handlers:
+
+```php
+use Vortos\Authorization\Scope\ScopedAuthorizationManager;
+
+final class AssignOrgRoleHandler
+{
+    public function __construct(
+        private ScopedAuthorizationManager $authorization,
+    ) {}
+
+    public function __invoke(AssignOrgRole $command): void
+    {
+        // Grant a permission in org scope
+        $this->authorization
+            ->forScope('org', $command->orgId)
+            ->grant($command->userId, 'documents.edit');
+
+        // Grant with expiry (temporary access)
+        $this->authorization
+            ->forScope('org', $command->orgId)
+            ->grant($command->userId, 'reports.export', new \DateTimeImmutable('+90 days'));
+
+        // Revoke a specific permission
+        $this->authorization
+            ->forScope('org', $command->orgId)
+            ->revoke($command->userId, 'documents.delete');
+
+        // Check if user has permission
+        $hasAccess = $this->authorization
+            ->forScope('org', $command->orgId)
+            ->has($command->userId, 'documents.edit');
+
+        // Revoke ALL permissions in this scope for this user
+        $this->authorization
+            ->forScope('org', $command->orgId)
+            ->revokeAll($command->userId);
+    }
+}
+```
+
+## Using Enums
+
+```php
+enum OrgPermission: string {
+    case DocumentsView   = 'documents.view';
+    case DocumentsEdit   = 'documents.edit';
+    case DocumentsDelete = 'documents.delete';
+    case ReportsView     = 'reports.view';
+    case ReportsExport   = 'reports.export';
+    case MembersInvite   = 'members.invite';
+    case MembersRemove   = 'members.remove';
+}
+
+// Grant with enum
+$this->authorization
+    ->forScope('org', $orgId)
+    ->grant($userId, OrgPermission::DocumentsEdit);
+
+// Revoke with enum
+$this->authorization
+    ->forScope('org', $orgId)
+    ->revoke($userId, OrgPermission::DocumentsEdit);
+```
+
+## Storage
+
+Scoped permissions are stored in Redis by default:
+
+```
+Key:   scoped_perm:{scopeName}:{scopeId}:{userId}:{permission}
+Value: "1"
+TTL:   set if grant has expiry, none if permanent
+
+Examples:
+scoped_perm:org:org-123:user-456:documents.edit     → "1" (no TTL)
+scoped_perm:team:team-789:user-456:reports.view     → "1" (no TTL)
+scoped_perm:org:org-123:user-456:reports.export     → "1" TTL 7776000s
+```
+
+<Callout type="warn" title="Redis Restart and Scoped Permissions">
+Scoped permissions are security-critical data. A Redis restart will clear all scoped permissions — users will lose access until permissions are re-granted.
+
+For production applications, implement a `ScopedPermissionStoreInterface` backed by your database as the primary store, and use Redis as a cache:
+
+```php
+final class DbScopedPermissionStore implements ScopedPermissionStoreInterface
+{
+    public function has(string $userId, string $scopeName, string $scopeId, string $permission): bool
+    {
+        // Check Redis cache first
+        $cached = $this->redis->exists("scoped_perm:{$scopeName}:{$scopeId}:{$userId}:{$permission}");
+        if ($cached) return true;
+
+        // Fall back to database
+        $exists = $this->db->fetchOne(
+            'SELECT 1 FROM org_permissions WHERE user_id = ? AND scope_name = ? AND scope_id = ? AND permission = ? AND (expires_at IS NULL OR expires_at > NOW())',
+            [$userId, $scopeName, $scopeId, $permission]
+        );
+
+        if ($exists) {
+            // Warm Redis cache
+            $this->redis->set("scoped_perm:{$scopeName}:{$scopeId}:{$userId}:{$permission}", '1');
+        }
+
+        return (bool) $exists;
+    }
+}
+```
+</Callout>
+
+## Complete Example: Multi-Tenant SaaS
+
+```php
+// User joins organization → grant default member permissions
+class JoinOrganizationHandler
+{
+    public function __invoke(JoinOrganization $command): void
+    {
+        $manager = $this->authorization->forScope('org', $command->orgId);
+
+        $manager->grant($command->userId, OrgPermission::DocumentsView);
+        $manager->grant($command->userId, OrgPermission::ReportsView);
+    }
+}
+
+// User promoted to editor
+class PromoteToEditorHandler
+{
+    public function __invoke(PromoteToEditor $command): void
+    {
+        $manager = $this->authorization->forScope('org', $command->orgId);
+
+        $manager->grant($command->userId, OrgPermission::DocumentsEdit);
+        $manager->grant($command->userId, OrgPermission::DocumentsDelete);
+        $manager->grant($command->userId, OrgPermission::ReportsExport);
+    }
+}
+
+// User leaves organization → revoke everything
+class LeaveOrganizationHandler
+{
+    public function __invoke(LeaveOrganization $command): void
+    {
+        $this->authorization
+            ->forScope('org', $command->orgId)
+            ->revokeAll($command->userId);
+    }
+}
+
+// Controller — checks permission in org scope resolved from route
+#[Route('/orgs/{org_id}/documents/{id}/edit')]
+#[RequiresPermission(OrgPermission::DocumentsEdit, scope: 'org')]
+final class EditDocumentController { ... }
+```

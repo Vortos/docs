@@ -1,0 +1,181 @@
+---
+title: Usage Quotas
+description: Per-user usage quotas with hourly, daily, monthly, and total periods — backed by Redis with automatic period reset.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Usage Quotas
+
+Quotas track how much of a resource a user consumes within a time period. Unlike rate limiting (requests per second), quotas track business-meaningful units — exports, API calls, AI completions, storage uploads.
+
+<Callout type="info" title="Compile-Time Map">
+All `#[RequiresQuota]` attributes are scanned at compile time. Runtime middleware does a single array lookup per request — zero reflection.
+</Callout>
+
+## Implement a Policy
+
+```php title="src/Billing/Infrastructure/SubscriptionQuotaPolicy.php"
+use Vortos\Auth\Quota\Contract\QuotaPolicyInterface;
+use Vortos\Auth\Quota\QuotaRule;
+use Vortos\Auth\Quota\QuotaPeriod;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+// Auto-discovered — no registration needed
+final class SubscriptionQuotaPolicy implements QuotaPolicyInterface
+{
+    public function getQuota(UserIdentityInterface $identity, string $quota): QuotaRule
+    {
+        $plan = $identity->getAttribute('plan', 'free');
+
+        return match($quota) {
+            'exports' => match($plan) {
+                'enterprise' => QuotaRule::unlimited(),
+                'pro'        => new QuotaRule(limit: 1000, period: QuotaPeriod::Monthly),
+                default      => new QuotaRule(limit: 100, period: QuotaPeriod::Monthly),
+            },
+            'api.calls' => match($plan) {
+                'enterprise' => QuotaRule::unlimited(),
+                'pro'        => new QuotaRule(limit: 50000, period: QuotaPeriod::Monthly),
+                default      => new QuotaRule(limit: 5000, period: QuotaPeriod::Monthly),
+            },
+            'ai.completions' => match($plan) {
+                'enterprise' => new QuotaRule(limit: 10000, period: QuotaPeriod::Monthly),
+                'pro'        => new QuotaRule(limit: 1000, period: QuotaPeriod::Monthly),
+                default      => new QuotaRule(limit: 10, period: QuotaPeriod::Daily),
+            },
+            default => QuotaRule::unlimited(),
+        };
+    }
+}
+```
+
+## Apply to a Controller
+
+```php
+use Vortos\Auth\Quota\Attribute\RequiresQuota;
+
+// String quota name — cost defaults to 1
+#[RequiresQuota('exports')]
+final class ExportController { ... }
+
+// Enum quota — type-safe
+enum Quota: string {
+    case Exports       = 'exports';
+    case ApiCalls      = 'api.calls';
+    case AiCompletions = 'ai.completions';
+}
+
+#[RequiresQuota(Quota::Exports)]
+final class ExportController { ... }
+
+// Custom cost — this endpoint costs 10 quota units
+#[RequiresQuota(Quota::Exports, cost: 10)]
+final class BulkExportController { ... }
+
+// Stack quotas — all are checked and consumed
+#[RequiresQuota(Quota::ApiCalls, cost: 1)]
+#[RequiresQuota(Quota::AiCompletions, cost: 1)]
+final class AiAnalysisController { ... }
+```
+
+## Quota Periods
+
+| Period | Redis Key Example | Resets |
+|---|---|---|
+| `QuotaPeriod::Hourly` | `quota:user-1:exports:2026-04-27-14` | Every hour |
+| `QuotaPeriod::Daily` | `quota:user-1:exports:2026-04-27` | Every day at midnight |
+| `QuotaPeriod::Monthly` | `quota:user-1:exports:2026-04` | First of every month |
+| `QuotaPeriod::Total` | `quota:user-1:exports:total` | Never — lifetime cap |
+
+Period keys are computed from the current server time. Redis TTL is set automatically on first increment — no cron job needed.
+
+## Quota Rule
+
+```php
+use Vortos\Auth\Quota\QuotaRule;
+use Vortos\Auth\Quota\QuotaPeriod;
+
+// 100 exports per month
+new QuotaRule(limit: 100, period: QuotaPeriod::Monthly)
+
+// 1000 per day
+new QuotaRule(limit: 1000, period: QuotaPeriod::Daily)
+
+// Unlimited — skip the check entirely
+QuotaRule::unlimited()
+```
+
+## Response on Quota Exceeded
+
+```
+HTTP 429 Too Many Requests
+
+{
+  "error": "Quota Exceeded",
+  "message": "You have exceeded your usage quota for this period.",
+  "quota": "exports",
+  "limit": 100,
+  "current": 100,
+  "period": "monthly"
+}
+```
+
+## How Quota Enforcement Works
+
+The middleware checks the current usage before incrementing. Only if the request is allowed does it increment the counter:
+
+```
+Request arrives at QuotaMiddleware
+    │
+    ▼
+Get current counter from Redis: current = 47
+    │
+    ▼
+Get policy rule: limit = 100, period = monthly
+    │
+    ├── current + cost (1) = 48 ≤ 100 → allow
+    │       └── increment Redis counter to 48
+    │       └── continue to controller
+    │
+    └── current + cost (1) = 101 > 100 → deny
+            └── 429 response
+            └── counter NOT incremented
+```
+
+This prevents the counter from going over the limit. If the current value is exactly at the limit, no more requests are allowed.
+
+<Callout type="warn" title="Redis Restart">
+Quota counters are stored in Redis and are ephemeral. A Redis restart resets all counters — users get fresh quota. For billing-critical quota enforcement, implement a database-backed quota store and use Redis as a cache layer.
+</Callout>
+
+## Checking Quota Programmatically
+
+Inject the quota store directly for programmatic checks (e.g., in a handler before performing a long operation):
+
+```php
+use Vortos\Auth\Quota\Storage\RedisQuotaStore;
+use Vortos\Auth\Quota\QuotaPeriod;
+
+final class StartBulkProcessingHandler
+{
+    public function __construct(
+        private RedisQuotaStore $quotaStore,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function __invoke(StartBulkProcessing $command): void
+    {
+        $identity = $this->currentUser->get();
+        $current = $this->quotaStore->get($identity->id(), 'exports', QuotaPeriod::Monthly);
+
+        if ($current >= 100) {
+            throw new QuotaExceededException('Monthly export limit reached');
+        }
+
+        // ... perform operation
+
+        $this->quotaStore->increment($identity->id(), 'exports', QuotaPeriod::Monthly, $command->recordCount);
+    }
+}
+```

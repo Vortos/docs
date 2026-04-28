@@ -1,0 +1,155 @@
+---
+title: Logger
+description: Monolog-backed PSR-3 logger — LineFormatter in dev, JsonFormatter to stderr in production. Inject LoggerInterface anywhere.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Logger
+
+`vortos-logger` wires Monolog as the PSR-3 `LoggerInterface`. Dev and production have different configurations automatically — no manual setup needed.
+
+## Installation
+
+```bash
+composer require vortos/vortos-logger
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Logger\DependencyInjection\LoggerPackage;
+
+$packages = [
+    new HttpPackage(),
+    new LoggerPackage(),
+    // ...
+];
+```
+
+## Container Parameters
+
+`LoggerExtension` reads these parameters:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `kernel.env` | `prod` | Controls formatter and log level |
+| `kernel.log_path` | `sys_get_temp_dir()` | Directory for dev log file |
+
+Set `kernel.log_path` in your bootstrap to write logs to `var/log/`:
+
+```php
+$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
+```
+
+## Dev vs Production Behaviour
+
+| | Dev (`kernel.env = dev`) | Production |
+|---|---|---|
+| Formatter | `LineFormatter` (human-readable) | `JsonFormatter` (structured) |
+| Level | `DEBUG` — all messages | `ERROR` — errors and above |
+| Destination | `{log_path}/dev.log` | `stderr` |
+
+**Dev** writes everything to a file — easy to tail during development:
+
+```
+[2026-04-27 14:32:01] app.DEBUG: User query executed {"query":"GetUserById","userId":"user-123"} []
+[2026-04-27 14:32:01] app.INFO: Handler dispatched {"command":"RegisterUser"} []
+```
+
+**Production** writes JSON to `stderr` — collected by Docker/container runtime and forwarded to your log aggregator (Datadog, CloudWatch, ELK):
+
+```json
+{"message":"Payment processing failed","context":{"paymentId":"pay-456","error":"Card declined"},"level":400,"level_name":"ERROR","channel":"app","datetime":"2026-04-27T14:32:01+00:00"}
+```
+
+## Inject the Logger
+
+Inject `LoggerInterface` in any service:
+
+```php
+use Psr\Log\LoggerInterface;
+
+final class PaymentService
+{
+    public function __construct(private LoggerInterface $logger) {}
+
+    public function charge(Payment $payment): void
+    {
+        $this->logger->info('Charging payment', [
+            'payment_id' => $payment->getId(),
+            'amount'     => $payment->getAmount(),
+        ]);
+
+        try {
+            // ... charge
+        } catch (\Exception $e) {
+            $this->logger->error('Payment charge failed', [
+                'payment_id' => $payment->getId(),
+                'error'      => $e->getMessage(),
+            ]);
+            throw $e;
+        }
+    }
+}
+```
+
+## Log Levels
+
+Use the appropriate level — log aggregators filter and alert by level:
+
+| Method | Level | When to use |
+|---|---|---|
+| `$logger->debug(...)` | DEBUG | Development detail — queries, state changes |
+| `$logger->info(...)` | INFO | Normal operation — requests, handler dispatch |
+| `$logger->notice(...)` | NOTICE | Unusual but expected — config fallbacks |
+| `$logger->warning(...)` | WARNING | Potential problem — deprecated usage, retries |
+| `$logger->error(...)` | ERROR | Error requiring investigation — failed payment |
+| `$logger->critical(...)` | CRITICAL | System failure — dead letter, DB down |
+| `$logger->alert(...)` | ALERT | Immediate action needed |
+| `$logger->emergency(...)` | EMERGENCY | System unusable |
+
+## IntrospectionProcessor
+
+The logger includes Monolog's `IntrospectionProcessor` automatically. It adds the calling file, line, class, and method to every log record — useful for quickly locating log sources in large codebases.
+
+## Services Registered
+
+```
+monolog.formatter.json      — JsonFormatter
+monolog.formatter.line      — LineFormatter
+monolog.processor.introspection — IntrospectionProcessor
+monolog.handler.main        — StreamHandler (dev.log or stderr)
+monolog.logger              — Logger instance (channel: app)
+LoggerInterface             — alias → monolog.logger
+```
+
+## Custom Channel
+
+The default logger uses the `app` channel. For separate channels per module (useful for filtering in log aggregators):
+
+```php title="config/services.php"
+use Monolog\Logger;
+
+// Create a payment-specific logger
+$services->set('logger.payment', Logger::class)
+    ->arg('$name', 'payment')
+    ->call('pushHandler', [service('monolog.handler.main')])
+    ->public();
+
+// Inject by service ID
+$services->set(PaymentService::class)
+    ->arg('$logger', service('logger.payment'));
+```
+
+<Callout type="info" title="Structured Context Always">
+Always pass context as the second argument — never embed variables in the message string. Structured context is searchable in log aggregators.
+
+```php
+// CORRECT — searchable by user_id
+$logger->info('User logged in', ['user_id' => $userId]);
+
+// WRONG — not searchable
+$logger->info("User {$userId} logged in");
+```
+</Callout>

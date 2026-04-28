@@ -1,0 +1,82 @@
+---
+title: Testing
+description: Testing auth in Vortos applications.
+---
+
+# Testing Auth
+
+## Swap to InMemory in tests
+
+```php
+// config/test/auth.php
+return static function(VortosAuthConfig $config): void {
+    $config
+        ->secret('test-secret-for-testing-only-32chars!')
+        ->tokenStorage(InMemoryTokenStorage::class);
+};
+```
+
+## Generate test tokens
+
+```php
+$jwtService = $container->get(JwtService::class);
+
+$identity = new UserIdentity(id: 'test-user-id', roles: ['ROLE_USER']);
+$token = $jwtService->issue($identity);
+
+$client->request('GET', '/api/users/me', [], [], [
+    'HTTP_AUTHORIZATION' => 'Bearer ' . $token->accessToken,
+]);
+```
+
+## Test protected routes without tokens
+
+```php
+$response = $client->request('GET', '/api/users/me');
+$this->assertResponseStatusCodeSame(401);
+```
+
+## Test password hashing
+
+```php
+$hasher = new ArgonPasswordHasher();
+
+$hash = $hasher->hash('mysecret');
+
+$this->assertTrue($hasher->verify('mysecret', $hash));
+$this->assertFalse($hasher->verify('wrongpassword', $hash));
+$this->assertStringStartsWith('$argon2id$', $hash);
+```
+
+## Test token revocation
+
+```php
+$storage = new InMemoryTokenStorage();
+$jwtService = new JwtService($config, $storage);
+
+$token = $jwtService->issue($identity);
+
+// Revoke all
+$jwtService->revokeAll($identity->id());
+
+// Attempt refresh — should throw TokenRevokedException
+$this->expectException(TokenRevokedException::class);
+$jwtService->refresh($token->refreshToken, $identity);
+```
+
+## Test CurrentUserProvider
+
+```php
+$arrayAdapter = new ArrayAdapter();
+$provider = new CurrentUserProvider($arrayAdapter);
+
+// Before setting identity
+$user = $provider->get();
+$this->assertFalse($user->isAuthenticated());
+
+// After AuthMiddleware sets identity
+$arrayAdapter->set('auth:identity', new UserIdentity('user-1', ['ROLE_USER']));
+$user = $provider->get();
+$this->assertTrue($user->isAuthenticated());
+$this->assertEquals('user-1', $user->id());
+```

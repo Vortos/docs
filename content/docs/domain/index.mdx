@@ -1,0 +1,55 @@
+---
+title: Domain
+description: The pure domain layer — aggregates, identities, domain events, value objects, and collections. No infrastructure dependencies.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Domain
+
+`vortos-domain` is the pure domain layer. It has **no dependencies on infrastructure** — no Doctrine, no Redis, no HTTP. Everything in this package is plain PHP expressing business concepts.
+
+<Callout type="info" title="Dependency Direction">
+Infrastructure depends on domain. Domain never depends on infrastructure. `DbalWriteRepository` depends on `WriteRepositoryInterface`. `WriteRepositoryInterface` does not know Doctrine exists.
+</Callout>
+
+## What's in vortos-domain
+
+| Component | Purpose |
+|---|---|
+| `AggregateRoot` | Base class for all domain aggregates |
+| `AggregateId` | Type-safe UuidV7-based identity |
+| `DomainEvent` | Base class for domain events |
+| `AbstractCommand` | Base class for CQRS commands |
+| `ValueObject` | Base class for value objects |
+| `Collection` | Type-safe domain collections |
+| `WriteRepositoryInterface` | Contract for write-side repositories |
+| `ReadRepositoryInterface` | Contract for read-side repositories |
+| `PageResult` | Cursor-based pagination result |
+
+## The Aggregate Pattern
+
+```
+final class User extends AggregateRoot
+    ↓
+UserId extends AggregateId
+    ↓
+UserRegisteredEvent extends DomainEvent
+    ↓
+Email extends ValueObject
+```
+
+Your domain model is built entirely from these building blocks. Infrastructure layers (DBAL, MongoDB) implement the interfaces — your domain code never imports them.
+
+## Module Overview
+
+<Cards>
+  <Card title="Aggregates" href="/docs/domain/aggregates" description="AggregateRoot — state, versioning, domain event recording." />
+  <Card title="Identity" href="/docs/domain/identity" description="AggregateId — typed UuidV7 identifiers with equality and string conversion." />
+  <Card title="Domain Events" href="/docs/domain/events" description="DomainEvent — immutable facts, versioning, occurredAt." />
+  <Card title="Commands" href="/docs/domain/commands" description="AbstractCommand and CommandInterface — intent, idempotency keys." />
+  <Card title="Queries" href="/docs/domain/queries" description="QueryInterface — marker interface for read-side questions." />
+  <Card title="Value Objects" href="/docs/domain/value-objects" description="ValueObject — equality by value, immutability, toString." />
+  <Card title="Collections" href="/docs/domain/collections" description="Collection — type-safe, ordered, filterable." />
+</Cards>

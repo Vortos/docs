@@ -1,0 +1,186 @@
+---
+title: Commands
+description: Write command handlers — #[AsCommandHandler], AbstractCommand, transaction ownership, domain event dispatch, and idempotency keys.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Commands
+
+## Define a Command
+
+Commands extend `AbstractCommand` — a readonly class with a default `idempotencyKey()` returning `null`. Override it to enable idempotency.
+
+```php title="src/User/Application/Command/RegisterUser.php"
+use Vortos\Domain\Command\AbstractCommand;
+
+final readonly class RegisterUser extends AbstractCommand
+{
+    public function __construct(
+        public string $email,
+        public string $name,
+        public string $password,
+    ) {}
+}
+```
+
+## Write a Handler
+
+```php title="src/User/Application/RegisterUserHandler.php"
+use Vortos\Cqrs\Attribute\AsCommandHandler;
+
+#[AsCommandHandler]
+final class RegisterUserHandler
+{
+    public function __construct(
+        private UserRepository $users,
+        private PasswordHasherInterface $hasher,
+    ) {}
+
+    public function __invoke(RegisterUser $command): User
+    {
+        $user = User::register(
+            email: new Email($command->email),
+            name: $command->name,
+            passwordHash: $this->hasher->hash($command->password),
+        );
+
+        $this->users->save($user);
+
+        return $user; // Return aggregate — bus dispatches its domain events
+    }
+}
+```
+
+### What the CommandBus Does Automatically
+
+1. Checks idempotency — if key already processed, skips silently (or throws in strict mode)
+2. Opens `UnitOfWork` transaction
+3. Calls `$handler($command)`
+4. Calls `$result->pullDomainEvents()` on the returned aggregate
+5. Dispatches each event to `EventBus` (writes to outbox inside the transaction)
+6. Commits
+7. Marks idempotency key as processed
+
+Your handler only does domain logic and saves. Never call `beginTransaction()`, `commit()`, or `dispatch()` inside a handler.
+
+<Callout type="warn" title="Return the Aggregate">
+Return the aggregate from your handler so the bus can pull and dispatch domain events. If your handler returns `null`, no events are dispatched — domain events are silently dropped.
+</Callout>
+
+## Dispatch from a Controller
+
+```php
+use Vortos\Cqrs\Command\CommandBusInterface;
+
+final class RegisterUserController
+{
+    public function __construct(private CommandBusInterface $commandBus) {}
+
+    public function register(Request $request): JsonResponse
+    {
+        $data = $request->toArray();
+
+        $this->commandBus->dispatch(new RegisterUser(
+            email: $data['email'],
+            name: $data['name'],
+            password: $data['password'],
+        ));
+
+        return new JsonResponse(['status' => 'created'], 201);
+    }
+}
+```
+
+## Handler Discovery — Inferred from __invoke()
+
+`CommandHandlerPass` infers the command class from the `__invoke()` first parameter type — no explicit `handles:` needed:
+
+```php
+// These two are equivalent:
+
+#[AsCommandHandler]                                          // inferred
+final class RegisterUserHandler
+{
+    public function __invoke(RegisterUser $command): User { ... }
+}
+
+#[AsCommandHandler(handles: RegisterUser::class)]            // explicit
+final class RegisterUserHandler
+{
+    public function __invoke(RegisterUser $command): User { ... }
+}
+```
+
+Use the explicit form when you want to make the relationship obvious in code review or for IDE navigation.
+
+### Compile-Time Validation
+
+If two handlers are registered for the same command, `CommandHandlerPass` throws at compile time:
+
+```
+Two command handlers registered for "App\RegisterUser":
+"RegisterUserHandler" and "LegacyRegisterUserHandler".
+Each command must have exactly one handler.
+```
+
+If `__invoke()` is missing or has no typed first parameter, `CommandHandlerPass` also throws with a clear message.
+
+## CommandHandlerNotFoundException
+
+Dispatching a command with no registered handler throws at runtime:
+
+```php
+use Vortos\Cqrs\Exception\CommandHandlerNotFoundException;
+
+try {
+    $this->commandBus->dispatch(new SomeCommand());
+} catch (CommandHandlerNotFoundException $e) {
+    // Programming error — handler not registered
+}
+```
+
+This is always a programming error, not a user error. It should never reach production.
+
+## AbstractCommand
+
+```php
+abstract readonly class AbstractCommand implements CommandInterface
+{
+    // Default returns null — override to enable idempotency
+    public function idempotencyKey(): ?string
+    {
+        return null;
+    }
+}
+```
+
+Override `idempotencyKey()` to return a client-generated UUID when idempotency is needed. See the [Idempotency](/docs/cqrs/idempotency) page for all options.
+
+## Handlers Are Transactional — No Manual Transactions
+
+The `CommandBus` wraps every handler in `UnitOfWork::run()`. Never manage transactions inside a handler:
+
+```php
+// WRONG — never do this
+final class RegisterUserHandler
+{
+    public function __invoke(RegisterUser $command): void
+    {
+        $this->db->beginTransaction();  // NO
+        // ...
+        $this->db->commit();            // NO
+    }
+}
+
+// CORRECT — just do domain logic and save
+final class RegisterUserHandler
+{
+    public function __invoke(RegisterUser $command): User
+    {
+        $user = User::register($command->email, $command->name);
+        $this->users->save($user);
+        return $user;
+    }
+}
+```

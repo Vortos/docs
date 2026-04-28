@@ -1,0 +1,131 @@
+---
+title: Cache
+description: PSR-16 cache with tag-based invalidation — Redis for production, InMemory for tests, ArrayAdapter for request-scoped memoization.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Cache
+
+Vortos cache provides PSR-16 `CacheInterface` extended with tag-based invalidation via `TaggedCacheInterface`. Three adapters cover every scenario — Redis for production persistence, `InMemoryAdapter` for tests, and `ArrayAdapter` for within-request memoization.
+
+## Three Adapters
+
+| Adapter | Scope | TTL | Tags | Use Case |
+|---|---|---|---|---|
+| `RedisAdapter` | Cross-request, cross-worker | Respected | Supported | Production |
+| `InMemoryAdapter` | Per-process | Respected (lazy expiry) | Supported | Tests |
+| `ArrayAdapter` | Per-request only | Ignored | Supported | Request memoization |
+
+## Installation
+
+```bash
+composer require vortos/vortos-cache
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Cache\DependencyInjection\CachePackage;
+
+$packages = [
+    new CachePackage(),  // MUST be first — other packages depend on CacheInterface
+    new MessagingPackage(),
+    new CqrsPackage(),
+    // ...
+];
+```
+
+<Callout type="warn" title="CachePackage Must Be First">
+`CachePackage` must be the first package registered. `MessagingPackage` (idempotency) and `CqrsPackage` (command idempotency) both depend on `CacheInterface` being registered before they load.
+</Callout>
+
+## Environment Variables
+
+```bash
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=        # optional
+APP_ENV=prod           # used in key prefix to prevent collisions
+```
+
+## Configuration
+
+```php title="config/cache.php"
+use Vortos\Cache\DependencyInjection\VortosCacheConfig;
+
+return static function (VortosCacheConfig $config): void {
+    $config
+        ->dsn(sprintf('redis://%s:%s', $_ENV['REDIS_HOST'], $_ENV['REDIS_PORT']))
+        ->prefix($_ENV['APP_ENV'] . '_myapp_')  // always include env + app name
+        ->defaultTtl(3600);                     // 1 hour default
+};
+```
+
+All settings have defaults — no config file is required for zero-config startup.
+
+### All Config Options
+
+| Method | Default | Description |
+|---|---|---|
+| `->driver(string)` | `RedisAdapter::class` | FQCN of `TaggedCacheInterface` implementation |
+| `->dsn(string)` | `redis://redis:6379` | Redis connection DSN |
+| `->prefix(string)` | `vortos_` | Key prefix — always include `APP_ENV` |
+| `->defaultTtl(int)` | `3600` | Default TTL in seconds for keys without explicit TTL |
+
+### Swap Driver Per Environment
+
+```php title="config/test/cache.php"
+use Vortos\Cache\Adapter\InMemoryAdapter;
+
+return static function (VortosCacheConfig $config): void {
+    $config->driver(InMemoryAdapter::class);
+    // Redis connection not registered when InMemory is the driver
+};
+```
+
+## Services Registered
+
+```
+\Redis::class           — only when driver = RedisAdapter (lazy connection)
+RedisAdapter::class     — always registered, injectable by class
+InMemoryAdapter::class  — always registered, injectable by class
+ArrayAdapter::class     — always registered, public (needed by Runner::cleanUp)
+CacheInterface          — alias → configured driver
+TaggedCacheInterface    — alias → configured driver
+```
+
+Both `CacheInterface` and `TaggedCacheInterface` point to the configured driver — swapping the driver in config routes all injections automatically.
+
+## Inject the Cache
+
+```php
+use Psr\SimpleCache\CacheInterface;
+use Vortos\Cache\Contract\TaggedCacheInterface;
+
+// Inject via interface — gets the configured driver
+final class MyService
+{
+    public function __construct(private TaggedCacheInterface $cache) {}
+}
+
+// Inject a specific adapter directly
+use Vortos\Cache\Adapter\ArrayAdapter;
+
+final class AuthMiddleware
+{
+    public function __construct(private ArrayAdapter $arrayAdapter) {}
+}
+```
+
+## Module Overview
+
+<Cards>
+  <Card title="Adapters" href="/docs/cache/adapters" description="ArrayAdapter, InMemoryAdapter, and RedisAdapter — when to use each." />
+  <Card title="Tagged Cache" href="/docs/cache/tagged-cache" description="setWithTags() and invalidateTags() — group-based cache invalidation." />
+  <Card title="Redis" href="/docs/cache/redis" description="Connection DSN, key format, SCAN-based clear, tag internals." />
+  <Card title="Warmers" href="/docs/cache/warmers" description="Pre-populate cache on deployment with CacheWarmerInterface." />
+  <Card title="Commands" href="/docs/cache/commands" description="vortos:cache:clear and vortos:cache:warmup CLI reference." />
+  <Card title="Testing" href="/docs/cache/testing" description="Use InMemoryAdapter and ArrayAdapter in tests." />
+</Cards>

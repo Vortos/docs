@@ -1,0 +1,121 @@
+---
+title: Tracing
+description: OpenTelemetry-compatible distributed tracing with sampling, per-module disable, and zero-overhead NoOp spans when tracing is off.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Tracing
+
+`vortos-tracing` provides distributed tracing via a decorator chain. NoOp by default — zero overhead until you plug in OpenTelemetry. Sampling and per-module disable are configured at compile time.
+
+## Decorator Chain
+
+```
+TracingInterface (injected everywhere)
+    │
+    ▼
+ModuleAwareTracer    ← disables specific modules (e.g. cache too noisy)
+    │
+    ▼
+SamplingTracer       ← applies sampling rate (e.g. trace 10% of requests)
+    │
+    ▼
+NoOpTracer           ← default inner (zero overhead)
+  or
+OpenTelemetryTracer  ← when you plug in OpenTelemetry
+```
+
+When `ModuleAwareTracer` detects a disabled module, it returns `NoOpSpan` immediately — never calls `SamplingTracer`. When `SamplingTracer` decides not to sample, it returns `NoOpSpan` — never calls the inner tracer.
+
+## Installation
+
+```bash
+composer require vortos/vortos-tracing
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Tracing\DependencyInjection\TracingPackage;
+
+$packages = [
+    new HttpPackage(),
+    new TracingPackage(),
+    // ...
+];
+```
+
+## Configuration
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingModule;
+use Vortos\Tracing\Config\TracingSampler;
+use Vortos\Tracing\DependencyInjection\VortosTracingConfig;
+
+return static function (VortosTracingConfig $config): void {
+
+    // Sampling strategy
+    $config->sampler(TracingSampler::AlwaysOn);               // trace everything (dev)
+    $config->sampler(TracingSampler::AlwaysOff);              // disable completely
+    $config->sampler(TracingSampler::Ratio, rate: 0.1);       // trace 10% (prod default)
+    $config->sampler(TracingSampler::Ratio, rate: 0.01);      // trace 1% (high-volume)
+
+    // Disable noisy modules
+    $config->disable(TracingModule::Cache);
+    $config->disable(TracingModule::Auth, TracingModule::Cache);
+
+    // Re-enable if needed
+    $config->enable(TracingModule::Cache);
+};
+```
+
+No config file is required — defaults are `Ratio` sampler at `0.1` in prod, `AlwaysOn` in dev.
+
+## Default Behaviour Per Environment
+
+| Environment | Default Sampler | Default Rate |
+|---|---|---|
+| `dev` | `AlwaysOn` | 100% |
+| Any other | `Ratio` | 10% |
+
+## Inject the Tracer
+
+```php
+use Vortos\Tracing\Contract\TracingInterface;
+
+final class PaymentService
+{
+    public function __construct(private TracingInterface $tracer) {}
+
+    public function charge(Payment $payment): void
+    {
+        $span = $this->tracer->startSpan('payment.charge', [
+            'payment.id'       => $payment->getId(),
+            'payment.amount'   => $payment->getAmount(),
+            'payment.currency' => $payment->getCurrency(),
+        ]);
+
+        try {
+            // ... charge
+            $span->setStatus('ok');
+        } catch (\Throwable $e) {
+            $span->recordException($e);
+            $span->setStatus('error', $e->getMessage());
+            throw $e;
+        } finally {
+            $span->end(); // always call end()
+        }
+    }
+}
+```
+
+## Module Overview
+
+<Cards>
+  <Card title="Samplers" href="/docs/tracing/samplers" description="AlwaysOn, AlwaysOff, Ratio — how sampling decisions are made." />
+  <Card title="Modules" href="/docs/tracing/modules" description="TracingModule enum — disable tracing per framework module." />
+  <Card title="Spans" href="/docs/tracing/spans" description="SpanInterface, NoOpSpan — recording attributes, exceptions, and status." />
+  <Card title="OpenTelemetry" href="/docs/tracing/opentelemetry" description="Plug in OpenTelemetryTracer to send spans to a collector." />
+</Cards>

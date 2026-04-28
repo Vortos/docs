@@ -1,0 +1,107 @@
+---
+title: Routing
+description: How RouteCompilerPass discovers #[Route] attributes at compile time, builds RouteCollection, and how kernel.enable_routes controls it.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Routing
+
+## How It Works
+
+Vortos routing is entirely attribute-based. At container compile time, `RouteCompilerPass` scans all classes tagged `vortos.api.controller`, reads their `#[Route]` attributes, and builds a `RouteCollection`. At runtime, `RouterListener` uses the pre-built collection — zero scanning, zero reflection.
+
+```
+Container compile time:
+    RouteCompilerPass
+        ├── Find all services tagged vortos.api.controller
+        ├── For each: load #[Route] attributes via RouteAttributeClassLoader
+        ├── Build RouteCollection
+        └── Serialize into container definition
+
+Runtime (every request):
+    RouterListener (priority 8)
+        ├── Deserialize RouteCollection (once, from container)
+        └── UrlMatcher::match(request) → _controller attribute set
+```
+
+## Enabling Routes
+
+Routes are only compiled when `kernel.enable_routes` is `true`. Set this in your bootstrap:
+
+```php title="bootstrap/app.php"
+$container->setParameter('kernel.enable_routes', true);
+$container->setParameter('kernel.debug', $_ENV['APP_ENV'] === 'dev');
+$container->setParameter('kernel.project_dir', __DIR__ . '/..');
+$container->setParameter('kernel.env', $_ENV['APP_ENV'] ?? 'prod');
+```
+
+When `kernel.enable_routes` is `false`, `RouteCompilerPass` and `HttpListenerCompilerPass` both skip — useful for CLI-only containers (worker processes, console commands).
+
+## Route Discovery Flow
+
+```
+#[ApiController] on a class
+    │
+    ▼ (autoconfiguration at compile time)
+Tag: vortos.api.controller
+    │
+    ▼ (RouteCompilerPass)
+RouteAttributeClassLoader::load($className)
+    ├── Scans class-level #[Route] attributes
+    └── Scans method-level #[Route] attributes
+    │
+    ▼
+RouteCollection (serialized into container)
+    │
+    ▼ (runtime)
+UrlMatcher::match($request) → sets _controller
+```
+
+## _controller Format
+
+`RouteAttributeClassLoader` sets `_controller` in the format `ClassName::methodName`:
+
+```
+App\User\Http\UserController::show
+App\User\Http\CreateUserController::__invoke
+```
+
+`ContainerControllerResolver` loads the controller from the container by class name, then calls the method.
+
+## Route Requirements
+
+Constrain path parameters with regex:
+
+```php
+// UUID format
+#[Route('/users/{id}', methods: ['GET'], requirements: ['id' => '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'])]
+
+// Numeric
+#[Route('/pages/{page}', methods: ['GET'], requirements: ['page' => '\d+'])]
+
+// Slug
+#[Route('/posts/{slug}', methods: ['GET'], requirements: ['slug' => '[a-z0-9-]+'])]
+```
+
+Requests that do not match requirements return 404 before the controller runs.
+
+## Route Naming
+
+Named routes enable URL generation:
+
+```php
+#[Route('/users/{id}', name: 'user.show', methods: ['GET'])]
+```
+
+Generate URLs using Symfony's `UrlGeneratorInterface` — inject it in controllers that need to return redirect responses.
+
+## Route Precedence
+
+Routes are matched in the order they are added to the `RouteCollection`. For controllers with method-level routes, methods are iterated in declaration order. If two routes match the same path and method, the first one wins.
+
+To control precedence explicitly, use route `priority` (Symfony 6.1+) or ensure more specific routes are declared before less specific ones.
+
+<Callout type="info" title="No YAML or XML Routes">
+Vortos has no YAML or XML route configuration. All routes are defined via `#[Route]` attributes on controller classes. This keeps routes co-located with the controllers they belong to — no separate routing file to maintain.
+</Callout>

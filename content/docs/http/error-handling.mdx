@@ -1,0 +1,141 @@
+---
+title: Error Handling
+description: ErrorController — JSON vs HTML responses, debug vs production mode, PublicExceptionInterface for safe error messages, log levels.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Error Handling
+
+`ErrorController` handles all uncaught exceptions. It decides the response format (JSON or HTML), the message to expose, and the log level based on the exception type and request headers.
+
+## JSON vs HTML
+
+The response format is determined by the request headers:
+
+```php
+private function wantsJson(Request $request): bool
+{
+    return $request->headers->get('Content-Type') === 'application/json'
+        || $request->headers->get('Accept') === 'application/json';
+}
+```
+
+**API clients** that send `Content-Type: application/json` or `Accept: application/json` receive:
+
+```json
+{
+  "error": true,
+  "code": 404,
+  "message": "User not found",
+  "trace": []  // only in debug mode
+}
+```
+
+**Browser clients** receive an HTML error page (from `View/error.html.php`).
+
+## Debug Mode
+
+Enable debug mode in your bootstrap:
+
+```php
+$container->setParameter('kernel.debug', $_ENV['APP_ENV'] === 'dev');
+```
+
+In **debug mode** (`kernel.debug = true`):
+- Exception message is always shown (even for 500 errors)
+- Stack trace is included in JSON responses
+- Code snippet shown in HTML error page (10 lines around the exception line)
+
+In **production mode** (`kernel.debug = false`):
+- 5xx errors show a generic "Something went wrong" message
+- 4xx errors show the exception message (if `< 500`)
+- `PublicExceptionInterface` exceptions show their message regardless of status code
+- No stack trace exposed
+
+## HTTP Status Codes
+
+`ErrorController` uses `HttpExceptionInterface` from Symfony:
+
+```php
+// These return their specific HTTP status code:
+use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
+use Symfony\Component\HttpKernel\Exception\UnauthorizedHttpException;
+use Symfony\Component\HttpKernel\Exception\ForbiddenHttpException;
+
+throw new NotFoundHttpException('User not found');   // 404
+throw new UnauthorizedHttpException('Bearer');        // 401
+
+// Any other exception → 500
+throw new \RuntimeException('Something broke');       // 500
+```
+
+## PublicExceptionInterface
+
+Implement `PublicExceptionInterface` to expose your exception message safely in production:
+
+```php
+use Vortos\Http\Contract\PublicExceptionInterface;
+
+final class UserNotFoundException extends \RuntimeException implements PublicExceptionInterface
+{
+    public function __construct(string $userId)
+    {
+        parent::__construct("User '{$userId}' not found.");
+    }
+}
+
+// This message is shown in production (not hidden behind generic message)
+throw new UserNotFoundException('user-123');
+// Response: {"error": true, "code": 500, "message": "User 'user-123' not found."}
+```
+
+Without `PublicExceptionInterface`, a non-HTTP exception in production returns:
+```json
+{
+  "error": true,
+  "code": 500,
+  "message": "Something went wrong, please try again later."
+}
+```
+
+<Callout type="warn" title="Never expose sensitive data in exception messages">
+Only implement `PublicExceptionInterface` on exceptions whose messages are safe to show users. Never include SQL errors, stack traces, internal service names, or user data in public exception messages.
+</Callout>
+
+## Log Levels
+
+`ErrorController` logs exceptions at different levels:
+
+| Exception Type | Status Code | Log Level |
+|---|---|---|
+| `HttpExceptionInterface` | 5xx | `CRITICAL` |
+| `HttpExceptionInterface` | 4xx | `ERROR` |
+| Any other exception | — | `CRITICAL` |
+
+4xx errors (client errors) are logged as `ERROR` — they are expected. 5xx errors (server errors) are logged as `CRITICAL` — they require immediate attention.
+
+## Register in Bootstrap
+
+`ErrorController` is registered automatically by `HttpExtension` with the configured debug flag:
+
+```php
+// In HttpExtension — already handled:
+$container->register(ErrorController::class, ErrorController::class)
+    ->setArguments(['%kernel.debug%'])
+    ->setPublic(true);
+```
+
+`ErrorListener` uses `ErrorController::class` as the error controller string — Symfony's `ErrorListener` calls it via the controller resolver when an exception occurs.
+
+## Custom Error Controller
+
+Replace `ErrorController` with your own implementation — register it in `config/services.php` before `HttpPackage` builds:
+
+```php
+// Replace the default
+$services->set(ErrorController::class, MyErrorController::class)
+    ->arg('$debug', '%kernel.debug%')
+    ->arg('$logger', service(LoggerInterface::class))
+    ->public();
+```

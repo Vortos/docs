@@ -1,0 +1,61 @@
+---
+title: Token Storage
+description: Refresh token tracking and revocation.
+---
+
+# Token Storage
+
+`TokenStorageInterface` tracks refresh tokens for revocation. Access tokens are not tracked — their short TTL is the revocation mechanism.
+
+## Why only track refresh tokens
+
+| Token type | TTL | Revocation |
+|-----------|-----|-----------|
+| Access token | 15 min | TTL expiry |
+| Refresh token | 7 days | JTI blacklist in Redis |
+
+Checking Redis on every API request (access token validation) would add significant latency. The 15-minute TTL makes explicit revocation unnecessary for access tokens — a stolen token expires quickly.
+
+Refresh tokens require explicit revocation — a 7-day validity window is too long to rely on TTL alone.
+
+## Redis key format
+
+```
+vortos_auth:token:{jti}          — userId, TTL matches token expiry
+vortos_auth:user_tokens:{userId} — SET of active JTIs for this user
+```
+
+<Callout type="info">
+Auth keys use the prefix `vortos_auth:` — **separate from your application cache prefix**. Running `vortos:cache:clear` does **not** affect auth tokens. Users are not logged out when you clear the cache.
+</Callout>
+
+## Swapping storage
+
+For testing:
+
+```php
+// config/test/auth.php
+$config->tokenStorage(InMemoryTokenStorage::class);
+```
+
+For custom storage (e.g. PostgreSQL for audit requirements):
+
+```php
+$config->tokenStorage(DbalTokenStorage::class);
+```
+
+## Token rotation
+
+When a refresh token is used, it is revoked before the new pair is issued:
+
+```
+validate refresh token
+  → check Redis: jti exists? yes
+  → check expiry: not expired
+revoke old jti in Redis
+issue new access + refresh pair
+  → store new jti in Redis
+return new token pair
+```
+
+A stolen refresh token cannot be used after it has been used once by the legitimate holder.

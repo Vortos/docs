@@ -1,0 +1,13 @@
+{
+  "title": "Domain",
+  "pages": [
+    "index",
+    "aggregates",
+    "identity",
+    "events",
+    "commands",
+    "queries",
+    "value-objects",
+    "collections"
+  ]
+}

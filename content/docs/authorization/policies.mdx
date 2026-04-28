@@ -1,0 +1,182 @@
+---
+title: Policies
+description: Write PolicyInterface implementations — the authorization logic for each resource type, auto-discovered via #[AsPolicy].
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Policies
+
+A policy is a PHP class that implements `PolicyInterface` and carries the `#[AsPolicy]` attribute. One policy per resource type. `PolicyRegistryPass` discovers and wires them all at compile time.
+
+## Write a Policy
+
+```php title="src/Document/Infrastructure/Authorization/DocumentPolicy.php"
+use Vortos\Authorization\Attribute\AsPolicy;
+use Vortos\Authorization\Contract\PolicyInterface;
+use Vortos\Authorization\Voter\RoleVoter;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+#[AsPolicy(resource: 'documents')]
+final class DocumentPolicy implements PolicyInterface
+{
+    public function __construct(private RoleVoter $roles) {}
+
+    public function supports(string $resource): bool
+    {
+        return $resource === 'documents';
+    }
+
+    public function can(
+        UserIdentityInterface $identity,
+        string $action,
+        string $scope,
+        mixed $resource = null,
+    ): bool {
+        return match($action) {
+            'list'   => $this->roles->atLeast($identity, 'ROLE_USER'),
+            'read'   => $this->roles->atLeast($identity, 'ROLE_USER'),
+            'create' => $this->roles->atLeast($identity, 'ROLE_USER'),
+            'update' => $this->canUpdate($identity, $scope, $resource),
+            'delete' => $this->canDelete($identity, $scope, $resource),
+            'export' => $this->roles->atLeast($identity, 'ROLE_ADMIN'),
+            default  => false,
+        };
+    }
+
+    private function canUpdate(UserIdentityInterface $identity, string $scope, mixed $resource): bool
+    {
+        // Admins can update any document
+        if ($this->roles->atLeast($identity, 'ROLE_ADMIN')) {
+            return true;
+        }
+
+        // Users can only update their own documents
+        return $scope === 'own'
+            && $resource !== null
+            && $resource['author_id'] === $identity->id();
+    }
+
+    private function canDelete(UserIdentityInterface $identity, string $scope, mixed $resource): bool
+    {
+        if ($this->roles->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN'])) {
+            return true;
+        }
+
+        return $scope === 'own'
+            && $resource !== null
+            && $resource['author_id'] === $identity->id();
+    }
+}
+```
+
+## PolicyInterface
+
+```php
+interface PolicyInterface
+{
+    // Whether this policy handles the given resource type
+    public function supports(string $resource): bool;
+
+    // The authorization decision
+    public function can(
+        UserIdentityInterface $identity,
+        string $action,
+        string $scope,
+        mixed $resource = null,
+    ): bool;
+}
+```
+
+The `$resource` parameter is whatever was loaded using `resourceParam` from `#[RequiresPermission]`. It is `null` if no `resourceParam` was specified — always handle null safely.
+
+## Resource Naming
+
+The `resource` in `#[AsPolicy]` must match the first segment of your permission strings:
+
+```php
+#[AsPolicy(resource: 'documents')]   // handles 'documents.*.*'
+#[AsPolicy(resource: 'athletes')]    // handles 'athletes.*.*'
+#[AsPolicy(resource: 'invoices')]    // handles 'invoices.*.*'
+```
+
+Use snake_case plural nouns. `documents.update.own` → looks up policy keyed `documents`.
+
+## Auto-Discovery
+
+`#[AsPolicy]` triggers autoconfiguration — your policy class is automatically tagged `vortos.policy` and registered as a public service. No manual registration needed:
+
+```php
+// This is all you need — no config/services.php entry required:
+#[AsPolicy(resource: 'documents')]
+final class DocumentPolicy implements PolicyInterface { ... }
+```
+
+The `PolicyRegistryPass` compiler pass discovers all `vortos.policy` tagged services and builds the `ServiceLocator` at compile time.
+
+<Callout type="warn" title="One Policy Per Resource">
+Registering two policies for the same resource throws a `\LogicException` at compile time:
+
+```
+Two policies registered for resource "documents": "DocumentPolicy" and "LegacyDocumentPolicy".
+Each resource must have exactly one policy.
+```
+
+If you need to split logic, keep one policy and delegate internally.
+</Callout>
+
+## No Policy for a Resource
+
+If a controller has `#[RequiresPermission('widgets.read.any')]` but no policy is registered for `widgets`, `PolicyEngine::can()` returns `false` — access denied. It does not throw. The 403 response is returned.
+
+`PolicyEngine::authorize()` also returns `false` → throws `AccessDeniedException`. The missing policy message appears in the exception:
+
+```
+No policy registered for resource "widgets".
+Create a class with #[AsPolicy(resource: "widgets")] implementing PolicyInterface.
+```
+
+## Common Policy Patterns
+
+### Pure Role-Based (no resource needed)
+
+```php
+public function can(UserIdentityInterface $identity, string $action, string $scope, mixed $resource = null): bool
+{
+    return match($action) {
+        'list'   => $this->roles->atLeast($identity, 'ROLE_USER'),
+        'create' => $this->roles->atLeast($identity, 'ROLE_ADMIN'),
+        'delete' => $this->roles->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN']),
+        default  => false,
+    };
+}
+```
+
+### Plan-Based (subscription tier check)
+
+```php
+public function can(UserIdentityInterface $identity, string $action, string $scope, mixed $resource = null): bool
+{
+    $plan = $identity->getAttribute('plan', 'free');
+
+    return match($action) {
+        'export' => in_array($plan, ['pro', 'enterprise'], true),
+        'bulk'   => $plan === 'enterprise',
+        default  => $this->roles->atLeast($identity, 'ROLE_USER'),
+    };
+}
+```
+
+### Ownership + Role Fallback
+
+```php
+public function can(UserIdentityInterface $identity, string $action, string $scope, mixed $resource = null): bool
+{
+    return match($action) {
+        'update' => $this->roles->atLeast($identity, 'ROLE_ADMIN')
+                    || ($scope === 'own' && $resource !== null && $resource['owner_id'] === $identity->id()),
+        'delete' => $this->roles->atLeast($identity, 'ROLE_ADMIN'),
+        default  => $this->roles->atLeast($identity, 'ROLE_USER'),
+    };
+}
+```

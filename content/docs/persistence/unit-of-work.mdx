@@ -1,0 +1,162 @@
+---
+title: Unit of Work
+description: Transaction boundaries, connection resilience for long-running workers, and atomic aggregate + outbox writes.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Unit of Work
+
+`UnitOfWorkInterface` wraps all database operations in a transaction. It has one public method: `run()`. `begin()`, `commit()`, and `rollback()` are intentionally not on the interface — exposing them would allow callers to open transactions they never close.
+
+## API
+
+```php
+interface UnitOfWorkInterface
+{
+    public function run(callable $work): mixed;
+    public function isActive(): bool;
+}
+```
+
+`run()` handles the full transaction lifecycle:
+
+```
+ensureConnection()   ← ping DB, reconnect if stale
+beginTransaction()
+    work()           ← your code runs here
+commit()             ← on success
+─── or ───
+rollBack()           ← on any exception
+throw $e             ← original exception rethrown
+```
+
+Whatever `$work` returns is passed through to the caller.
+
+## Basic Usage
+
+```php
+use Vortos\Persistence\Transaction\UnitOfWorkInterface;
+
+final class RegisterUserHandler
+{
+    public function __construct(
+        private UnitOfWorkInterface $unitOfWork,
+        private UserRepository $users,
+    ) {}
+
+    public function __invoke(RegisterUser $command): void
+    {
+        $this->unitOfWork->run(function() use ($command) {
+            $user = User::register(
+                new Email($command->email),
+                $command->name,
+            );
+
+            $this->users->save($user);
+        });
+    }
+}
+```
+
+## Atomic Aggregate + Outbox Write
+
+The most important use case: writing the aggregate and its outbox events in the same transaction, guaranteeing at-least-once delivery:
+
+```php
+final class RegisterUserHandler
+{
+    public function __construct(
+        private UnitOfWorkInterface $unitOfWork,
+        private UserRepository $users,
+        private OutboxWriter $outbox,
+    ) {}
+
+    public function __invoke(RegisterUser $command): void
+    {
+        $this->unitOfWork->run(function() use ($command) {
+            $user = User::register(new Email($command->email), $command->name);
+
+            $this->users->save($user);
+
+            // Write events to outbox within the same transaction
+            foreach ($user->pullDomainEvents() as $event) {
+                $this->outbox->store($event, 'user.events');
+            }
+
+            // If save() or store() throws → both roll back
+            // Either both succeed or neither does
+        });
+    }
+}
+```
+
+<Callout type="info" title="CommandBus Owns the Transaction">
+The `CommandBus` wraps every handler in `UnitOfWork::run()` automatically. You only need to inject `UnitOfWorkInterface` directly when you need fine-grained control — for example, when doing multiple save operations that must be individually atomic, or when working in a context outside the command bus.
+</Callout>
+
+## Returning Values
+
+`run()` passes through whatever `$work` returns:
+
+```php
+$user = $this->unitOfWork->run(function() use ($command) {
+    $user = User::register(new Email($command->email), $command->name);
+    $this->users->save($user);
+    return $user; // returned to caller
+});
+
+// $user is the registered User aggregate
+```
+
+## Nested Transactions
+
+Use `isActive()` to avoid opening a nested transaction when an outer one is already active:
+
+```php
+// TransactionalMiddleware uses this pattern:
+if ($this->unitOfWork->isActive()) {
+    // Outer transaction owns commit/rollback — just run the work
+    return $work();
+}
+
+return $this->unitOfWork->run($work);
+```
+
+You rarely need this in application code — the `CommandBus` handles it automatically via `TransactionalMiddleware`.
+
+## Connection Resilience
+
+The DBAL `UnitOfWork` implementation pings the database before every `run()` call:
+
+```php
+private function ensureConnection(): void
+{
+    try {
+        $this->connection->executeQuery('SELECT 1');
+    } catch (\Throwable) {
+        $this->connection->close();
+        // DBAL auto-reconnects on next query after close()
+    }
+}
+```
+
+This is critical for long-running processes:
+
+| Process | Idle period | Problem without resilience |
+|---|---|---|
+| FrankenPHP worker | Between requests | DB connection times out overnight |
+| Kafka consumer worker | Between messages | "MySQL server has gone away" on first batch |
+| CLI command | Batch pauses | Connection dropped mid-batch |
+
+`SELECT 1` takes ~0.1ms on a local connection — the overhead is negligible.
+
+<Callout type="warn" title="DBAL 3.x: No ping()">
+DBAL 3.x removed `Connection::ping()`. The correct reconnect pattern is to catch a query exception and call `$connection->close()`. DBAL automatically reconnects on the next query after `close()`. Do not call `$connection->connect()` — it is protected in DBAL 3.x.
+</Callout>
+
+## Shared Connection
+
+All services that participate in a transaction — `UnitOfWork`, `DbalWriteRepository`, `OutboxWriter`, `DeadLetterWriter` — **must share the same `Connection` instance**. If they used different instances, each would have its own transaction and atomicity would be lost.
+
+`DbalPersistenceExtension` registers `Connection::class` with `setShared(true)` (the default, made explicit). Never change this to `setShared(false)`.

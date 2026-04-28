@@ -1,0 +1,123 @@
+---
+title: Middleware
+description: How AuthorizationMiddleware enforces #[RequiresPermission] on controllers at priority 5 — route map, resource loading, and response shapes.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Authorization Middleware
+
+`AuthorizationMiddleware` enforces `#[RequiresPermission]` on controllers. It runs at priority 5 — after `AuthMiddleware` has validated the token and set the identity.
+
+## #[RequiresPermission]
+
+```php
+use Vortos\Authorization\Attribute\RequiresPermission;
+
+// Single permission — entire controller
+#[RequiresPermission('documents.read.any')]
+final class ListDocumentsController { ... }
+
+// Multiple permissions — all must pass
+#[RequiresPermission('documents.read.any')]
+#[RequiresPermission('reports.export.federation')]
+final class ExportReportController { ... }
+
+// With resource parameter — loads route param, passes to policy
+#[RequiresPermission('documents.update.own', resourceParam: 'id')]
+final class UpdateDocumentController { ... }
+
+// On a specific method (method-level overrides class-level)
+#[ApiController]
+#[Route('/documents')]
+final class DocumentController
+{
+    #[Route('/{id}', methods: ['PUT'])]
+    #[RequiresPermission('documents.update.own', resourceParam: 'id')]
+    public function update(string $id): Response { ... }
+
+    #[Route('/{id}', methods: ['DELETE'])]
+    #[RequiresPermission('documents.delete.own', resourceParam: 'id')]
+    public function delete(string $id): Response { ... }
+}
+
+// String or BackedEnum — both work
+enum Permission: string { case DocumentsRead = 'documents.read.any'; }
+#[RequiresPermission(Permission::DocumentsRead)]
+final class ListDocumentsController { ... }
+```
+
+## #[RequiresPermission] Options
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `$permission` | `string\|BackedEnum` | required | Permission string or enum |
+| `$resourceParam` | `?string` | `null` | Route parameter name to pass as `$resource` to the policy |
+| `$scope` | `string\|array\|null` | `null` | Scope name(s) for scoped permission checks |
+| `$scopeMode` | `ScopeMode` | `ScopeMode::All` | `All` = must have all scopes, `Any` = must have any scope |
+
+## Resource Loading via resourceParam
+
+When `resourceParam` is set, the middleware reads that route attribute and passes it as `$resource` to `PolicyEngine::can()`:
+
+```php
+// Route: GET /documents/{id}
+#[RequiresPermission('documents.update.own', resourceParam: 'id')]
+final class UpdateDocumentController { ... }
+
+// In the policy:
+public function can(UserIdentityInterface $identity, string $action, string $scope, mixed $resource): bool
+{
+    // $resource = '019d4784-7b26-...' (the route parameter value)
+    // Load the full document if needed for ownership check:
+    $doc = $this->documents->findById($resource);
+    return $doc?->getAuthorId() === $identity->id();
+}
+```
+
+The `$resource` passed to the policy is the raw route parameter string — not the loaded document. Load the document inside the policy if you need ownership comparison.
+
+## Responses
+
+### 401 Unauthorized — Not Authenticated
+
+```json
+{
+  "error": "Unauthorized",
+  "message": "Authentication required."
+}
+```
+
+Returned when `#[RequiresPermission]` is on the controller but no valid token is in the request. The middleware handles this even without `#[RequiresAuth]` — a permission check implies authentication.
+
+### 403 Forbidden — Authenticated but Not Allowed
+
+```json
+{
+  "error": "Forbidden",
+  "message": "You do not have permission to perform this action.",
+  "permission": "documents.update.own"
+}
+```
+
+Returned when the identity is authenticated but the policy denies the action.
+
+## Multiple Permissions — All Must Pass
+
+When multiple `#[RequiresPermission]` attributes are stacked, they are checked in order. The first failure returns 403 immediately — remaining permissions are not checked:
+
+```php
+#[RequiresPermission('athletes.read.any')]
+#[RequiresPermission('reports.export.federation')]
+final class ExportAthleteReportController { ... }
+```
+
+If the user passes `athletes.read.any` but fails `reports.export.federation`, the 403 response includes `"permission": "reports.export.federation"`.
+
+## Subrequests Are Skipped
+
+The middleware checks `$event->isMainRequest()` first. Subrequests (forward, render, ESI) are skipped entirely.
+
+## Compile-Time Behaviour
+
+`AuthorizationMiddleware` currently uses reflection to read `#[RequiresPermission]` attributes at runtime. This is on the roadmap to be moved to a compile-time map (like `RateLimitMiddleware`). The reflection call is cached by PHP's opcode cache in production — the performance impact is negligible for most applications.

@@ -1,0 +1,89 @@
+---
+title: Samplers
+description: AlwaysOnSampler, AlwaysOffSampler, RatioSampler — how sampling decisions work and how to configure them.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Samplers
+
+Samplers decide whether a given request should be traced. Sampling happens at the `SamplingTracer` decorator layer — before calling the inner tracer.
+
+## TracingSampler Enum
+
+```php
+enum TracingSampler
+{
+    case AlwaysOn;   // trace every request
+    case AlwaysOff;  // never trace
+    case Ratio;      // trace a fraction of requests
+}
+```
+
+## Configuration
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingSampler;
+
+// Trace everything — development, debugging
+$config->sampler(TracingSampler::AlwaysOn);
+
+// Disable tracing completely — CLI workers, batch jobs
+$config->sampler(TracingSampler::AlwaysOff);
+
+// Trace 10% of requests — production default
+$config->sampler(TracingSampler::Ratio, rate: 0.1);
+
+// Trace 1% — very high-volume services
+$config->sampler(TracingSampler::Ratio, rate: 0.01);
+
+// Trace 50% — staging or canary
+$config->sampler(TracingSampler::Ratio, rate: 0.5);
+```
+
+## AlwaysOnSampler
+
+Every call to `startSpan()` delegates to the inner tracer. Use in development and debugging.
+
+## AlwaysOffSampler
+
+Every call to `startSpan()` returns `NoOpSpan` immediately — the inner tracer is never called. True zero overhead — not even a random number generation. Use when tracing is completely unnecessary (CLI workers, batch commands).
+
+## RatioSampler
+
+Generates a random number on each `shouldSample()` call and compares to the configured ratio:
+
+```php
+public function shouldSample(): bool
+{
+    return (mt_rand() / mt_getrandmax()) <= $this->ratio;
+}
+```
+
+At `rate: 0.1`, approximately 10% of requests are traced. The decision is per-span — there is no head-based sampling that ties all spans in a request together. For head-based sampling (trace entire requests consistently), use OpenTelemetry's parent-based sampler.
+
+### Valid Ratio Range
+
+Ratio must be between `0.0` and `1.0` inclusive. `RatioSampler` throws `\InvalidArgumentException` at construction for out-of-range values — caught at container compile time.
+
+```php
+new RatioSampler(0.0);   // valid — 0% (same as AlwaysOff)
+new RatioSampler(1.0);   // valid — 100% (same as AlwaysOn)
+new RatioSampler(0.1);   // valid — 10%
+new RatioSampler(-0.1);  // throws InvalidArgumentException
+new RatioSampler(1.1);   // throws InvalidArgumentException
+```
+
+## Choosing a Rate
+
+| Traffic Volume | Recommended Rate | Reason |
+|---|---|---|
+| Dev/staging | `AlwaysOn` (1.0) | See everything while debugging |
+| Low volume (< 100 req/s) | 1.0 | Trace everything — low cost |
+| Medium (100–1000 req/s) | 0.1 (10%) | Good coverage, manageable cost |
+| High (> 1000 req/s) | 0.01–0.05 (1–5%) | Control storage costs |
+| CLI workers | `AlwaysOff` | Traces not useful without request context |
+
+<Callout type="info" title="Sampling Does Not Affect Header Propagation">
+`SamplingTracer` only gates `startSpan()`. It always delegates `injectHeaders()`, `extractContext()`, and `currentCorrelationId()` to the inner tracer — these must work regardless of sampling to maintain distributed trace propagation across service boundaries.
+</Callout>

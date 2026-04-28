@@ -1,0 +1,134 @@
+---
+title: Projections
+description: Update read models from domain events — #[AsProjectionHandler], idempotency with upsert, multi-event handlers.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Projections
+
+Projection handlers consume domain events from Kafka and update read models in MongoDB. They are the bridge between the event stream (write side) and the query-optimised read models (read side).
+
+```
+Write side:   Command → Handler → Aggregate → Domain Event → Outbox → Kafka
+Read side:    Kafka → Consumer → ProjectionHandler → ReadRepository → MongoDB
+```
+
+## Write a Projection Handler
+
+```php title="src/User/Infrastructure/Projection/UserProjectionHandler.php"
+use Vortos\Cqrs\Attribute\AsProjectionHandler;
+
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.read-model')]
+final class UserProjectionHandler
+{
+    public function __construct(
+        private UserReadRepository $readRepository,
+    ) {}
+
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        // upsert — never insert (idempotency requirement)
+        $this->readRepository->upsert((string) $event->aggregateId(), [
+            '_id'       => (string) $event->aggregateId(),
+            'email'     => $event->email,
+            'name'      => $event->name,
+            'status'    => 'active',
+            'createdAt' => $event->occurredAt()->format('c'),
+        ]);
+    }
+}
+```
+
+## #[AsProjectionHandler] Options
+
+```php
+#[AsProjectionHandler(
+    consumer: 'user.events',        // required — Kafka consumer name
+    handlerId: 'user.read-model',   // required — unique ID for idempotency tracking
+    priority: 0,                    // optional — higher runs first (default 0)
+)]
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `consumer` | Yes | Must match a registered `KafkaConsumerDefinition` name |
+| `handlerId` | Yes | Unique ID used for idempotency tracking and dead letter identification |
+| `priority` | No | Execution order when multiple handlers process the same event (default 0) |
+
+## Idempotency — Always Use upsert()
+
+Kafka delivers at-least-once. The same event may arrive twice — on replay, on consumer restart, or after a dead letter retry. Your handler must be idempotent:
+
+```php
+// CORRECT — upsert is safe to call twice with same data
+$this->readRepository->upsert($event->userId, ['_id' => $event->userId, ...]);
+
+// WRONG — throws on second delivery
+$this->readRepository->insert(['_id' => $event->userId, ...]);
+```
+
+`MongoReadRepository::upsert()` uses `replaceOne` with `upsert: true` — inserts if not exists, replaces if exists. Calling it twice with the same data produces the same result.
+
+## Multiple Events — One Handler
+
+Handle multiple event types in one projection handler using multiple attributes:
+
+```php
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.rm.created')]
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.rm.name-updated')]
+final class UserReadModelHandler
+{
+    public function __construct(private UserReadRepository $repo) {}
+
+    public function __invoke(UserRegisteredEvent|UserNameUpdatedEvent $event): void
+    {
+        if ($event instanceof UserRegisteredEvent) {
+            $this->repo->upsert((string) $event->aggregateId(), [
+                '_id'   => (string) $event->aggregateId(),
+                'email' => $event->email,
+                'name'  => $event->name,
+            ]);
+            return;
+        }
+
+        // Partial update for name change — load + modify + upsert
+        $doc = $this->repo->findById((string) $event->aggregateId()) ?? [];
+        $doc['name'] = $event->newName;
+        $this->repo->upsert((string) $event->aggregateId(), $doc);
+    }
+}
+```
+
+## Projection Handler vs Event Handler
+
+Both use the same infrastructure — `#[AsProjectionHandler]` is wired exactly like `#[AsEventHandler]` by `HandlerDiscoveryCompilerPass`. The distinction is conceptual:
+
+| | `#[AsEventHandler]` | `#[AsProjectionHandler]` |
+|---|---|---|
+| Purpose | General event reaction | Update read model |
+| Reads from | Kafka | Kafka |
+| Writes to | Anything | Read repository only |
+| Idempotency | Optional | Required (always upsert) |
+| Return | void | void |
+
+## Discovery
+
+`AsProjectionHandler` is registered in `CqrsExtension` autoconfiguration — handlers tagged `vortos.projection_handler` are discovered by `HandlerDiscoveryCompilerPass` in the messaging module and wired as event handlers on the specified consumer. No additional registration needed.
+
+## Priority
+
+When multiple projection handlers process the same event on the same consumer, use priority to control execution order:
+
+```php
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.primary-rm', priority: 10)]
+final class PrimaryUserProjectionHandler { ... }  // runs first
+
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.search-index', priority: 5)]
+final class SearchIndexProjectionHandler { ... }  // runs second
+
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.analytics', priority: 0)]
+final class AnalyticsProjectionHandler { ... }    // runs last
+```
+
+Higher priority = runs first.

@@ -1,0 +1,10 @@
+{
+  "title": "Tracing",
+  "pages": [
+    "index",
+    "samplers",
+    "modules",
+    "spans",
+    "opentelemetry"
+  ]
+}

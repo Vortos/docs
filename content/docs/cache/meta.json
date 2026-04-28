@@ -1,0 +1,12 @@
+{
+  "title": "Cache",
+  "pages": [
+    "index",
+    "adapters",
+    "tagged-cache",
+    "redis",
+    "warmers",
+    "commands",
+    "testing"
+  ]
+}

@@ -1,0 +1,103 @@
+---
+title: OpenTelemetry
+description: Plug in OpenTelemetryTracer to replace NoOpTracer and send spans to a collector — Jaeger, Tempo, Datadog, or any OTLP-compatible backend.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# OpenTelemetry
+
+By default, `TracingInterface` is backed by `NoOpTracer` — zero overhead, no dependencies. To enable distributed tracing, replace the inner tracer with `OpenTelemetryTracer`.
+
+## Current Status
+
+`OpenTelemetryTracer` is included in `vortos-tracing` (`src/Tracing/OpenTelemetry/`). It wraps the `open-telemetry/sdk` PHP package. The wiring to replace `NoOpTracer` is done in `config/services.php` — not automatic yet.
+
+## Install OpenTelemetry SDK
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp
+```
+
+## Wire OpenTelemetryTracer
+
+Replace `NoOpTracer` with `OpenTelemetryTracer` in `config/services.php`:
+
+```php title="config/services.php"
+use Vortos\Tracing\OpenTelemetry\OpenTelemetryTracer;
+use Vortos\Tracing\NoOpTracer;
+
+// Replace the inner tracer in the decorator chain
+$services->set(NoOpTracer::class, OpenTelemetryTracer::class)
+    ->arg('$tracer', service('otel.tracer'))   // inject OTel SDK tracer
+    ->public(false);
+```
+
+The decorator chain wires itself around whatever is registered as `NoOpTracer::class`. Replacing this registration swaps the inner tracer without touching `SamplingTracer` or `ModuleAwareTracer`.
+
+## Configure the OTel SDK
+
+```php title="config/services.php"
+use OpenTelemetry\SDK\Trace\TracerProvider;
+use OpenTelemetry\Contrib\Otlp\OtlpHttpSpanExporter;
+use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
+
+$services->set(OtlpHttpSpanExporter::class)
+    ->arg('$endpoint', $_ENV['OTEL_EXPORTER_OTLP_ENDPOINT'] ?? 'http://collector:4318/v1/traces');
+
+$services->set(BatchSpanProcessor::class)
+    ->arg('$exporter', service(OtlpHttpSpanExporter::class));
+
+$services->set(TracerProvider::class)
+    ->call('addSpanProcessor', [service(BatchSpanProcessor::class)]);
+
+$services->set('otel.tracer')
+    ->factory([service(TracerProvider::class), 'getTracer'])
+    ->arg('$name', 'vortos');
+```
+
+## Environment Variables
+
+```bash
+# OTLP endpoint (Jaeger, Tempo, Datadog Agent, etc.)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+
+# Service name shown in the tracing UI
+OTEL_SERVICE_NAME=myapp
+
+# Resource attributes
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.version=1.2.3
+```
+
+## Supported Backends
+
+Any OTLP-compatible backend works:
+
+| Backend | OTLP Endpoint |
+|---|---|
+| Jaeger | `http://jaeger:4318/v1/traces` |
+| Grafana Tempo | `http://tempo:4318/v1/traces` |
+| Datadog Agent | `http://datadog-agent:4318/v1/traces` |
+| AWS X-Ray (via collector) | `http://otel-collector:4318/v1/traces` |
+| Google Cloud Trace | Via OpenTelemetry Collector |
+
+## Docker Compose (Jaeger)
+
+```yaml title="docker-compose.yml"
+jaeger:
+  image: jaegertracing/all-in-one:latest
+  ports:
+    - "16686:16686"  # UI
+    - "4318:4318"    # OTLP HTTP
+  environment:
+    - COLLECTOR_OTLP_ENABLED=true
+```
+
+```bash
+# View traces
+open http://localhost:16686
+```
+
+<Callout type="info" title="NoOp is Always Safe">
+If `OTEL_EXPORTER_OTLP_ENDPOINT` is unreachable or OpenTelemetry is not configured, `NoOpTracer` ensures the application continues to work with zero tracing overhead. Never let a tracing failure affect application availability.
+</Callout>

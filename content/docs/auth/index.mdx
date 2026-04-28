@@ -1,0 +1,395 @@
+---
+title: Authentication
+description: JWT authentication, password hashing, token storage, account lockout, and concurrent session management.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Authentication
+
+Vortos provides a complete JWT-based authentication system. Tokens are validated on every request, identity is stored in a request-scoped cache, and every downstream component reads the same identity object with zero re-parsing.
+
+## Architecture
+
+```
+HTTP Request
+    │
+    ▼
+AuthMiddleware (priority 6)
+    ├── Extract Bearer token from Authorization header
+    ├── Validate JWT signature, expiry, and type
+    ├── Store UserIdentity in ArrayAdapter (request-scoped)
+    └── Enforce #[RequiresAuth] — return 401 if unauthenticated
+    │
+    ▼
+Controller / Handler
+    └── CurrentUserProvider::get() → UserIdentity (zero DB query)
+```
+
+## Configuration
+
+```php title="config/auth.php"
+use Vortos\Auth\DependencyInjection\VortosAuthConfig;
+use Vortos\Auth\Lockout\LockoutTrack;
+use Vortos\Auth\Storage\RedisTokenStorage;
+
+return static function (VortosAuthConfig $config): void {
+    $config
+        ->secret($_ENV['JWT_SECRET'])
+        ->accessTokenTtl(900)          // 15 minutes
+        ->refreshTokenTtl(604800)      // 7 days
+        ->issuer('my-app')
+        ->tokenStorage(RedisTokenStorage::class)
+        ->enableBuiltInControllers();
+
+    $config->lockout()
+        ->maxAttempts(5)
+        ->lockDurationSeconds(900)
+        ->trackBy(LockoutTrack::Email)
+        ->message('Account locked due to too many failed attempts. Try again in 15 minutes.');
+};
+```
+
+Generate a secure secret:
+
+```bash
+php -r "echo bin2hex(random_bytes(32));"
+```
+
+Add it to your `.env`:
+
+```bash
+JWT_SECRET=your_64_character_hex_secret_here
+```
+
+## User Entity Setup
+
+Mark your User entity with `#[AuthenticatableUser]` — the framework auto-discovers it and wires a `UserProviderInterface` with zero manual registration:
+
+```php title="src/User/Domain/User.php"
+use Vortos\Auth\Attribute\AuthenticatableUser;
+use Vortos\Domain\Aggregate\AggregateRoot;
+
+#[AuthenticatableUser(
+    emailField: 'email',
+    passwordField: 'passwordHash',
+    rolesField: 'roles',
+)]
+final class User extends AggregateRoot
+{
+    public function __construct(
+        private UserId $id,
+        private string $email,
+        private string $passwordHash,
+        private array $roles = ['ROLE_USER'],
+    ) {}
+
+    public function getId(): UserId { return $this->id; }
+}
+```
+
+<Callout type="info" title="Auto-Discovery">
+The `AuthDiscoveryPass` compiler pass scans all registered services for `#[AuthenticatableUser]` at compile time. At runtime, the `UserProviderInterface` is already wired — zero reflection.
+</Callout>
+
+## Built-In Controllers
+
+Enable built-in login, refresh, and logout controllers in `config/auth.php`:
+
+```php
+$config->enableBuiltInControllers();
+```
+
+This registers three endpoints automatically:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/auth/login` | `POST` | Authenticate and receive token pair |
+| `/auth/refresh` | `POST` | Exchange refresh token for new pair |
+| `/auth/logout` | `POST` | Revoke all refresh tokens for user |
+
+### Login
+
+```bash
+POST /auth/login
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "password": "secret"
+}
+```
+
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "expires_in": 900
+}
+```
+
+### Refresh
+
+```bash
+POST /auth/refresh
+Content-Type: application/json
+
+{
+  "refresh_token": "eyJ..."
+}
+```
+
+### Logout
+
+```bash
+POST /auth/logout
+Authorization: Bearer eyJ...
+```
+
+## Protecting Routes
+
+### Require Authentication
+
+```php
+use Vortos\Auth\Attribute\RequiresAuth;
+
+#[RequiresAuth]
+final class ProfileController
+{
+    // 401 returned for unauthenticated requests
+}
+```
+
+### Access Current User
+
+```php
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+final class ProfileController
+{
+    public function __construct(
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function show(): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+
+        // identity is always available — authenticated or anonymous
+        if (!$identity->isAuthenticated()) {
+            return new JsonResponse(['error' => 'Unauthorized'], 401);
+        }
+
+        return new JsonResponse([
+            'id'    => $identity->id(),
+            'roles' => $identity->roles(),
+            'plan'  => $identity->getAttribute('plan', 'free'),
+        ]);
+    }
+}
+```
+
+## UserIdentity
+
+The `UserIdentity` object is populated from the JWT payload. It is immutable and available throughout the entire request lifecycle.
+
+```php
+$identity->id();                           // string — JWT 'sub' claim
+$identity->roles();                        // string[] — JWT 'roles' claim
+$identity->isAuthenticated();              // bool — false for AnonymousIdentity
+$identity->hasRole('ROLE_ADMIN');          // bool — exact match
+$identity->getAttribute('plan');           // mixed — extra JWT claims
+$identity->getAttribute('plan', 'free');   // mixed — with default
+```
+
+### Embedding Custom Claims
+
+To embed custom claims (like `plan`, `org_id`, `tier`) in the JWT so they are available without a database query, override `JwtService` or include them when issuing tokens:
+
+```php
+// When issuing the token, include extra claims:
+$tokenPair = $jwtService->issue(
+    userId: $user->getId()->toString(),
+    roles: $user->getRoles(),
+    extraClaims: [
+        'plan'   => $user->getSubscription()->getPlan(),
+        'org_id' => $user->getOrganizationId(),
+    ],
+);
+```
+
+These claims are then accessible via `$identity->getAttribute('plan')` in any policy, middleware, or controller — with zero database queries.
+
+## Password Hashing
+
+```php
+use Vortos\Auth\Contract\PasswordHasherInterface;
+
+final class RegisterUserHandler
+{
+    public function __construct(
+        private PasswordHasherInterface $hasher,
+    ) {}
+
+    public function __invoke(RegisterUser $command): void
+    {
+        $hash = $this->hasher->hash($command->password);
+        // Uses Argon2id — the current recommended algorithm
+    }
+}
+```
+
+<Callout type="warn" title="Never Store Plain Passwords">
+Always hash passwords before storing. The `ArgonPasswordHasher` uses PHP's `password_hash()` with `PASSWORD_ARGON2ID` and secure default parameters.
+</Callout>
+
+## Token Storage
+
+Two implementations are available:
+
+| Implementation | Use Case |
+|---|---|
+| `RedisTokenStorage` | Production — refresh tokens stored in Redis with TTL |
+| `InMemoryTokenStorage` | Testing — no external dependencies |
+
+Switch in `config/auth.php`:
+
+```php
+use Vortos\Auth\Storage\InMemoryTokenStorage;
+
+// For tests:
+$config->tokenStorage(InMemoryTokenStorage::class);
+```
+
+## Account Lockout
+
+Account lockout is applied automatically at login. Zero route attributes needed.
+
+```php title="config/auth.php"
+$config->lockout()
+    ->maxAttempts(5)               // Lock after 5 failed attempts
+    ->lockDurationSeconds(900)     // Lock for 15 minutes
+    ->trackBy(LockoutTrack::Email) // Track by email, IP, or both
+    ->message('Account locked. Try again in 15 minutes.');
+```
+
+### Tracking Modes
+
+| Mode | Behavior |
+|---|---|
+| `LockoutTrack::Email` | Track failed attempts per email address |
+| `LockoutTrack::Ip` | Track failed attempts per IP address |
+| `LockoutTrack::Both` | Track both — locked if either threshold reached |
+
+### What Happens on Lockout
+
+```
+Failed login → increment Redis counter
+5th failure  → set locked:email:{email} TTL 900s in Redis
+Next attempt → 423 Locked + Retry-After header
+Successful login after lock expires → counter cleared automatically
+```
+
+```json
+HTTP 423 Locked
+Retry-After: 843
+
+{
+  "error": "Locked",
+  "message": "Account locked due to too many failed attempts. Try again in 15 minutes.",
+  "retry_after": 843
+}
+```
+
+<Callout type="warn" title="Redis Restart and Lockouts">
+Lockout counters are stored in Redis. A Redis restart will clear active lockouts. For security-critical applications, implement a `LockoutStoreInterface` backed by your database as the primary store.
+</Callout>
+
+### Integrate LockoutManager in Custom Login
+
+If you write your own login controller instead of using built-ins:
+
+```php
+use Vortos\Auth\Lockout\LockoutManager;
+
+final class LoginController
+{
+    public function __construct(
+        private LockoutManager $lockout,
+        private JwtService $jwt,
+        private UserProviderInterface $users,
+        private PasswordHasherInterface $hasher,
+    ) {}
+
+    public function login(Request $request): JsonResponse
+    {
+        $email = $request->toArray()['email'] ?? '';
+        $ip = $request->getClientIp() ?? '';
+
+        // Check lockout first
+        if ($this->lockout->isLocked($email, $ip)) {
+            return new JsonResponse([
+                'error'       => 'Locked',
+                'message'     => $this->lockout->getMessage(),
+                'retry_after' => $this->lockout->getRemainingSeconds($email, $ip),
+            ], 423, ['Retry-After' => $this->lockout->getRemainingSeconds($email, $ip)]);
+        }
+
+        $user = $this->users->findByEmail($email);
+
+        if (!$user || !$this->hasher->verify($request->toArray()['password'] ?? '', $user->getPasswordHash())) {
+            $this->lockout->recordFailedAttempt($email, $ip);
+            return new JsonResponse(['error' => 'Invalid credentials'], 401);
+        }
+
+        // Success — clear lockout counter
+        $this->lockout->clearLockout($email, $ip);
+
+        $tokens = $this->jwt->issue($user->getId()->toString(), $user->getRoles());
+
+        return new JsonResponse($tokens->toArray());
+    }
+}
+```
+
+## Concurrent Session Limits
+
+Control how many active sessions a user can have simultaneously.
+
+```php title="src/Auth/SubscriptionSessionPolicy.php"
+use Vortos\Auth\Session\Contract\SessionPolicyInterface;
+use Vortos\Auth\Session\SessionLimitAction;
+
+// Auto-discovered — just implement the interface
+final class SubscriptionSessionPolicy implements SessionPolicyInterface
+{
+    public function getMaxSessions(\Vortos\Auth\Contract\UserIdentityInterface $identity): int
+    {
+        return match($identity->getAttribute('plan') ?? 'free') {
+            'enterprise' => PHP_INT_MAX,  // Unlimited
+            'pro'        => 5,
+            default      => 1,            // Free tier: one device only
+        };
+    }
+
+    public function onLimitExceeded(\Vortos\Auth\Contract\UserIdentityInterface $identity): SessionLimitAction
+    {
+        // Kick the oldest session and allow new login
+        return SessionLimitAction::InvalidateOldest;
+
+        // Or: reject the new login attempt
+        // return SessionLimitAction::RejectNew;
+    }
+}
+```
+
+Sessions are tracked in Redis using a sorted set per user. When a new login occurs, the framework checks the session count against the policy and takes action automatically.
+
+## Security Notes
+
+- Access tokens are short-lived (15 minutes recommended) and cannot be revoked individually — they expire naturally.
+- Refresh tokens are stored in Redis with TTL. They can be revoked individually or all-at-once on logout.
+- The `Authorization: Bearer` header is the only supported token transport — cookies are not used.
+- All JWT validation errors (expired, tampered, wrong type) return `401 Unauthorized` with no detail leakage.

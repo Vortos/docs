@@ -1,0 +1,11 @@
+{
+  "title": "CQRS",
+  "pages": [
+    "index",
+    "commands",
+    "queries",
+    "idempotency",
+    "projections",
+    "testing"
+  ]
+}

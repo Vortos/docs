@@ -1,0 +1,135 @@
+---
+title: Adapters
+description: ArrayAdapter for request memoization, InMemoryAdapter for tests, RedisAdapter for production — each with distinct scope and TTL behaviour.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Adapters
+
+## ArrayAdapter — Request-Scoped Memoization
+
+`ArrayAdapter` stores values in a plain PHP array. All values live until `clear()` is called — TTL is accepted for PSR-16 compliance but completely ignored.
+
+**Scope:** Single request. `Runner::cleanUp()` calls `clear()` after every request automatically.
+
+**Use for:** Caching things you only need once per request — user identity, permission results, tenant config.
+
+```php
+use Vortos\Cache\Adapter\ArrayAdapter;
+
+// Inject by class — always gets ArrayAdapter regardless of configured driver
+final class AuthMiddleware
+{
+    public function __construct(private ArrayAdapter $arrayAdapter) {}
+
+    public function setIdentity(UserIdentityInterface $identity): void
+    {
+        // Identity is cached for the rest of this request
+        $this->arrayAdapter->set('auth:identity', $identity);
+        // TTL ignored — lives until request ends
+    }
+}
+```
+
+### TTL is Ignored
+
+```php
+$arrayAdapter->set('key', 'value', 60); // TTL ignored
+$arrayAdapter->set('key', 'value', 0);  // TTL ignored
+$arrayAdapter->set('key', 'value');     // same result as above
+```
+
+All three store the value with no expiry. The only way data leaves `ArrayAdapter` is `delete()`, `deleteMultiple()`, `clear()`, or process restart.
+
+### FrankenPHP Worker Mode
+
+In FrankenPHP worker mode, PHP processes stay alive across many requests. Without clearing, data from request N leaks into request N+1. The framework handles this automatically — `Runner::cleanUp()` calls `$arrayAdapter->clear()` after each request. If you run a custom worker loop, call `clear()` yourself at the end of each request.
+
+<Callout type="warn" title="Never Use ArrayAdapter for Shared Data">
+`ArrayAdapter` is per-process. In a multi-worker setup, each worker has its own instance. Never use it for data that must be shared across workers or survive request boundaries. Use `RedisAdapter` for that.
+</Callout>
+
+## InMemoryAdapter — Test Cache
+
+`InMemoryAdapter` stores values in a PHP array with **lazy TTL expiry**. TTL is respected on read — expired keys return `$default` from `get()` and `false` from `has()`.
+
+**Scope:** Per-process. Persists within a PHP process until `clear()` is called or the process exits.
+
+**Use for:** Unit and integration tests — no Redis connection needed.
+
+```php
+use Vortos\Cache\Adapter\InMemoryAdapter;
+
+// Inject by class — always gets InMemoryAdapter
+final class SomeService
+{
+    public function __construct(private InMemoryAdapter $cache) {}
+}
+
+// Or configure as the active driver in test environment:
+// config/test/cache.php
+$config->driver(InMemoryAdapter::class);
+// Now CacheInterface and TaggedCacheInterface both point to InMemoryAdapter
+```
+
+### Lazy TTL Expiry
+
+```php
+$cache = new InMemoryAdapter();
+$cache->set('key', 'value', 1); // expires in 1 second
+
+sleep(2);
+
+$cache->has('key');  // false — key removed from store on access
+$cache->get('key');  // null — key removed from store on access
+```
+
+Keys are not actively removed when they expire. They are checked on the next `get()` or `has()` call and removed at that point. This matches real cache behaviour from the caller's perspective.
+
+## RedisAdapter — Production
+
+`RedisAdapter` uses PHP's `ext-redis` extension — a C extension that is 3-5x faster than pure-PHP alternatives. Values are serialized with PHP's native `serialize()`/`unserialize()`.
+
+**Scope:** Persistent across requests and workers.
+
+**Use for:** Everything in production.
+
+```php
+use Vortos\Cache\Contract\TaggedCacheInterface;
+
+// Inject via interface — gets RedisAdapter in production
+final class ProductRepository
+{
+    public function __construct(private TaggedCacheInterface $cache) {}
+}
+```
+
+See the [Redis](/docs/cache/redis) page for full configuration details.
+
+## Comparison
+
+| Feature | ArrayAdapter | InMemoryAdapter | RedisAdapter |
+|---|---|---|---|
+| TTL | Ignored | Lazy expiry | Respected |
+| Tags | Supported | Supported | Supported |
+| Persistence | Request only | Process only | Persistent |
+| Shared across workers | No | No | Yes |
+| External dependency | None | None | Redis |
+| Use in production | For auth:identity only | No | Yes |
+| Use in tests | Yes (via injection) | Yes (driver swap) | Integration tests only |
+
+## Always Registered
+
+All three adapters are always registered in the container regardless of which driver is configured. You can inject any of them by class name at any time:
+
+```php
+// These always work regardless of the configured driver:
+public function __construct(private ArrayAdapter $arr) {}
+public function __construct(private InMemoryAdapter $mem) {}
+public function __construct(private RedisAdapter $redis) {}
+
+// These get the configured driver:
+public function __construct(private TaggedCacheInterface $cache) {}
+public function __construct(private CacheInterface $cache) {}
+```

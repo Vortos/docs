@@ -1,0 +1,14 @@
+{
+  "title": "Persistence",
+  "pages": [
+    "index",
+    "write-repositories",
+    "read-repositories",
+    "unit-of-work",
+    "dbal",
+    "mongodb",
+    "optimistic-locking",
+    "pagination",
+    "testing"
+  ]
+}

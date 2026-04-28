@@ -1,0 +1,188 @@
+---
+title: Feature Access
+description: Tier-based feature gating — block access to features based on subscription plan, with 402 support for expired subscriptions.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Feature Access
+
+Feature access gating lets you block controllers or methods based on whether the current user's plan includes a feature. It is separate from authorization — authorization answers "can this role do this action?", feature access answers "does this plan include this feature?".
+
+<Callout type="info" title="Compile-Time Map">
+All `#[RequiresFeatureAccess]` attributes are scanned at compile time. Runtime middleware does a single array lookup — zero reflection.
+</Callout>
+
+## Implement a Policy
+
+```php title="src/Billing/Infrastructure/SubscriptionFeaturePolicy.php"
+use Vortos\Auth\FeatureAccess\Contract\FeatureAccessPolicyInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+// Auto-discovered — no registration needed
+final class SubscriptionFeaturePolicy implements FeatureAccessPolicyInterface
+{
+    // Define which plans include which features
+    private const PLAN_FEATURES = [
+        'free' => [
+            'api.basic',
+            'api.export.csv',
+        ],
+        'pro' => [
+            'api.basic',
+            'api.export.csv',
+            'api.bulk_export',
+            'api.webhooks',
+            'api.advanced_search',
+            'api.custom_fields',
+        ],
+        'enterprise' => [
+            'api.basic',
+            'api.export.csv',
+            'api.bulk_export',
+            'api.webhooks',
+            'api.advanced_search',
+            'api.custom_fields',
+            'api.advanced_analytics',
+            'api.sso',
+            'api.audit_log_export',
+            'api.custom_roles',
+        ],
+    ];
+
+    public function canAccess(UserIdentityInterface $identity, string $feature): bool
+    {
+        $plan = $identity->getAttribute('plan', 'free');
+        $allowed = self::PLAN_FEATURES[$plan] ?? self::PLAN_FEATURES['free'];
+
+        return in_array($feature, $allowed, true);
+    }
+}
+```
+
+## Handling Expired Subscriptions
+
+When a subscription expires, you can check the subscription status directly in the policy:
+
+```php
+final class SubscriptionFeaturePolicy implements FeatureAccessPolicyInterface
+{
+    public function __construct(
+        private SubscriptionRepository $subscriptions,
+    ) {}
+
+    public function canAccess(UserIdentityInterface $identity, string $feature): bool
+    {
+        $subscription = $this->subscriptions->findByUserId($identity->id());
+
+        // Expired or no subscription — fall back to free tier
+        if (!$subscription || $subscription->isExpired()) {
+            return in_array($feature, ['api.basic', 'api.export.csv'], true);
+        }
+
+        $plan = $subscription->getPlan();
+        $allowed = self::PLAN_FEATURES[$plan] ?? self::PLAN_FEATURES['free'];
+
+        return in_array($feature, $allowed, true);
+    }
+}
+```
+
+## Apply to a Controller
+
+```php
+use Vortos\Auth\FeatureAccess\Attribute\RequiresFeatureAccess;
+
+// String — simple and direct
+#[RequiresFeatureAccess('api.bulk_export')]
+final class BulkExportController { ... }
+
+// Enum — type-safe, IDE autocomplete, refactor-safe
+enum Feature: string {
+    case BulkExport       = 'api.bulk_export';
+    case Webhooks         = 'api.webhooks';
+    case AdvancedAnalytics = 'api.advanced_analytics';
+}
+
+#[RequiresFeatureAccess(Feature::BulkExport)]
+final class BulkExportController { ... }
+
+// Stack multiple features — all must be accessible
+#[RequiresFeatureAccess(Feature::AdvancedAnalytics)]
+#[RequiresFeatureAccess(Feature::CustomRoles)]
+final class EnterpriseReportController { ... }
+```
+
+## Payment Required (402)
+
+Use `paymentRequired: true` when the feature is unavailable specifically because the user needs to pay — not just because they lack permission. This returns `402 Payment Required` instead of `403 Forbidden`, which frontend apps can use to show an upgrade prompt.
+
+```php
+// Returns 403 — general feature not in plan
+#[RequiresFeatureAccess('api.bulk_export')]
+final class BulkExportController { ... }
+
+// Returns 402 — feature needs payment/upgrade
+#[RequiresFeatureAccess('api.bulk_export', paymentRequired: true)]
+final class BulkExportController { ... }
+```
+
+### Response Comparison
+
+```json
+// 403 — plan does not include this feature
+{
+  "error": "Forbidden",
+  "message": "Your plan does not include access to this feature.",
+  "feature": "api.bulk_export"
+}
+
+// 402 — subscription required or expired
+{
+  "error": "Payment Required",
+  "message": "This feature requires an active subscription.",
+  "feature": "api.bulk_export"
+}
+```
+
+## Method-Level Gating
+
+Apply feature access to specific methods, not the whole controller:
+
+```php
+#[ApiController]
+#[Route('/exports')]
+final class ExportController
+{
+    // Free tier can access this
+    #[Route('/csv', methods: ['GET'])]
+    public function exportCsv(): Response { ... }
+
+    // Pro and above only
+    #[Route('/bulk', methods: ['POST'])]
+    #[RequiresFeatureAccess(Feature::BulkExport)]
+    public function bulkExport(): Response { ... }
+
+    // Enterprise only — needs upgrade if not enterprise
+    #[Route('/analytics', methods: ['GET'])]
+    #[RequiresFeatureAccess(Feature::AdvancedAnalytics, paymentRequired: true)]
+    public function analyticsExport(): Response { ... }
+}
+```
+
+## Middleware Priority
+
+`FeatureAccessMiddleware` runs at priority 4 — after authentication (6) and authorization (5). This ordering ensures:
+
+1. User is authenticated before feature check
+2. User has the required permission before feature check
+3. Feature check happens last — after all security gates pass
+
+```
+priority 7: RateLimitMiddleware
+priority 6: AuthMiddleware
+priority 5: AuthorizationMiddleware
+priority 4: FeatureAccessMiddleware  ← here
+priority 3: QuotaMiddleware
+priority 2: AuditMiddleware
+```

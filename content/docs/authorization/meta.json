@@ -1,0 +1,14 @@
+{
+  "title": "Authorization",
+  "pages": [
+    "index",
+    "policies",
+    "role-voter",
+    "middleware",
+    "policy-engine",
+    "scoped",
+    "temporal",
+    "ownership",
+    "testing"
+  ]
+}

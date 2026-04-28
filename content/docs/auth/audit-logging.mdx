@@ -1,0 +1,209 @@
+---
+title: Audit Logging
+description: Immutable, append-only audit trail for sensitive actions — who did what, when, from where, automatically captured with zero boilerplate.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Audit Logging
+
+The audit log is an immutable record of sensitive actions in your application. It answers security and compliance questions: who accessed this resource, when was this record deleted, which admin made this change.
+
+<Callout type="info" title="Fire and Forget">
+Audit log recording is fire-and-forget. If the store throws an exception, the request continues normally. A broken audit store never blocks your users.
+</Callout>
+
+## Audit Log vs Activity Log
+
+These are two different things:
+
+| | Audit Log | Activity Log |
+|---|---|---|
+| **Purpose** | Security, compliance, forensics | Product feature, user-facing history |
+| **Audience** | Engineers, compliance teams, security | End users |
+| **Storage** | Framework-managed, append-only | Your domain — event projections |
+| **Examples** | Who deleted this record, which IP logged in | "You submitted form at 3:02pm", "Alice commented" |
+| **Implementation** | `#[AuditLog]` attribute | Domain events → projections |
+
+If you want to show users their activity history in your UI, build that as a domain projection from your events — not from the audit log.
+
+## Implement a Store
+
+```php title="src/Infrastructure/Audit/PostgresAuditStore.php"
+use Doctrine\DBAL\Connection;
+use Vortos\Auth\Audit\AuditEntry;
+use Vortos\Auth\Audit\Contract\AuditStoreInterface;
+
+// Auto-discovered — no registration needed
+final class PostgresAuditStore implements AuditStoreInterface
+{
+    public function __construct(private Connection $connection) {}
+
+    public function record(AuditEntry $entry): void
+    {
+        $this->connection->insert('audit_log', $entry->toArray());
+    }
+}
+```
+
+### Database Table
+
+```sql
+CREATE TABLE audit_log (
+    id          VARCHAR(32) PRIMARY KEY,
+    user_id     VARCHAR(255) NOT NULL,
+    action      VARCHAR(255) NOT NULL,
+    resource    VARCHAR(255),
+    ip          VARCHAR(45),
+    user_agent  TEXT,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMP NOT NULL,
+
+    -- Indexes for common queries
+    INDEX idx_audit_user_id (user_id),
+    INDEX idx_audit_action  (action),
+    INDEX idx_audit_created (created_at)
+);
+```
+
+## Apply to a Controller
+
+```php
+use Vortos\Auth\Audit\Attribute\AuditLog;
+
+// String action
+#[AuditLog('document.viewed')]
+final class ViewDocumentController { ... }
+
+// Enum action — type-safe
+enum AuditAction: string {
+    case DocumentViewed  = 'document.viewed';
+    case DocumentDeleted = 'document.deleted';
+    case UserLoggedIn    = 'user.logged_in';
+    case PaymentCharged  = 'payment.charged';
+    case ApiKeyCreated   = 'api_key.created';
+    case ExportDownloaded = 'export.downloaded';
+}
+
+#[AuditLog(AuditAction::DocumentViewed)]
+final class ViewDocumentController { ... }
+
+// Capture route parameters as metadata
+#[AuditLog(AuditAction::DocumentDeleted, include: ['id'])]
+final class DeleteDocumentController { ... }
+
+// Capture multiple params
+#[AuditLog(AuditAction::ExportDownloaded, include: ['format', 'filter_type', 'record_count'])]
+final class ExportController { ... }
+```
+
+## What Gets Captured Automatically
+
+Every audit entry includes:
+
+| Field | Source | Example |
+|---|---|---|
+| `id` | `bin2hex(random_bytes(16))` | `a1b2c3d4...` |
+| `userId` | Current identity | `user-123` |
+| `action` | Attribute value | `document.deleted` |
+| `resourceId` | `id` route param (if present) | `doc-456` |
+| `ipAddress` | `$request->getClientIp()` | `192.168.1.1` |
+| `userAgent` | `User-Agent` header | `Mozilla/5.0...` |
+| `occurredAt` | Current timestamp | `2026-04-27T14:32:00Z` |
+| `metadata` | Route params listed in `include:` | `{"format": "csv"}` |
+
+## AuditEntry Object
+
+```php
+use Vortos\Auth\Audit\AuditEntry;
+
+// Create manually (e.g., in a handler for complex scenarios)
+$entry = AuditEntry::create(
+    userId: $identity->id(),
+    action: 'payment.refunded',
+    resourceId: $payment->getId(),
+    ipAddress: $request->getClientIp(),
+    userAgent: $request->headers->get('User-Agent'),
+    metadata: [
+        'amount'   => $payment->getAmount(),
+        'currency' => $payment->getCurrency(),
+        'reason'   => $command->reason,
+    ],
+);
+
+$auditStore->record($entry);
+```
+
+## Manual Audit in Handlers
+
+For complex operations where the audit context is richer than what the middleware can capture automatically, audit from your handler directly:
+
+```php
+use Vortos\Auth\Audit\AuditEntry;
+use Vortos\Auth\Audit\Contract\AuditStoreInterface;
+use Vortos\Auth\Identity\CurrentUserProvider;
+
+final class ProcessRefundHandler
+{
+    public function __construct(
+        private AuditStoreInterface $audit,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function __invoke(ProcessRefund $command): void
+    {
+        // ... business logic
+
+        try {
+            $this->audit->record(AuditEntry::create(
+                userId: $this->currentUser->get()->id(),
+                action: 'payment.refunded',
+                resourceId: $command->paymentId,
+                metadata: [
+                    'amount'       => $command->amount,
+                    'reason'       => $command->reason,
+                    'approved_by'  => $command->approvedBy,
+                ],
+            ));
+        } catch (\Throwable) {
+            // Audit failure must never block the operation
+        }
+    }
+}
+```
+
+## Querying the Audit Log
+
+Common queries for security investigations:
+
+```sql
+-- All actions by a specific user
+SELECT * FROM audit_log
+WHERE user_id = 'user-123'
+ORDER BY created_at DESC
+LIMIT 100;
+
+-- All deletions in the last 24 hours
+SELECT * FROM audit_log
+WHERE action = 'document.deleted'
+  AND created_at > NOW() - INTERVAL '24 hours'
+ORDER BY created_at DESC;
+
+-- Logins from a specific IP
+SELECT * FROM audit_log
+WHERE action = 'user.logged_in'
+  AND ip = '192.168.1.100'
+ORDER BY created_at DESC;
+
+-- All actions on a specific resource
+SELECT * FROM audit_log
+WHERE resource = 'doc-456'
+ORDER BY created_at DESC;
+```
+
+## Compliance Considerations
+
+- **Never delete audit records** — they are append-only by design. Even for GDPR erasure requests, pseudonymize the `user_id` rather than deleting rows.
+- **Protect write access** — the database user for your application should have `INSERT` only on `audit_log`, not `UPDATE` or `DELETE`.
+- **Retention policy** — many compliance frameworks (SOC2, HIPAA) require audit logs to be retained for 1-7 years. Plan your storage accordingly.
+- **Indexing** — for high-volume applications, partition the `audit_log` table by month to keep queries fast.

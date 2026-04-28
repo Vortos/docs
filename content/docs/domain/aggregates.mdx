@@ -1,0 +1,177 @@
+---
+title: Aggregates
+description: AggregateRoot — version-based optimistic locking, domain event recording, pullDomainEvents, and the reconstruct pattern.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Aggregates
+
+`AggregateRoot` is the base class for all domain aggregates. It provides version tracking for optimistic locking and domain event collection.
+
+## Define an Aggregate
+
+```php title="src/User/Domain/User.php"
+use Vortos\Domain\Aggregate\AggregateRoot;
+use Vortos\Domain\Identity\AggregateId;
+
+final class User extends AggregateRoot
+{
+    private function __construct(
+        private UserId $id,
+        private Email $email,
+        private string $name,
+        private string $passwordHash,
+        private string $status,
+    ) {}
+
+    // Named constructor for new aggregates
+    public static function register(Email $email, string $name, string $passwordHash): self
+    {
+        $user = new self(
+            id: UserId::generate(),
+            email: $email,
+            name: $name,
+            passwordHash: $passwordHash,
+            status: 'active',
+        );
+
+        // Record event — dispatched by CommandBus after commit
+        $user->recordEvent(new UserRegisteredEvent(
+            aggregateId: (string) $user->id,
+            email: (string) $email,
+            name: $name,
+        ));
+
+        return $user;
+    }
+
+    // Named constructor for loading from DB (restores version)
+    public static function reconstruct(
+        UserId $id,
+        Email $email,
+        string $name,
+        string $passwordHash,
+        string $status,
+        int $version,
+    ): self {
+        $user = new self($id, $email, $name, $passwordHash, $status);
+        for ($i = 0; $i < $version; $i++) {
+            $user->incrementVersion();
+        }
+        return $user;
+    }
+
+    public function getId(): UserId { return $this->id; }
+    public function getEmail(): Email { return $this->email; }
+    public function getName(): string { return $this->name; }
+    public function getPasswordHash(): string { return $this->passwordHash; }
+
+    // Command method — mutates state and records event
+    public function updateName(string $name): void
+    {
+        $old = $this->name;
+        $this->name = $name;
+        $this->recordEvent(new UserNameUpdatedEvent((string) $this->id, $old, $name));
+    }
+
+    public function deactivate(): void
+    {
+        if ($this->status === 'inactive') {
+            return; // idempotent
+        }
+
+        $this->status = 'inactive';
+        $this->recordEvent(new UserDeactivatedEvent((string) $this->id));
+    }
+}
+```
+
+## AggregateRoot API
+
+```php
+// Abstract — must implement
+abstract public function getId(): AggregateId;
+
+// Record an event (called inside command methods)
+protected function recordEvent(DomainEventInterface $event): void;
+
+// Pull all recorded events and clear the buffer
+public function pullDomainEvents(): array;
+
+// Check if any events are pending
+public function hasDomainEvents(): bool;
+
+// Optimistic locking
+public function getVersion(): int;
+public function incrementVersion(): void; // @internal — called by repository
+```
+
+## Domain Event Recording
+
+Aggregates never dispatch events — they record them. The `CommandBus` calls `pullDomainEvents()` inside the transaction and writes them to the outbox:
+
+```
+Command → CommandBus
+    UnitOfWork::run()
+        handler() → aggregate.recordEvent(...)
+        repository.save(aggregate)
+        foreach aggregate.pullDomainEvents() as event
+            outbox.store(event)   ← same transaction
+    commit()
+```
+
+Record events at the end of command methods, after state has been mutated:
+
+```php
+public function updateEmail(Email $newEmail): void
+{
+    $old = $this->email;
+    $this->email = $newEmail;           // mutate first
+    $this->recordEvent(new UserEmailUpdatedEvent(...)); // record after
+}
+```
+
+## Version and Optimistic Locking
+
+Every aggregate starts at `version = 0`. The repository increments it on every successful save:
+
+```
+new User()        version = 0
+save()            version = 1   (INSERT)
+save()            version = 2   (UPDATE WHERE version = 1)
+save()            version = 3   (UPDATE WHERE version = 2)
+```
+
+If two processes load version 2 and both try to save, the second save fails because the database version is already 3. See [Optimistic Locking](/docs/persistence/optimistic-locking) for handling strategies.
+
+**Never call `incrementVersion()` directly.** It is called by the repository after a successful save.
+
+## The reconstruct() Pattern
+
+`fromRow()` in your repository needs to restore the aggregate's version from the database. Add a `reconstruct()` static factory:
+
+```php
+// In DbalWriteRepository::fromRow():
+protected function fromRow(array $row): AggregateRoot
+{
+    return User::reconstruct(
+        id: UserId::fromString($row['id']),
+        email: new Email($row['email']),
+        name: $row['name'],
+        passwordHash: $row['password_hash'],
+        status: $row['status'],
+        version: (int) $row['version'],
+    );
+}
+```
+
+The version is restored so optimistic locking works correctly on the next `save()`.
+
+## EventSourcedAggregateRoot
+
+`EventSourcedAggregateRoot` is stubbed but **not yet implemented**. Extending it throws `\LogicException`. Use `AggregateRoot` for all production code.
+
+<Callout type="info" title="Private Constructor">
+Use a private constructor and named static factories (`register()`, `reconstruct()`). This prevents invalid aggregates from being created — the factory enforces all invariants. Never expose a public constructor.
+</Callout>

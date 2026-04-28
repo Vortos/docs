@@ -1,0 +1,96 @@
+---
+title: HTTP
+description: Symfony HttpKernel-based HTTP layer — attribute-driven routing, controller discovery, event subscribers, and error handling.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# HTTP
+
+`vortos-http` provides the HTTP layer built on Symfony's `HttpKernel`. Controllers are discovered via `#[ApiController]` and `#[Route]` attributes at compile time. Event subscribers are wired automatically. No YAML, no XML.
+
+## Architecture
+
+```
+HTTP Request
+    │
+    ▼
+public/index.php
+    │
+    ▼
+Runner::run(Request)
+    │
+    ▼
+Kernel ('vortos') — Symfony HttpKernel
+    │
+    ├── EventDispatcher fires kernel.request
+    │       ├── RouterListener (priority 8) — route matching
+    │       ├── RateLimitMiddleware (priority 7)
+    │       ├── AuthMiddleware (priority 6)
+    │       ├── TwoFactorMiddleware (priority 5.5)
+    │       ├── AuthorizationMiddleware (priority 5)
+    │       ├── OwnershipMiddleware (priority 4.5)
+    │       ├── FeatureAccessMiddleware (priority 4)
+    │       ├── QuotaMiddleware (priority 3)
+    │       └── AuditMiddleware (priority 2)
+    │
+    ├── Controller resolved and called
+    │
+    └── EventDispatcher fires kernel.response
+            └── ResponseListener — Content-Type, charset
+```
+
+## Installation
+
+```bash
+composer require vortos/vortos-http
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Http\DependencyInjection\HttpPackage;
+
+$packages = [
+    new HttpPackage(),   // MUST be first
+    new CachePackage(),
+    new AuthPackage(),
+    // ...
+];
+```
+
+<Callout type="warn" title="HttpPackage Must Be First">
+`HttpPackage` must be registered first. It registers the `EventDispatcher` and kernel that all other packages add subscribers to. Loading it after other packages causes undefined service references at compile time.
+</Callout>
+
+## Container Parameters
+
+`HttpPackage` reads these container parameters (set before `build()`):
+
+| Parameter | Required | Description |
+|---|---|---|
+| `kernel.project_dir` | Yes | Application root path |
+| `kernel.env` | Yes | Environment name (`prod`, `dev`, `test`) |
+| `kernel.enable_routes` | Yes | `true` to enable route discovery |
+| `kernel.debug` | No | `true` for debug error pages (default: `false`) |
+| `charset` | No | Response charset (default: `UTF-8`) |
+
+## Compiler Passes
+
+Three compiler passes run at container build time:
+
+| Pass | Priority | Purpose |
+|---|---|---|
+| `HttpListenerCompilerPass` | 100 | Enables RouterListener when routes are on |
+| `RegisterEventSubscribersPass` | 90 | Wires all `kernel.event_subscriber` tagged services to EventDispatcher |
+| `RouteCompilerPass` | 80 | Scans `#[ApiController]` classes for `#[Route]` attributes, builds RouteCollection |
+
+## Module Overview
+
+<Cards>
+  <Card title="Controllers" href="/docs/http/controllers" description="#[ApiController], #[Route], service injection, response types." />
+  <Card title="Routing" href="/docs/http/routing" description="Attribute-based routing — how RouteCompilerPass discovers and builds routes at compile time." />
+  <Card title="Error Handling" href="/docs/http/error-handling" description="ErrorController, PublicExceptionInterface, JSON vs HTML responses, debug mode." />
+  <Card title="Event Subscribers" href="/docs/http/event-subscribers" description="How EventSubscriberInterface implementations are auto-wired to the dispatcher." />
+</Cards>

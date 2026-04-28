@@ -1,0 +1,157 @@
+---
+title: Value Objects
+description: ValueObject — equality by value, immutability, validation in factory methods, and toString for logging.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Value Objects
+
+Value objects have no identity — two `Email('alice@example.com')` instances are equal because their values are equal, not because they are the same object. They are always immutable.
+
+## ValueObject Base Class
+
+```php
+abstract readonly class ValueObject
+{
+    abstract public function equals(ValueObject $other): bool;
+    abstract public function __toString(): string;
+}
+```
+
+`ValueObject` is `readonly` — all subclasses must be `readonly`.
+
+## Define a Value Object
+
+```php title="src/User/Domain/ValueObject/Email.php"
+use Vortos\Domain\ValueObject\ValueObject;
+
+final readonly class Email extends ValueObject
+{
+    private function __construct(private string $value) {}
+
+    // Factory method — validates before constructing
+    public static function fromString(string $email): self
+    {
+        $normalized = strtolower(trim($email));
+
+        if (!filter_var($normalized, FILTER_VALIDATE_EMAIL)) {
+            throw new \InvalidArgumentException("Invalid email: {$email}");
+        }
+
+        return new self($normalized);
+    }
+
+    public function equals(ValueObject $other): bool
+    {
+        return $other instanceof self && $this->value === $other->value;
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
+
+    public function getDomain(): string
+    {
+        return substr($this->value, strpos($this->value, '@') + 1);
+    }
+}
+```
+
+```php title="src/Payment/Domain/ValueObject/Money.php"
+final readonly class Money extends ValueObject
+{
+    private function __construct(
+        private int $amount,   // in minor units (cents)
+        private string $currency,
+    ) {}
+
+    public static function of(int $amount, string $currency): self
+    {
+        if ($amount < 0) {
+            throw new \InvalidArgumentException('Amount cannot be negative');
+        }
+
+        return new self($amount, strtoupper($currency));
+    }
+
+    public function equals(ValueObject $other): bool
+    {
+        return $other instanceof self
+            && $this->amount === $other->amount
+            && $this->currency === $other->currency;
+    }
+
+    public function add(Money $other): self
+    {
+        if ($this->currency !== $other->currency) {
+            throw new \InvalidArgumentException('Cannot add different currencies');
+        }
+        return new self($this->amount + $other->amount, $this->currency);
+    }
+
+    public function __toString(): string
+    {
+        return sprintf('%s %.2f', $this->currency, $this->amount / 100);
+    }
+}
+```
+
+## Key Rules
+
+**Private constructor, public factory.** Validation lives in the factory — invalid value objects cannot be created.
+
+**Return new instances for transformations.** Never mutate:
+
+```php
+// CORRECT — new instance
+public function toLowerCase(): self
+{
+    return new self(strtolower($this->value));
+}
+
+// WRONG — mutation (impossible with readonly, but the principle applies)
+public function toLowerCase(): void
+{
+    $this->value = strtolower($this->value); // readonly prevents this
+}
+```
+
+**equals() checks instanceof first.** A `Name` is never equal to an `Email` even if their string values match:
+
+```php
+public function equals(ValueObject $other): bool
+{
+    return $other instanceof self && $this->value === $other->value;
+}
+```
+
+## Common Value Objects
+
+```php
+final readonly class Name extends ValueObject { ... }
+final readonly class Email extends ValueObject { ... }
+final readonly class PhoneNumber extends ValueObject { ... }
+final readonly class Money extends ValueObject { ... }
+final readonly class Address extends ValueObject { ... }
+final readonly class Url extends ValueObject { ... }
+final readonly class Percentage extends ValueObject { ... }
+```
+
+<Callout type="info" title="Value Objects in Database">
+Store value objects as their primitive representation. In `DbalWriteRepository::toRow()`:
+
+```php
+'email' => (string) $user->getEmail(),  // __toString()
+'amount' => $order->getTotal()->getAmount(),  // int
+'currency' => $order->getTotal()->getCurrency(),  // string
+```
+
+Reconstruct in `fromRow()`:
+
+```php
+Email::fromString($row['email']),
+Money::of((int) $row['amount'], $row['currency']),
+```
+</Callout>

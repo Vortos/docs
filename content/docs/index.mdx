@@ -1,208 +1,33 @@
 ---
-title: Messaging
-description: Enterprise-grade event-driven messaging for Tekton — Kafka, outbox pattern, retry, dead letter, and more.
+title: Vortos
+description: A modern PHP framework built for CQRS, event-driven architecture, and high-throughput applications.
 ---
 
-import { Callout } from 'fumadocs-ui/components/callout';
 import { Card, Cards } from 'fumadocs-ui/components/card';
-import { Step, Steps } from 'fumadocs-ui/components/steps';
 
-# Tekton Messaging
+# Vortos
 
-The Tekton Messaging module is a production-ready, broker-agnostic event-driven messaging layer built directly into the framework. It provides everything you need to publish, consume, and reliably process domain events across services — with zero manual wiring.
+Vortos is a PHP framework built around CQRS, domain-driven design, and event-driven architecture. It ships as a set of independent packages — use only what you need.
 
-<Callout type="info" title="Design Philosophy">
-Your domain code calls one method: `$eventBus->dispatch($event)`. Everything else — Kafka transport, serialization, middleware, retries, dead letters, tracing — happens automatically behind the scenes.
-</Callout>
-
-## What It Does
-
-The messaging module handles the full lifecycle of a domain event from the moment it is dispatched to the moment a handler processes it:
-
-**On the producer side**, the `EventBus` receives your domain event, stamps it with a unique ID, correlation ID, and timestamp, then routes it to the correct Kafka topic via the producer registry. If outbox mode is enabled, the event is first written to a database table within your active transaction, guaranteeing no message is ever lost even if Kafka is temporarily unavailable.
-
-**On the consumer side**, a long-running worker process polls Kafka for messages, deserializes the payload back into a typed domain event, resolves all registered handlers, and runs each one through the middleware pipeline. On success the Kafka offset is committed. On failure, the consumer retries with exponential backoff before writing the message to a dead letter store.
-
-## Architecture Overview
-
-```
-Your Code
-    │
-    ▼
-EventBusInterface::dispatch(DomainEvent)
-    │
-    ├─── Has registered producer? ──► Outbox enabled? ──► Write to outbox table
-    │                                                      (OutboxRelayWorker → Kafka)
-    │                              └─► Direct produce ──► Kafka topic
-    │
-    └─── Has internal handlers? ──► Symfony Messenger bus (in-process)
-
-Kafka Topic
-    │
-    ▼
-Worker Process (supervisord)
-    │
-    ▼
-ConsumerRunner
-    ├── Deserialize payload → DomainEvent
-    ├── Resolve handlers from HandlerRegistry
-    └── For each handler:
-            │
-            ▼
-        MiddlewareStack
-            ├── TracingMiddleware
-            ├── LoggingMiddleware
-            ├── HookMiddleware
-            └── TransactionalMiddleware
-                    │
-                    ▼
-                Handler::__invoke(DomainEvent)
-                    │
-            ┌───────┴───────┐
-          Success          Failure
-            │                │
-        Commit offset    Retry (exponential backoff)
-                              │
-                         Exhausted → Dead Letter
-```
-
-## Key Features
+## Get Started
 
 <Cards>
-  <Card title="Transport Registration" href="/docs/messaging/transports" description="Define Kafka topics, partitions, and connection settings with a fluent PHP API." />
-  <Card title="Event Publishing" href="/docs/messaging/publishing" description="Dispatch domain events through the EventBus with automatic stamping, tracing, and routing." />
-  <Card title="Event Consuming" href="/docs/messaging/consuming" description="Register handlers with a single attribute. The framework discovers and wires them automatically." />
-  <Card title="Middleware Pipeline" href="/docs/messaging/middleware" description="Plug in cross-cutting concerns — tracing, logging, transactions — at the framework level." />
-  <Card title="Outbox Pattern" href="/docs/messaging/outbox" description="Guarantee at-least-once delivery even when Kafka is unavailable using transactional outbox." />
-  <Card title="Retry & Dead Letter" href="/docs/messaging/retry" description="Automatic retry with exponential backoff and dead letter storage after exhaustion." />
+  <Card title="Getting Started" href="/docs/getting-started" description="Install Vortos, create your first command handler, and run your first request." />
 </Cards>
 
-## Quick Setup
+## Modules
 
-<Steps>
-
-<Step>
-
-### Register a Transport
-
-Create a config class in your bounded context:
-
-```php title="src/User/Infrastructure/UserMessagingConfig.php"
-use Fortizan\Tekton\Messaging\Attribute\MessagingConfig;
-use Fortizan\Tekton\Messaging\Attribute\RegisterTransport;
-use Fortizan\Tekton\Messaging\Attribute\RegisterProducer;
-use Fortizan\Tekton\Messaging\Attribute\RegisterConsumer;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaConsumerDefinition;
-
-#[MessagingConfig]
-final class UserMessagingConfig
-{
-    #[RegisterTransport]
-    public function userTransport(): KafkaTransportDefinition
-    {
-        return KafkaTransportDefinition::create('user.events')
-            ->dsn('kafka://kafka:9092')
-            ->topic('user.events')
-            ->partitions(3)
-            ->replicationFactor(1);
-    }
-
-    #[RegisterProducer]
-    public function userProducer(): KafkaProducerDefinition
-    {
-        return KafkaProducerDefinition::create('user.events')
-            ->transport('user.events')
-            ->publishes(UserCreatedEvent::class)
-            ->outbox(false);
-    }
-
-    #[RegisterConsumer]
-    public function userConsumer(): KafkaConsumerDefinition
-    {
-        return KafkaConsumerDefinition::create('user.events')
-            ->groupId('user-service')
-            ->parallelism(1)
-            ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500))
-            ->dlq('user.events.dlq');
-    }
-}
-```
-
-</Step>
-
-<Step>
-
-### Dispatch an Event
-
-```php title="src/User/Application/RegisterUserHandler.php"
-use Fortizan\Tekton\Messaging\Contract\EventBusInterface;
-
-final class RegisterUserHandler
-{
-    public function __construct(private EventBusInterface $eventBus) {}
-
-    public function handle(RegisterUserCommand $command): void
-    {
-        // ... domain logic
-
-        $this->eventBus->dispatch(new UserCreatedEvent(
-            id: new UuidV7(),
-            email: $command->email,
-        ));
-    }
-}
-```
-
-</Step>
-
-<Step>
-
-### Write a Handler
-
-```php title="src/User/Application/EventHandler/SendWelcomeEmailHandler.php"
-use Fortizan\Tekton\Messaging\Attribute\AsEventHandler;
-
-#[AsEventHandler(handlerId: 'user.created.welcome-email', consumer: 'user.events')]
-final class SendWelcomeEmailHandler
-{
-    public function __invoke(UserCreatedEvent $event): void
-    {
-        // send welcome email
-    }
-}
-```
-
-</Step>
-
-<Step>
-
-### Start the Worker
-
-Add your consumer to `docker/worker/supervisord.conf`:
-
-```ini
-[program:consumer-user-events]
-command=php /var/www/html/bin/console tekton:consume user.events
-autostart=true
-autorestart=true
-stdout_logfile=/var/log/supervisor/user-events.out.log
-stderr_logfile=/var/log/supervisor/user-events.err.log
-```
-
-</Step>
-
-</Steps>
-
-## CLI Commands
-
-The framework ships with built-in console commands for operating and inspecting the messaging system:
-
-| Command | Description |
-|---|---|
-| `tekton:consume <name>` | Start a consumer worker for the named pipeline |
-| `tekton:transports:list` | List all registered transports and producers |
-| `tekton:consumers:list` | List all registered consumers and their handlers |
-| `tekton:outbox:relay` | Start the outbox relay worker |
-| `tekton:dlq:replay` | Replay messages from the dead letter store |
+<Cards>
+  <Card title="Foundation" href="/docs/foundation" description="Runner, Container auto-discovery, PackageInterface, and container caching." />
+  <Card title="HTTP" href="/docs/http" description="Attribute-based routing, controllers, event subscribers, and error handling." />
+  <Card title="Domain" href="/docs/domain" description="Aggregates, identities, domain events, value objects, and collections." />
+  <Card title="CQRS" href="/docs/cqrs" description="Command and query buses with compile-time discovery and idempotency." />
+  <Card title="Persistence" href="/docs/persistence" description="DBAL write repositories, MongoDB read repositories, and optimistic locking." />
+  <Card title="Messaging" href="/docs/messaging" description="Kafka-backed event bus, outbox pattern, retry, and dead letter queues." />
+  <Card title="Cache" href="/docs/cache" description="PSR-16 cache with tag-based invalidation — Redis, InMemory, ArrayAdapter." />
+  <Card title="Auth" href="/docs/auth" description="JWT authentication, route protection, rate limiting, 2FA, and quotas." />
+  <Card title="Authorization" href="/docs/authorization" description="Policy-based authorization, role hierarchy, scoped and temporal permissions." />
+  <Card title="Logger" href="/docs/logger" description="Monolog PSR-3 logger — LineFormatter in dev, JSON to stderr in production." />
+  <Card title="Tracing" href="/docs/tracing" description="OpenTelemetry-compatible distributed tracing with sampling and per-module disable." />
+  <Card title="Docker" href="/docs/docker" description="Publish production-ready Docker files for FrankenPHP or PHP-FPM." />
+</Cards>

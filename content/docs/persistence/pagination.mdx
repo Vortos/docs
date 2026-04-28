@@ -1,0 +1,186 @@
+---
+title: Pagination
+description: Cursor-based keyset pagination — O(1) performance at any depth, how PageResult works, and how to consume paginated results.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Pagination
+
+Vortos uses **keyset (cursor-based) pagination** exclusively. Offset pagination (`LIMIT x OFFSET y`) is never used — it degrades linearly as datasets grow and produces inconsistent results when records are inserted or deleted during pagination.
+
+## Why Keyset Over Offset
+
+| | Offset Pagination | Keyset Pagination |
+|---|---|---|
+| Performance at page 1 | O(1) | O(1) |
+| Performance at page 1000 | O(1000) — scans 1000×limit rows | O(1) — jumps directly to cursor |
+| Consistent results | No — new inserts shift pages | Yes — cursor is stable |
+| Works with sorted results | Yes | Yes |
+| SQL/MongoDB support | Universal | Requires indexed sort field |
+
+## PageResult
+
+All paginated queries return `PageResult`:
+
+```php
+final readonly class PageResult
+{
+    public function __construct(
+        public array $items,          // documents for this page
+        public ?string $nextCursor,   // opaque cursor — pass to next call
+        public bool $hasMore,         // whether more pages exist
+        public ?int $total = null,    // optional total count (expensive)
+    ) {}
+}
+```
+
+`nextCursor` is an opaque base64-encoded string. Pass it back verbatim — do not parse, decode, or modify it.
+
+## Using findPage()
+
+```php
+// First page
+$page = $userReadRepository->findPage(
+    criteria: ['status' => 'active'],
+    limit: 20,
+    sort: ['createdAt' => 'desc'],
+);
+
+foreach ($page->items as $user) {
+    // process user
+}
+
+// Check if more pages exist
+if ($page->hasMore) {
+    // Second page — pass cursor from first page
+    $nextPage = $userReadRepository->findPage(
+        criteria: ['status' => 'active'],
+        limit: 20,
+        cursor: $page->nextCursor,
+        sort: ['createdAt' => 'desc'],
+    );
+}
+```
+
+## Iterating All Pages
+
+```php
+function iterateAllUsers(UserReadRepository $repo, array $criteria): \Generator
+{
+    $cursor = null;
+
+    do {
+        $page = $repo->findPage(
+            criteria: $criteria,
+            limit: 100,
+            cursor: $cursor,
+        );
+
+        foreach ($page->items as $item) {
+            yield $item;
+        }
+
+        $cursor = $page->nextCursor;
+    } while ($page->hasMore);
+}
+
+foreach (iterateAllUsers($repo, ['status' => 'active']) as $user) {
+    // process each user
+}
+```
+
+## API Response Pattern
+
+```php
+final class ListUsersController
+{
+    public function __invoke(Request $request): JsonResponse
+    {
+        $page = $this->userReadRepository->findPage(
+            criteria: ['status' => 'active'],
+            limit: (int) $request->query->get('limit', 20),
+            cursor: $request->query->get('cursor'),
+            sort: ['createdAt' => 'desc'],
+        );
+
+        return new JsonResponse([
+            'data'        => $page->items,
+            'has_more'    => $page->hasMore,
+            'next_cursor' => $page->nextCursor,
+        ]);
+    }
+}
+```
+
+The client passes `?cursor=<nextCursor>` on subsequent requests to load the next page.
+
+## How Cursor Encoding Works (Internal)
+
+The cursor is a base64-encoded JSON object containing the sort field values of the last item on the current page, plus `_id` as a tiebreaker:
+
+```
+Last item on page: { _id: 'user-5', createdAt: '2026-04-27T10:00:00Z' }
+Sort: ['createdAt' => 'desc']
+
+Cursor content: {"createdAt": "2026-04-27T10:00:00Z", "_id": "user-5"}
+Encoded cursor: base64("{"createdAt":"2026-04-27T10:00:00Z","_id":"user-5"}")
+```
+
+On the next request, the cursor is decoded and converted to a MongoDB `$gt` filter (ascending) or `$lt` filter (descending) for each sort field.
+
+You never need to understand this — just pass `nextCursor` back verbatim.
+
+## InMemory Pagination
+
+`InMemoryReadRepository` implements cursor pagination using integer offsets (simpler than field-value keyset, but correct for testing):
+
+```php
+$repo = new InMemoryUserReadRepository();
+
+// Seed test data
+for ($i = 1; $i <= 25; $i++) {
+    $repo->seed("user-{$i}", ['_id' => "user-{$i}", 'name' => "User {$i}"]);
+}
+
+// First page
+$page1 = $repo->findPage(criteria: [], limit: 10);
+$this->assertCount(10, $page1->items);
+$this->assertTrue($page1->hasMore);
+$this->assertNotNull($page1->nextCursor);
+
+// Second page
+$page2 = $repo->findPage(criteria: [], limit: 10, cursor: $page1->nextCursor);
+$this->assertCount(10, $page2->items);
+
+// Third page (last)
+$page3 = $repo->findPage(criteria: [], limit: 10, cursor: $page2->nextCursor);
+$this->assertCount(5, $page3->items);
+$this->assertFalse($page3->hasMore);
+$this->assertNull($page3->nextCursor);
+```
+
+<Callout type="info" title="InMemory Cursor Format Differs">
+`InMemoryReadRepository` encodes the cursor as a base64 integer offset. `MongoReadRepository` encodes it as a base64 JSON object with sort field values. The formats are not interchangeable — do not mix cursors between implementations.
+
+In practice this does not matter because you never parse cursors — you only pass them back verbatim.
+</Callout>
+
+## Sort Field Index
+
+For pagination to perform correctly in MongoDB, ensure your sort fields are indexed. The last field in a compound sort should include `_id` as a tiebreaker:
+
+```php
+protected function indexes(): array
+{
+    return [
+        // Pagination index: sort by createdAt descending, _id as tiebreaker
+        ['key' => ['createdAt' => -1, '_id' => -1], 'options' => []],
+
+        // Filtered pagination: filter by status, sort by createdAt
+        ['key' => ['status' => 1, 'createdAt' => -1, '_id' => -1], 'options' => []],
+    ];
+}
+```
+
+Without a supporting index, MongoDB scans the entire collection on every paginated query — defeating the purpose of keyset pagination.

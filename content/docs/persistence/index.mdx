@@ -1,0 +1,116 @@
+---
+title: Persistence
+description: Repository pattern with DBAL write repositories, MongoDB read repositories, optimistic locking, and cursor-based pagination.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Persistence
+
+Vortos uses a CQRS-aligned persistence model. Write operations go through DBAL-backed repositories to PostgreSQL. Read operations go through MongoDB-backed repositories. Domain aggregates never depend on any persistence technology — only the interfaces defined in `vortos-domain` are visible to application code.
+
+## Architecture
+
+```
+Write Side                        Read Side
+──────────────────────────────    ──────────────────────────────
+Command → Handler                 Query → Handler
+    │                                 │
+    ▼                                 ▼
+WriteRepositoryInterface          ReadRepositoryInterface
+    │                                 │
+    ▼                                 ▼
+DbalWriteRepository               MongoReadRepository
+    │                                 │
+    ▼                                 ▼
+PostgreSQL (source of truth)      MongoDB (read-optimised projections)
+```
+
+The write side is transactional and strongly consistent. The read side is eventually consistent — projections update MongoDB asynchronously when domain events are processed.
+
+## Three Packages
+
+| Package | Purpose | Require When |
+|---|---|---|
+| `vortos-persistence` | Core interfaces and in-memory implementations | Always |
+| `vortos-persistence-dbal` | PostgreSQL write repositories | Using DBAL for writes |
+| `vortos-persistence-mongo` | MongoDB read repositories | Using MongoDB for reads |
+
+## Installation
+
+```bash
+composer require vortos/vortos-persistence
+composer require vortos/vortos-persistence-dbal   # for write side
+composer require vortos/vortos-persistence-mongo  # for read side
+```
+
+## Environment Variables
+
+```bash
+DATABASE_URL=pgsql://postgres:secret@write_db:5432/myapp
+MONGODB_URL=mongodb://root:secret@read_db:27017
+MONGO_DB_NAME=myapp_reads
+```
+
+## Configuration
+
+```php title="config/persistence.php"
+use Vortos\Persistence\DependencyInjection\VortosPersistenceConfig;
+
+return static function (VortosPersistenceConfig $config): void {
+    $config
+        ->writeDsn($_ENV['DATABASE_URL'])
+        ->readDsn($_ENV['MONGODB_URL'])
+        ->readDatabase($_ENV['MONGO_DB_NAME']);
+};
+```
+
+Environment-specific overrides:
+
+```php title="config/test/persistence.php"
+return static function (VortosPersistenceConfig $config): void {
+    $config->writeDsn('pgsql://postgres:test@write_db:5432/myapp_test');
+};
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Persistence\DependencyInjection\PersistencePackage;
+use Vortos\PersistenceDbal\DependencyInjection\DbalPersistencePackage;
+use Vortos\PersistenceMongo\DependencyInjection\MongoPersistencePackage;
+
+$packages = [
+    new PersistencePackage(),       // always first — sets DSN parameters
+    new DbalPersistencePackage(),   // write side
+    new MongoPersistencePackage(),  // read side
+];
+```
+
+<Callout type="warn" title="Load Order Matters">
+`PersistencePackage` must be registered before `DbalPersistencePackage` and `MongoPersistencePackage`. The DBAL and Mongo extensions read container parameters that `PersistenceExtension` sets — wrong order causes a compile-time error.
+</Callout>
+
+## Setup Command
+
+After deploying, run once to ensure MongoDB indexes exist:
+
+```bash
+php bin/console vortos:setup:persistence
+```
+
+Safe to run on every deploy — all operations are idempotent.
+
+## Module Overview
+
+<Cards>
+  <Card title="Write Repositories" href="/docs/persistence/write-repositories" description="Implement DbalWriteRepository for PostgreSQL aggregate storage." />
+  <Card title="Read Repositories" href="/docs/persistence/read-repositories" description="Implement MongoReadRepository for query-optimised read models." />
+  <Card title="Unit of Work" href="/docs/persistence/unit-of-work" description="Transaction boundaries, connection resilience, and atomicity." />
+  <Card title="DBAL" href="/docs/persistence/dbal" description="Connection factory, DSN drivers, SSL, and advanced configuration." />
+  <Card title="MongoDB" href="/docs/persistence/mongodb" description="Client setup, collections, indexes, and bulk operations." />
+  <Card title="Optimistic Locking" href="/docs/persistence/optimistic-locking" description="How version-based concurrency control works and how to handle conflicts." />
+  <Card title="Pagination" href="/docs/persistence/pagination" description="Cursor-based keyset pagination — O(1) performance at any depth." />
+  <Card title="Testing" href="/docs/persistence/testing" description="In-memory repositories for fast, dependency-free tests." />
+</Cards>

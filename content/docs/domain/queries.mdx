@@ -1,0 +1,61 @@
+---
+title: Queries
+description: QueryInterface — marker interface for read-side questions. Named in descriptive mood, carry criteria as readonly properties.
+---
+
+# Queries
+
+## QueryInterface
+
+```php
+interface QueryInterface
+{
+    // Marker interface — no methods required
+}
+```
+
+`QueryInterface` is a marker — it has no methods. Queries carry their criteria as constructor properties.
+
+## Define a Query
+
+```php title="src/User/Application/Query/GetUserById.php"
+use Vortos\Domain\Query\QueryInterface;
+
+final readonly class GetUserById implements QueryInterface
+{
+    public function __construct(public string $userId) {}
+}
+
+final readonly class ListActiveUsers implements QueryInterface
+{
+    public function __construct(
+        public int $limit = 20,
+        public ?string $cursor = null,
+        public ?string $role = null,
+    ) {}
+}
+
+final readonly class SearchUsers implements QueryInterface
+{
+    public function __construct(
+        public string $term,
+        public int $limit = 10,
+    ) {}
+}
+```
+
+## Naming Convention
+
+Queries are named in the descriptive mood: `GetUserById`, `ListActiveOrders`, `FindBookingsByDate`. They express a question.
+
+```
+GetUserById         ✔
+ListActiveOrders    ✔
+FindBookingsByDate  ✔
+IsEmailAvailable    ✔
+
+FetchUser           ✗ (verb-noun, not descriptive)
+UserQuery           ✗ (too generic)
+```
+
+Queries always return a value. They never modify state.

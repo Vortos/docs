@@ -1,0 +1,185 @@
+---
+title: Time-Limited Access
+description: Grant permissions that expire automatically — beta features, trial access, temporary admin rights. Redis TTL handles cleanup with no cron job needed.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Time-Limited Access
+
+Temporal permissions grant a user access to something for a defined period. When the period expires, access is revoked automatically via Redis TTL — no cron job, no cleanup worker needed.
+
+Use cases:
+- Beta feature access for selected users
+- Free trial of premium features
+- Temporary admin access for an investigation
+- Time-boxed contractor access
+
+## Grant Access
+
+Inject `TemporalAuthorizationManager` in your command handlers:
+
+```php
+use Vortos\Authorization\Temporal\TemporalAuthorizationManager;
+
+final class ActivateBetaAccessHandler
+{
+    public function __construct(
+        private TemporalAuthorizationManager $authorization,
+    ) {}
+
+    public function __invoke(ActivateBetaAccess $command): void
+    {
+        // Grant for 30 days
+        $this->authorization
+            ->grant($command->userId, 'beta.analytics_v2')
+            ->forDays(30);
+
+        // Grant for 24 hours
+        $this->authorization
+            ->grant($command->userId, 'beta.ai_suggestions')
+            ->forHours(24);
+
+        // Grant until a specific date
+        $this->authorization
+            ->grant($command->userId, 'feature.early_access')
+            ->until(new \DateTimeImmutable('2026-12-31'));
+    }
+}
+```
+
+## Revoke Early
+
+```php
+// Revoke before expiry (e.g., user cancelled beta)
+$this->authorization->revoke($command->userId, 'beta.analytics_v2');
+```
+
+## Check Validity
+
+```php
+// Check if access is currently valid
+$isValid = $this->authorization->isValid($userId, 'beta.analytics_v2');
+
+// Get expiry date (null if not granted)
+$expiry = $this->authorization->getExpiry($userId, 'beta.analytics_v2');
+```
+
+## Protect a Route
+
+Use `#[RequiresPermission]` — the standard authorization system checks temporal permissions the same way it checks all other permissions:
+
+```php
+use Vortos\Authorization\Attribute\RequiresPermission;
+
+// This endpoint is only accessible if the user has been granted 'beta.analytics_v2'
+#[RequiresPermission('beta.analytics_v2.any')]
+final class BetaAnalyticsController { ... }
+```
+
+For this to work, your policy must handle the permission:
+
+```php
+#[AsPolicy(resource: 'beta')]
+final class BetaPolicy implements PolicyInterface
+{
+    public function __construct(
+        private TemporalAuthorizationManager $temporal,
+    ) {}
+
+    public function can(
+        UserIdentityInterface $identity,
+        string $action,
+        string $scope,
+        mixed $resource = null,
+    ): bool {
+        // action is the second segment: 'analytics_v2', 'ai_suggestions', etc.
+        $permission = "beta.{$action}";
+
+        return $this->temporal->isValid($identity->id(), $permission);
+    }
+}
+```
+
+## Using Enums
+
+```php
+enum BetaFeature: string {
+    case AnalyticsV2    = 'beta.analytics_v2';
+    case AiSuggestions  = 'beta.ai_suggestions';
+    case EarlyAccess    = 'feature.early_access';
+}
+
+// Grant
+$this->authorization->grant($userId, BetaFeature::AnalyticsV2)->forDays(30);
+
+// Revoke
+$this->authorization->revoke($userId, BetaFeature::AnalyticsV2);
+
+// Check
+$isValid = $this->authorization->isValid($userId, BetaFeature::AnalyticsV2);
+```
+
+## Storage
+
+Temporal permissions are stored in Redis:
+
+```
+Key:   temporal_perm:{userId}:{permission}
+Value: {"expires_at": 1719532800}
+TTL:   seconds until expiry
+```
+
+Redis auto-expires the key when the TTL reaches zero. No cleanup job is needed. The `isValid()` check simply calls `Redis::exists()` — if the key is gone, access is denied.
+
+<Callout type="warn" title="Redis Restart and Temporal Permissions">
+Temporal permissions are stored only in Redis. A Redis restart clears all grants. For production, consider storing grants in a database as the source of truth and using Redis as a cache:
+
+```php
+final class DbTemporalPermissionStore implements TemporalPermissionStoreInterface
+{
+    public function grant(string $userId, string $permission, \DateTimeImmutable $expiresAt): void
+    {
+        // Write to DB
+        $this->db->insert('temporal_permissions', [
+            'user_id'    => $userId,
+            'permission' => $permission,
+            'expires_at' => $expiresAt->format('Y-m-d H:i:s'),
+        ]);
+
+        // Also cache in Redis for fast reads
+        $ttl = $expiresAt->getTimestamp() - time();
+        if ($ttl > 0) {
+            $this->redis->setEx("temporal_perm:{$userId}:{$permission}", $ttl,
+                json_encode(['expires_at' => $expiresAt->getTimestamp()]));
+        }
+    }
+
+    public function isValid(string $userId, string $permission): bool
+    {
+        // Check Redis first (fast)
+        if ($this->redis->exists("temporal_perm:{$userId}:{$permission}")) {
+            return true;
+        }
+
+        // Fall back to DB
+        return (bool) $this->db->fetchOne(
+            'SELECT 1 FROM temporal_permissions WHERE user_id = ? AND permission = ? AND expires_at > NOW()',
+            [$userId, $permission]
+        );
+    }
+}
+```
+</Callout>
+
+## Grant Builder Reference
+
+```php
+$this->authorization->grant($userId, 'permission')
+
+    ->forDays(30)              // Grant for 30 days from now
+    ->forHours(24)             // Grant for 24 hours from now
+    ->until($dateTimeImmutable) // Grant until a specific datetime
+```
+
+All three methods call `TemporalPermissionStoreInterface::grant()` with the computed expiry and return void.

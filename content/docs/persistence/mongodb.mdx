@@ -1,0 +1,199 @@
+---
+title: MongoDB
+description: MongoDB client setup, DSN format, connection behaviour, index management, and bulk operations.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# MongoDB
+
+`vortos-persistence-mongo` provides MongoDB integration for the read side. It registers a shared `MongoDB\Client` instance and exposes the database name as a container parameter.
+
+## What Gets Registered
+
+```
+MongoDB\Client::class                        — shared, built from MONGODB_URL
+vortos.persistence.mongo.database_name       — container parameter
+```
+
+## Environment Variables
+
+```bash
+MONGODB_URL=mongodb://root:secret@read_db:27017
+MONGO_DB_NAME=myapp_reads
+```
+
+## Configuration
+
+```php title="config/persistence.php"
+$config
+    ->readDsn($_ENV['MONGODB_URL'])
+    ->readDatabase($_ENV['MONGO_DB_NAME']);
+```
+
+The database name is kept separate from the DSN so it can be overridden per environment without changing the connection string.
+
+<Callout type="warn" title="MongoDB\Client Is NOT Lazy">
+Unlike Doctrine DBAL, `MongoDB\Client` establishes a connection immediately on construction. If MongoDB is unreachable at container boot time, the application fails to start. Use health checks in your deployment pipeline to verify MongoDB is ready before starting the application.
+</Callout>
+
+## DSN Format
+
+```
+mongodb://[user:pass@]host[:port][/database][?options]
+```
+
+### Examples
+
+```bash
+# Local development
+MONGODB_URL=mongodb://localhost:27017
+
+# With authentication
+MONGODB_URL=mongodb://root:secret@read_db:27017
+
+# Replica set
+MONGODB_URL=mongodb://user:pass@host1:27017,host2:27017/?replicaSet=rs0
+
+# Replica set with TLS
+MONGODB_URL=mongodb://user:pass@host1:27017,host2:27017/?replicaSet=rs0&tls=true
+
+# MongoDB Atlas
+MONGODB_URL=mongodb+srv://user:pass@cluster0.abc123.mongodb.net
+```
+
+## Register Your Read Repositories
+
+`MongoPersistenceExtension` does NOT register your read repositories automatically — you register them in `config/services.php`:
+
+```php title="config/services.php"
+use MongoDB\Client;
+
+$services->set(UserReadRepository::class)
+    ->arg('$client', service(Client::class))
+    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
+    ->tag('vortos.read_repository')   // required for setup command
+    ->public();
+
+$services->set(OrderReadRepository::class)
+    ->arg('$client', service(Client::class))
+    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
+    ->tag('vortos.read_repository')
+    ->public();
+```
+
+The `vortos.read_repository` tag is used by `vortos:setup:persistence` to discover all read repositories and call `ensureIndexes()` on each.
+
+## Index Setup
+
+```bash
+php bin/console vortos:setup:persistence
+
+# Output:
+#   ✔ Indexes ensured (3): users
+#   ✔ Indexes ensured (2): orders
+#   ⊘ No indexes declared: audit_log
+```
+
+Repositories with no entries in `indexes()` are reported but not skipped — they are valid. If a repository has `indexes()` returning an empty array, it will show the `⊘` message.
+
+## Store `_id` as String UUID
+
+Always use string UUIDs for `_id`, not MongoDB `ObjectId`:
+
+```php
+// CORRECT — consistent with write-side UuidV7 identity
+$this->collection()->insertOne([
+    '_id'   => $event->userId,   // string UUID
+    'email' => $event->email,
+]);
+
+// WRONG — ObjectId is incompatible with UuidV7 identity
+$this->collection()->insertOne([
+    '_id'   => new \MongoDB\BSON\ObjectId(),  // don't do this
+    'email' => $event->email,
+]);
+```
+
+Mixing `ObjectId` and string UUIDs causes silent type mismatch bugs when querying by ID. The write side stores UuidV7 as a string — the read side must match.
+
+## Bulk Operations
+
+### `bulkUpsert(array $documents): void`
+
+Single bulk write for multiple documents:
+
+```php
+$userReadRepository->bulkUpsert([
+    ['_id' => 'user-1', 'email' => 'alice@example.com', 'status' => 'active'],
+    ['_id' => 'user-2', 'email' => 'bob@example.com', 'status' => 'active'],
+    ['_id' => 'user-3', 'email' => 'carol@example.com', 'status' => 'inactive'],
+]);
+```
+
+Uses `replaceOne` with `upsert: true` for each document. All documents must have `_id`.
+
+### `bulkDelete(array $ids): void`
+
+```php
+$userReadRepository->bulkDelete(['user-1', 'user-2', 'user-3']);
+```
+
+Single `deleteMany` with `$in` filter.
+
+## Advanced Queries via collection()
+
+Access the raw `MongoDB\Collection` for queries `findByCriteria()` cannot express:
+
+```php
+// Aggregation pipeline
+public function getStatsByRole(): array
+{
+    return iterator_to_array(
+        $this->collection()->aggregate([
+            ['$group' => ['_id' => '$role', 'count' => ['$sum' => 1]]],
+            ['$sort'  => ['count' => -1]],
+        ])
+    );
+}
+
+// Geospatial query (requires 2dsphere index)
+public function findNearby(float $lat, float $lng, int $radiusMetres): array
+{
+    $cursor = $this->collection()->find([
+        'location' => [
+            '$near' => [
+                '$geometry' => ['type' => 'Point', 'coordinates' => [$lng, $lat]],
+                '$maxDistance' => $radiusMetres,
+            ],
+        ],
+    ]);
+
+    return array_map(fn($doc) => $this->fromDocument((array) $doc), iterator_to_array($cursor));
+}
+```
+
+## Multiple Databases
+
+If you need read repositories in different MongoDB databases, register multiple `Client` instances manually in `config/services.php`:
+
+```php
+use MongoDB\Client;
+
+// Primary read client (default)
+$services->set(Client::class)
+    ->factory([MongoClientFactory::class, 'fromDsn'])
+    ->arg('$dsn', '%vortos.persistence.read_dsn%')
+    ->public();
+
+// Analytics client (different database server)
+$services->set('mongodb.analytics_client', Client::class)
+    ->factory([MongoClientFactory::class, 'fromDsn'])
+    ->arg('$dsn', $_ENV['ANALYTICS_MONGODB_URL'])
+    ->public();
+
+$services->set(AnalyticsReadRepository::class)
+    ->arg('$client', service('mongodb.analytics_client'))
+    ->arg('$databaseName', $_ENV['ANALYTICS_DB_NAME'])
+    ->public();
+```

@@ -1,0 +1,17 @@
+{
+  "title": "Authentication",
+  "pages": [
+    "index",
+    "tokens",
+    "protecting-routes",
+    "current-user",
+    "passwords",
+    "token-storage",
+    "testing",
+    "rate-limiting",
+    "feature-access",
+    "quotas",
+    "audit-logging",
+    "two-factor"
+  ]
+}

@@ -1,0 +1,162 @@
+---
+title: PolicyEngine
+description: Programmatic authorization checks — can() for soft checks and authorize() for hard gates inside handlers and services.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# PolicyEngine
+
+`PolicyEngine` is the central authorization engine. Use it for programmatic checks inside handlers, services, or anywhere outside of HTTP middleware.
+
+## Two Methods
+
+```php
+use Vortos\Authorization\Engine\PolicyEngine;
+
+// Soft check — returns bool, never throws
+$engine->can($identity, 'documents.update.own', $resource)
+
+// Hard gate — throws AccessDeniedException if denied
+$engine->authorize($identity, 'documents.update.own', $resource)
+```
+
+## `can()` — Soft Check
+
+Returns `true` or `false`. Never throws. Use for conditional logic — showing/hiding UI elements, branching behaviour:
+
+```php
+final class DocumentController
+{
+    public function __construct(
+        private PolicyEngine $policy,
+        private CurrentUserProvider $currentUser,
+    ) {}
+
+    public function show(string $id): JsonResponse
+    {
+        $identity = $this->currentUser->get();
+        $document = $this->documents->findById($id);
+
+        return new JsonResponse([
+            'id'          => $document->getId(),
+            'title'       => $document->getTitle(),
+            'can_edit'    => $this->policy->can($identity, 'documents.update.own', ['author_id' => $document->getAuthorId()]),
+            'can_delete'  => $this->policy->can($identity, 'documents.delete.own', ['author_id' => $document->getAuthorId()]),
+            'can_export'  => $this->policy->can($identity, 'documents.export.any'),
+        ]);
+    }
+}
+```
+
+### Returns False When:
+
+- Identity is not authenticated (`isAuthenticated()` returns false)
+- Permission string format is invalid (not `resource.action.scope`)
+- No policy registered for the resource
+- Policy's `can()` returns false
+- Policy's `can()` throws any exception
+
+`can()` never propagates exceptions from inside a policy — all failures silently return false.
+
+## `authorize()` — Hard Gate
+
+Throws `AccessDeniedException` if denied. Use inside handlers where denial should abort execution:
+
+```php
+final class UpdateDocumentHandler
+{
+    public function __construct(
+        private PolicyEngine $policy,
+        private CurrentUserProvider $currentUser,
+        private DocumentRepository $documents,
+    ) {}
+
+    public function __invoke(UpdateDocument $command): void
+    {
+        $document = $this->documents->findById(DocumentId::fromString($command->documentId));
+        $identity = $this->currentUser->get();
+
+        // Throws AccessDeniedException (403) if not allowed
+        $this->policy->authorize(
+            $identity,
+            'documents.update.own',
+            ['author_id' => $document->getAuthorId()],
+        );
+
+        $document->updateTitle($command->title);
+        $this->documents->save($document);
+    }
+}
+```
+
+### AccessDeniedException
+
+```php
+use Vortos\Authorization\Exception\AccessDeniedException;
+```
+
+Two static constructors:
+
+```php
+// For authenticated users who lack permission — maps to 403
+AccessDeniedException::forbidden($userId, $permission)
+
+// For unauthenticated requests — maps to 401
+AccessDeniedException::unauthenticated($permission)
+```
+
+Translate in your exception listener:
+
+```php
+if ($e instanceof AccessDeniedException) {
+    $status = str_contains($e->getMessage(), 'Authentication required') ? 401 : 403;
+    return new JsonResponse(['error' => $e->getMessage()], $status);
+}
+```
+
+## `parsePermission()` — Parse Permission String
+
+Split a permission string into `[resource, action, scope]`:
+
+```php
+[$resource, $action, $scope] = $engine->parsePermission('documents.update.own');
+// $resource = 'documents'
+// $action   = 'update'
+// $scope    = 'own'
+```
+
+Throws `\InvalidArgumentException` if the format is not exactly three dot-separated segments.
+
+## Inject PolicyEngine
+
+```php
+use Vortos\Authorization\Engine\PolicyEngine;
+
+final class SomeHandler
+{
+    public function __construct(private PolicyEngine $policy) {}
+}
+```
+
+`PolicyEngine` is registered as a shared public service by `AuthorizationExtension`. Inject by type — no service ID needed.
+
+## Resource Parameter
+
+The `$resource` parameter is passed directly to the policy's `can()` method. It can be any value — a string, an array, a domain object:
+
+```php
+// Pass a string (e.g. route param)
+$engine->can($identity, 'documents.update.own', $documentId)
+
+// Pass an array (loaded from DB)
+$engine->can($identity, 'documents.update.own', [
+    'author_id'    => $document->getAuthorId(),
+    'federation_id' => $document->getFederationId(),
+])
+
+// Pass null (no resource needed for this check)
+$engine->can($identity, 'reports.export.any')
+```
+
+The policy receives whatever you pass — it decides how to use it.

@@ -1,0 +1,105 @@
+---
+title: Modules
+description: TracingModule enum — disable tracing for specific framework modules at compile time. ModuleAwareTracer returns NoOpSpan for disabled modules.
+---
+
+# Modules
+
+`ModuleAwareTracer` sits at the outermost layer of the decorator chain. It reads the `vortos.module` attribute from `startSpan()` calls and returns `NoOpSpan` immediately for disabled modules — the sampling check and inner tracer are never called.
+
+## TracingModule Enum
+
+```php
+enum TracingModule: string
+{
+    case Http          = 'http';
+    case Auth          = 'auth';
+    case Authorization = 'authorization';
+    case Cache         = 'cache';
+    case Persistence   = 'persistence';
+    case Messaging     = 'messaging';
+    case Cqrs          = 'cqrs';
+    case RateLimit     = 'rate_limit';
+    case Quota         = 'quota';
+    case Audit         = 'audit';
+}
+```
+
+## Disable Modules
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingModule;
+
+// Disable one module
+$config->disable(TracingModule::Cache);
+
+// Disable multiple
+$config->disable(TracingModule::Cache, TracingModule::Auth);
+
+// Re-enable
+$config->enable(TracingModule::Cache);
+```
+
+## How It Works
+
+Framework components tag their spans with `vortos.module`:
+
+```php
+// Inside CacheRedisAdapter
+$span = $this->tracer->startSpan('cache.get', [
+    'vortos.module' => TracingModule::Cache,  // ← module tag
+    'cache.key'     => $key,
+]);
+```
+
+`ModuleAwareTracer` checks this attribute:
+
+```php
+public function startSpan(string $name, array $attributes = []): SpanInterface
+{
+    $module = $attributes['vortos.module'] ?? null;
+
+    if ($module instanceof TracingModule && $this->isDisabled($module)) {
+        return new NoOpSpan(); // ← zero cost, inner never called
+    }
+
+    return $this->inner->startSpan($name, $attributes);
+}
+```
+
+Spans without a `vortos.module` attribute always pass through — no module tag means no module filtering applies.
+
+## When to Disable Modules
+
+| Module | When to Disable | Why |
+|---|---|---|
+| `Cache` | Common — very noisy | Cache hits generate many spans; usually not useful in traces |
+| `Auth` | Moderate | Auth runs on every request; adds noise without insight |
+| `RateLimit` | Moderate | Rate limit checks are fast; spans add noise |
+| `Quota` | Moderate | Similar to rate limit |
+| `Audit` | Rarely | Audit has its own separate log — tracing it is redundant |
+| `Http` | Rarely | HTTP spans are often the most useful for debugging |
+| `Persistence` | Never in prod | DB query spans are gold for performance debugging |
+| `Messaging` | Never | Consumer spans are critical for message flow debugging |
+
+## Custom Spans with Module Tags
+
+When writing your own spans, use `vortos.module` to make them respectable of the disable config:
+
+```php
+$span = $this->tracer->startSpan('user.permission.check', [
+    'vortos.module' => TracingModule::Authorization,
+    'user.id'       => $identity->id(),
+    'permission'    => $permission,
+]);
+```
+
+Or omit the tag for spans that should always be traced regardless of module config:
+
+```php
+// Always traced — no module tag
+$span = $this->tracer->startSpan('payment.charge', [
+    'payment.id'     => $payment->getId(),
+    'payment.amount' => $payment->getAmount(),
+]);
+```

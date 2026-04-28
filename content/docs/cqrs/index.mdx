@@ -1,0 +1,92 @@
+---
+title: CQRS
+description: Command and query buses with compile-time handler discovery, idempotency, transaction ownership, and projection handlers.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# CQRS
+
+Vortos provides `CommandBus` and `QueryBus` with compile-time handler auto-discovery. Mark your handler with one attribute — discovery, wiring, transaction management, event dispatch, and idempotency are all handled automatically.
+
+<Callout type="info" title="Compile-Time Discovery">
+`CommandHandlerPass` and `QueryHandlerPass` scan all services at compile time, infer the handled class from `__invoke()` parameter types, and build `ServiceLocator` maps. At runtime, dispatch is a single map lookup — zero reflection.
+</Callout>
+
+## Architecture
+
+```
+Command → CommandBus
+    ├── Idempotency check (pre-built strategy map — zero reflection)
+    ├── UnitOfWork::run()
+    │       ├── handler(__invoke($command))
+    │       ├── pullDomainEvents() from returned aggregate
+    │       └── EventBus::dispatch() each event (writes to outbox)
+    └── UnitOfWork::commit()
+    └── markProcessed(idempotencyKey)
+
+Query → QueryBus
+    └── handler(__invoke($query)) → returns result
+        (no transaction, no events, no idempotency)
+```
+
+## Installation
+
+```bash
+composer require vortos/vortos-cqrs
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Cqrs\DependencyInjection\CqrsPackage;
+
+$packages = [
+    new CachePackage(),       // required — idempotency store uses CacheInterface
+    new CqrsPackage(),
+];
+```
+
+## Configuration
+
+```php title="config/cqrs.php"
+use Vortos\Cqrs\DependencyInjection\VortosCqrsConfig;
+
+return static function (VortosCqrsConfig $config): void {
+    $config->commandBus()
+        ->idempotencyStore(RedisCommandIdempotencyStore::class) // default
+        ->idempotencyTtl(86400)                                 // 24 hours default
+        ->strictIdempotency(false);                             // false = silent skip (default)
+};
+```
+
+No config file needed — all settings have sensible defaults.
+
+### All Config Options
+
+| Method | Default | Description |
+|---|---|---|
+| `->idempotencyStore(string)` | `RedisCommandIdempotencyStore::class` | FQCN of `CommandIdempotencyStoreInterface` |
+| `->idempotencyTtl(int)` | `86400` | Seconds to keep processed keys (24 hours) |
+| `->strictIdempotency(bool)` | `false` | `false` = silent skip, `true` = throw `DuplicateCommandException` |
+
+## Compiler Pass Order
+
+```
+CommandHandlerPass  (priority 50) — builds command handler map
+QueryHandlerPass    (priority 50) — builds query handler map
+IdempotencyKeyPass  (priority 40) — reads command map, resolves idempotency strategies
+```
+
+`IdempotencyKeyPass` must run after `CommandHandlerPass` — it reads the map that `CommandHandlerPass` builds.
+
+## Module Overview
+
+<Cards>
+  <Card title="Commands" href="/docs/cqrs/commands" description="Write command handlers — #[AsCommandHandler], AbstractCommand, idempotency keys." />
+  <Card title="Queries" href="/docs/cqrs/queries" description="Write query handlers — #[AsQueryHandler], QueryInterface, return types." />
+  <Card title="Idempotency" href="/docs/cqrs/idempotency" description="Prevent duplicate command processing — method, property, and none strategies." />
+  <Card title="Projections" href="/docs/cqrs/projections" description="Update read models from domain events — #[AsProjectionHandler], upsert." />
+  <Card title="Testing" href="/docs/cqrs/testing" description="Test handlers in isolation with InMemory stores." />
+</Cards>

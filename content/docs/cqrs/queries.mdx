@@ -1,0 +1,166 @@
+---
+title: Queries
+description: Write query handlers — #[AsQueryHandler], QueryInterface, return types. No transactions, no events, no idempotency.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Queries
+
+Queries read state and return data. They never modify state, never dispatch events, and never run inside a transaction. They are the read side of CQRS.
+
+## Define a Query
+
+```php title="src/User/Application/Query/GetUserById.php"
+use Vortos\Domain\Query\QueryInterface;
+
+final readonly class GetUserById implements QueryInterface
+{
+    public function __construct(public string $userId) {}
+}
+
+final readonly class ListActiveUsers implements QueryInterface
+{
+    public function __construct(
+        public int $limit = 20,
+        public ?string $cursor = null,
+    ) {}
+}
+```
+
+`QueryInterface` is a marker interface — no methods required. Queries carry their criteria as constructor properties.
+
+## Write a Handler
+
+```php title="src/User/Application/Query/GetUserByIdHandler.php"
+use Vortos\Cqrs\Attribute\AsQueryHandler;
+
+#[AsQueryHandler]
+final class GetUserByIdHandler
+{
+    public function __construct(private UserReadRepository $users) {}
+
+    public function __invoke(GetUserById $query): ?array
+    {
+        return $this->users->findById($query->userId);
+    }
+}
+```
+
+```php title="src/User/Application/Query/ListActiveUsersHandler.php"
+use Vortos\Domain\Repository\PageResult;
+
+#[AsQueryHandler]
+final class ListActiveUsersHandler
+{
+    public function __construct(private UserReadRepository $users) {}
+
+    public function __invoke(ListActiveUsers $query): PageResult
+    {
+        return $this->users->findPage(
+            criteria: ['status' => 'active'],
+            limit: $query->limit,
+            cursor: $query->cursor,
+            sort: ['createdAt' => 'desc'],
+        );
+    }
+}
+```
+
+## Ask from a Controller
+
+```php
+use Vortos\Cqrs\Query\QueryBusInterface;
+
+final class UserController
+{
+    public function __construct(private QueryBusInterface $queryBus) {}
+
+    public function show(string $id): JsonResponse
+    {
+        $user = $this->queryBus->ask(new GetUserById($id));
+
+        if ($user === null) {
+            return new JsonResponse(['error' => 'Not Found'], 404);
+        }
+
+        return new JsonResponse($user);
+    }
+
+    public function index(Request $request): JsonResponse
+    {
+        $page = $this->queryBus->ask(new ListActiveUsers(
+            limit: (int) $request->query->get('limit', 20),
+            cursor: $request->query->get('cursor'),
+        ));
+
+        return new JsonResponse([
+            'data'        => $page->items,
+            'has_more'    => $page->hasMore,
+            'next_cursor' => $page->nextCursor,
+        ]);
+    }
+}
+```
+
+## Return Types
+
+Query handlers return whatever makes sense — there is no constraint:
+
+```php
+// Single item or null
+public function __invoke(GetUserById $query): ?array { ... }
+
+// Paginated result
+public function __invoke(ListUsers $query): PageResult { ... }
+
+// Boolean check
+public function __invoke(IsEmailAvailable $query): bool { ... }
+
+// Count
+public function __invoke(CountActiveUsers $query): int { ... }
+
+// A typed ViewModel
+public function __invoke(GetUserProfile $query): UserProfileViewModel { ... }
+```
+
+## Handler Discovery
+
+Identical to commands — `QueryHandlerPass` infers the query class from `__invoke()`:
+
+```php
+// Inferred — query class from first parameter type
+#[AsQueryHandler]
+final class GetUserByIdHandler
+{
+    public function __invoke(GetUserById $query): ?array { ... }
+}
+```
+
+Two handlers for the same query class throws at compile time.
+
+## Query Rules
+
+<Callout type="warn" title="Queries Must Be Pure Reads">
+Query handlers must not modify state, call repositories' `save()` or `delete()`, dispatch events, or use `UnitOfWork`. A method that both reads and writes is a command — return the ID from the command and query separately.
+
+```php
+// WRONG — queries must not write
+#[AsQueryHandler]
+final class GetOrCreateUserHandler
+{
+    public function __invoke(GetOrCreateUser $query): array
+    {
+        $user = $this->users->findById($query->id);
+        if ($user === null) {
+            $user = $this->users->create($query->email); // NO — this is a command
+        }
+        return $user;
+    }
+}
+
+// CORRECT — separate command and query
+$this->commandBus->dispatch(new EnsureUserExists($query->email));
+$user = $this->queryBus->ask(new GetUserById($query->id));
+```
+</Callout>

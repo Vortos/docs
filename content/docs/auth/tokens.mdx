@@ -1,0 +1,110 @@
+---
+title: Token Lifecycle
+description: How access and refresh tokens work in Vortos.
+---
+
+# Token Lifecycle
+
+## Access tokens
+
+Short-lived (default 15 minutes). Used for API authentication on every request.
+
+```
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+Access tokens are **not tracked in Redis**. Their short TTL is the revocation mechanism. If a token is compromised, it expires in at most 15 minutes.
+
+## Refresh tokens
+
+Long-lived (default 7 days). Used only to obtain new access tokens. Store in an `httpOnly` cookie — never in `localStorage`.
+
+Refresh tokens **are tracked in Redis** by their JTI (JWT ID). This enables explicit revocation on logout.
+
+## Token pair structure
+
+```json
+{
+  "access_token": "eyJ...",
+  "refresh_token": "eyJ...",
+  "access_token_expires_at": 1234567890,
+  "refresh_token_expires_at": 1234567890,
+  "token_type": "Bearer"
+}
+```
+
+## Issuing tokens (login)
+
+```php
+$identity = new UserIdentity(
+    id: (string) $user->getId(),
+    roles: $user->getRoles(),
+);
+
+$token = $this->jwtService->issue($identity);
+
+return new JsonResponse($token->toArray());
+```
+
+## Validating tokens (every request)
+
+`AuthMiddleware` does this automatically. You never call `validate()` directly unless building a custom flow.
+
+```php
+// AuthMiddleware does this for you:
+$identity = $this->jwtService->validate($accessToken);
+// Returns UserIdentity with id and roles from JWT claims
+```
+
+## Refreshing tokens
+
+```php
+// Validate old refresh token, revoke it, issue new pair
+$newToken = $this->jwtService->refresh($refreshToken, $identity);
+```
+
+Token rotation: the old refresh token is revoked before the new pair is issued. A stolen refresh token cannot be reused after legitimate use.
+
+## Logout
+
+```php
+// Revoke all refresh tokens for this user (all devices)
+$this->jwtService->revokeAll($identity->id());
+```
+
+## JWT payload structure
+
+**Access token:**
+```json
+{
+  "iss": "squaura",
+  "sub": "019d...",
+  "iat": 1234567890,
+  "exp": 1234568790,
+  "roles": ["ROLE_USER", "ROLE_ADMIN"],
+  "type": "access"
+}
+```
+
+**Refresh token:**
+```json
+{
+  "iss": "squaura",
+  "sub": "019d...",
+  "iat": 1234567890,
+  "exp": 1235172690,
+  "jti": "019d...",
+  "type": "refresh"
+}
+```
+
+## Token TTL configuration
+
+```php
+// config/auth.php
+$config
+    ->accessTokenTtl(900)     // 15 min — balance security vs UX
+    ->refreshTokenTtl(604800); // 7 days — adjust to your session policy
+```
+
+Shorter access TTL = smaller compromise window. Longer refresh TTL = less friction for users (less frequent re-login).

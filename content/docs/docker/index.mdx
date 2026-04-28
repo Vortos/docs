@@ -1,0 +1,186 @@
+---
+title: Docker
+description: Publish production-ready Docker files for FrankenPHP or PHP-FPM+Nginx with one command — vortos:docker:publish.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Docker
+
+`vortos-docker` provides a single console command that publishes production-ready Docker infrastructure files into your project. Choose between FrankenPHP (recommended) or PHP-FPM + Nginx.
+
+## Installation
+
+```bash
+composer require vortos/vortos-docker
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Docker\DependencyInjection\DockerPackage;
+
+$packages = [
+    // ... other packages
+    new DockerPackage(),
+];
+```
+
+## Publish Docker Files
+
+```bash
+# FrankenPHP runtime (default — recommended)
+php bin/console vortos:docker:publish
+
+# PHP-FPM + Nginx runtime
+php bin/console vortos:docker:publish --runtime=phpfpm
+# or
+php bin/console vortos:docker:publish -r phpfpm
+```
+
+Files are copied from the package's `stubs/` directory into your project root. Existing files are overwritten.
+
+## FrankenPHP (Default)
+
+FrankenPHP is a modern PHP application server built on Caddy. It supports worker mode — PHP processes stay alive across requests, eliminating bootstrap overhead on every request.
+
+### Published Files
+
+```
+docker-compose.yaml
+docker-compose.prod.yaml
+.dockerignore
+docker/
+├── frankenphp/
+│   └── Caddyfile                 ← HTTP/HTTPS routing config
+├── php/
+│   └── Dockerfile                ← PHP + extensions + app
+├── postgres/
+│   └── init/
+│       ├── 001_create_database.sql
+│       └── 002_vortos_tables.sql  ← messaging outbox + dead letter tables
+└── worker/
+    └── supervisord.conf           ← Kafka consumer process manager
+```
+
+### Services in docker-compose.yaml
+
+```
+backend    — FrankenPHP (PHP + Caddy, port 80/443)
+worker     — Kafka consumer worker (supervisord)
+write_db   — PostgreSQL (write side)
+read_db    — MongoDB (read side)
+redis      — Cache + idempotency + rate limiting
+kafka      — Message broker
+zookeeper  — Kafka coordination
+```
+
+### Worker Mode
+
+FrankenPHP worker mode keeps PHP workers alive between requests. `Runner::cleanUp()` only clears `ArrayAdapter` — the compiled container and all services stay alive:
+
+```
+Request 1 → Runner::run() → compile container → handle → cleanUp() (clear ArrayAdapter only)
+Request 2 → Runner::run() → use existing container → handle → cleanUp()
+Request 3 → Runner::run() → use existing container → handle → cleanUp()
+```
+
+Boot time only on first request — all subsequent requests skip container compilation entirely.
+
+## PHP-FPM + Nginx
+
+Traditional PHP-FPM with Nginx as reverse proxy. Compatible with any hosting environment that supports Docker.
+
+### Published Files
+
+```
+docker-compose.yaml
+docker-compose.prod.yaml
+.dockerignore
+docker/
+├── nginx/
+│   ├── Dockerfile
+│   └── default.conf              ← Nginx virtual host config
+├── php/
+│   └── Dockerfile                ← PHP-FPM + extensions
+├── postgres/
+│   └── init/
+│       ├── 001_create_database.sql
+│       └── 002_vortos_tables.sql
+└── worker/
+    └── supervisord.conf
+```
+
+### Services
+
+```
+backend    — PHP-FPM
+nginx      — Nginx reverse proxy (port 80)
+worker     — Kafka consumer worker
+write_db   — PostgreSQL
+read_db    — MongoDB
+redis      — Cache
+kafka      — Message broker
+zookeeper  — Kafka coordination
+```
+
+## Development Workflow
+
+```bash
+# 1. Publish Docker files
+php bin/console vortos:docker:publish
+
+# 2. Start all services
+docker compose up -d
+
+# 3. Run migrations / setup
+docker compose exec backend php bin/console vortos:setup:persistence
+docker compose exec backend php bin/console vortos:cache:clear
+docker compose exec backend php bin/console vortos:cache:warmup
+
+# 4. Watch logs
+docker compose logs -f backend
+docker compose logs -f worker
+```
+
+## Production
+
+The `docker-compose.prod.yaml` extends the base compose file with production-specific overrides — resource limits, restart policies, no volume mounts for source code.
+
+```bash
+# Production deployment
+docker compose -f docker-compose.yaml -f docker-compose.prod.yaml up -d
+```
+
+## PostgreSQL Init Scripts
+
+Two SQL scripts are included:
+
+**`001_create_database.sql`** — creates the application database.
+
+**`002_vortos_tables.sql`** — creates the messaging infrastructure tables:
+
+```sql
+-- Outbox table — domain events queued for Kafka
+CREATE TABLE IF NOT EXISTS outbox (...);
+
+-- Dead letter table — messages that failed after all retries
+CREATE TABLE IF NOT EXISTS dead_letters (...);
+```
+
+These tables are required by `vortos-messaging`. They are created automatically when the PostgreSQL container starts.
+
+<Callout type="info" title="Re-publishing Overwrites Files">
+Running `vortos:docker:publish` again overwrites existing Docker files with the latest stubs from the package. If you have customised your Docker files, keep them in version control and review diffs after re-publishing.
+</Callout>
+
+## Choosing a Runtime
+
+| | FrankenPHP | PHP-FPM + Nginx |
+|---|---|---|
+| Performance | Excellent — worker mode eliminates PHP bootstrap | Good — standard PHP-FPM |
+| Complexity | Lower — one container (PHP + web server) | Higher — two containers (PHP + Nginx) |
+| HTTPS | Built-in automatic via Caddy | Manual cert management |
+| Worker mode | Yes — containers stay alive | No — PHP process per request |
+| Ecosystem | Newer, growing | Mature, universal |
+| Use when | New projects, performance-critical | Hosting constraints, existing Nginx config |

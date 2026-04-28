@@ -1,0 +1,250 @@
+---
+title: Write Repositories
+description: Implement DbalWriteRepository to persist domain aggregates to PostgreSQL with optimistic locking, batch operations, and custom queries.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Write Repositories
+
+`DbalWriteRepository` is the abstract base for all write-side aggregate repositories. Extend it and implement four methods describing your table shape — insert, update, delete, batch operations, and optimistic locking are provided free.
+
+## Required Table Structure
+
+Every table using `DbalWriteRepository` **must** have these two columns:
+
+```sql
+CREATE TABLE users (
+    id      VARCHAR(36)  PRIMARY KEY,  -- UUID string (UuidV7)
+    version INTEGER      NOT NULL DEFAULT 0,
+    -- your domain columns below
+    email   VARCHAR(255) NOT NULL,
+    name    VARCHAR(255) NOT NULL
+);
+```
+
+The `id` column stores your aggregate's UUID as a string. The `version` column is used for optimistic concurrency control — the base class manages it automatically.
+
+## Implement the Four Methods
+
+```php title="src/User/Infrastructure/Repository/UserRepository.php"
+use Doctrine\DBAL\Types\Types;
+use Vortos\Domain\Aggregate\AggregateRoot;
+use Vortos\PersistenceDbal\Write\DbalWriteRepository;
+
+final class UserRepository extends DbalWriteRepository
+{
+    // 1. Table name
+    protected function tableName(): string
+    {
+        return 'users';
+    }
+
+    // 2. Column → DBAL type map (must include version)
+    protected function columnMap(): array
+    {
+        return [
+            'id'      => Types::STRING,
+            'email'   => Types::STRING,
+            'name'    => Types::STRING,
+            'version' => Types::INTEGER,
+        ];
+    }
+
+    // 3. Aggregate → database row
+    protected function toRow(AggregateRoot $aggregate): array
+    {
+        /** @var User $aggregate */
+        return [
+            'id'      => (string) $aggregate->getId(),
+            'email'   => (string) $aggregate->getEmail(),
+            'name'    => $aggregate->getName(),
+            'version' => $aggregate->getVersion(),
+        ];
+    }
+
+    // 4. Database row → Aggregate
+    protected function fromRow(array $row): AggregateRoot
+    {
+        return User::reconstruct(
+            UserId::fromString($row['id']),
+            new Email($row['email']),
+            $row['name'],
+            (int) $row['version'],
+        );
+    }
+}
+```
+
+### The `reconstruct()` Pattern
+
+`fromRow()` needs to restore the aggregate's version from the database. Add a named constructor to your aggregate for this:
+
+```php title="src/User/Domain/User.php"
+final class User extends AggregateRoot
+{
+    private function __construct(
+        private UserId $id,
+        private Email $email,
+        private string $name,
+        private int $restoredVersion = 0,
+    ) {}
+
+    // For new aggregates (version starts at 0)
+    public static function register(Email $email, string $name): self
+    {
+        $user = new self(UserId::generate(), $email, $name);
+        $user->recordEvent(new UserRegisteredEvent((string) $user->id, (string) $email));
+        return $user;
+    }
+
+    // For loading from database (version restored from DB)
+    public static function reconstruct(UserId $id, Email $email, string $name, int $version): self
+    {
+        $user = new self($id, $email, $name);
+        // Restore version so optimistic locking works on next save()
+        for ($i = 0; $i < $version; $i++) {
+            $user->incrementVersion();
+        }
+        return $user;
+    }
+
+    public function getId(): UserId { return $this->id; }
+}
+```
+
+## Register the Repository
+
+```php title="config/services.php"
+use Doctrine\DBAL\Connection;
+
+$services->set(UserRepository::class)
+    ->arg('$connection', service(Connection::class))
+    ->public();
+```
+
+## Built-In Operations
+
+### `findById(AggregateId $id): ?AggregateRoot`
+
+```php
+$user = $userRepository->findById(UserId::fromString($command->userId));
+
+if ($user === null) {
+    throw new UserNotFoundException($command->userId);
+}
+```
+
+Returns `null` if not found — never throws for missing records.
+
+### `save(AggregateRoot $aggregate): void`
+
+```php
+$userRepository->save($user);
+```
+
+- `version === 0` → `INSERT`
+- `version > 0` → `UPDATE WHERE version = :expectedVersion`
+- Throws `OptimisticLockException` if another process modified the aggregate
+
+After a successful save, `incrementVersion()` is called on the aggregate automatically.
+
+### `delete(AggregateRoot $aggregate): void`
+
+```php
+$userRepository->delete($user);
+```
+
+Applies optimistic locking on delete. Throws `OptimisticLockException` if the aggregate was modified since loaded.
+
+## Custom Queries
+
+Use the protected `connection()` method for queries beyond `findById()`:
+
+```php
+public function findByEmail(Email $email): ?User
+{
+    $row = $this->connection()->createQueryBuilder()
+        ->select('*')
+        ->from($this->tableName())
+        ->where('email = :email')
+        ->setParameter('email', (string) $email)
+        ->executeQuery()
+        ->fetchAssociative();
+
+    return $row !== false ? $this->fromRow($row) : null;
+}
+
+public function findAllActive(): array
+{
+    $rows = $this->connection()->createQueryBuilder()
+        ->select('*')
+        ->from($this->tableName())
+        ->where('status = :status')
+        ->setParameter('status', 'active')
+        ->orderBy('created_at', 'DESC')
+        ->executeQuery()
+        ->fetchAllAssociative();
+
+    return array_map(fn(array $row) => $this->fromRow($row), $rows);
+}
+```
+
+<Callout type="warn" title="Never Use Raw SQL Strings">
+Always use `createQueryBuilder()` for custom queries — never raw SQL strings. QueryBuilder handles parameter escaping and is database-portable. Raw strings bypass DBAL's type binding and are vulnerable to SQL injection.
+</Callout>
+
+## Batch Operations
+
+### `batchInsert(array $aggregates): void`
+
+Single `INSERT` statement for multiple new aggregates. All must have `version === 0`.
+
+```php
+$users = array_map(fn($row) => User::register(new Email($row['email']), $row['name']), $csvRows);
+$userRepository->batchInsert($users);
+```
+
+### `batchUpdate(array $aggregates): void`
+
+Updates multiple aggregates. The base `DbalWriteRepository` calls `save()` per aggregate (applies optimistic locking per row). `PostgresWriteRepository` overrides this with a single-query `UPDATE FROM VALUES`.
+
+### `batchUpsert(array $aggregates): void`
+
+PostgreSQL `INSERT ... ON CONFLICT (id) DO UPDATE SET`. Does **not** apply optimistic locking.
+
+<Callout type="warn" title="batchUpsert Does Not Lock">
+`batchUpsert()` silently overwrites any version in the database. Use only for read model projections, idempotent bulk imports, or test seeding — never for commands where concurrent modification must be detected.
+</Callout>
+
+### `batchDelete(array $ids): void`
+
+```php
+$userRepository->batchDelete([
+    UserId::fromString('user-1'),
+    UserId::fromString('user-2'),
+]);
+```
+
+Single `DELETE WHERE id IN (...)`. Does not apply optimistic locking.
+
+## PostgresWriteRepository
+
+For PostgreSQL-only applications with large batch updates, extend `PostgresWriteRepository` instead of `DbalWriteRepository`. It overrides `batchUpdate()` with PostgreSQL's `UPDATE FROM VALUES` — a single query regardless of batch size:
+
+```php
+use Vortos\PersistenceDbal\Write\PostgresWriteRepository;
+
+final class UserRepository extends PostgresWriteRepository
+{
+    // Same four methods — batchUpdate() is now a single query
+}
+```
+
+| Method | `DbalWriteRepository` | `PostgresWriteRepository` |
+|---|---|---|
+| `batchUpdate()` | One `UPDATE` per aggregate | One `UPDATE FROM VALUES` for all |
+| Optimistic locking in batch | Per-row, throws on conflict | Silent skip on version mismatch |
+| Database portability | All DBAL drivers | PostgreSQL only |
+
+Use `PostgresWriteRepository` when batch sizes exceed ~50 aggregates and you are on PostgreSQL. For smaller batches the difference is negligible.

@@ -1,0 +1,192 @@
+---
+title: Idempotency
+description: Prevent duplicate command processing — three strategies resolved at compile time with zero runtime reflection.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Idempotency
+
+Command idempotency prevents the same command from being processed more than once. HTTP clients retry on network errors, mobile apps retry on timeout, message queues deliver at-least-once. Without idempotency, retries cause duplicate side effects — two accounts created, two payments charged.
+
+## How It Works
+
+`IdempotencyKeyPass` resolves the strategy for each command **at compile time**:
+
+```
+Compile time:
+    IdempotencyKeyPass scans RegisterUser → has #[AsIdempotencyKey] on $requestId
+    → stores strategy: {type: 'property', property: 'requestId'}
+
+Runtime:
+    CommandBus.dispatch(RegisterUser) → reads pre-built map → $command->requestId
+    → no reflection, direct property access
+```
+
+Three strategies are supported: `method`, `property`, and `none`.
+
+## Strategy 1: Property — `#[AsIdempotencyKey]`
+
+Mark a property on the command with `#[AsIdempotencyKey]`. The bus reads it directly at runtime — no reflection:
+
+```php
+use Vortos\Domain\Command\AbstractCommand;
+use Vortos\Domain\Command\AsIdempotencyKey;
+
+final readonly class RegisterUser extends AbstractCommand
+{
+    public function __construct(
+        #[AsIdempotencyKey]
+        public string $requestId,  // client-generated UUID
+        public string $email,
+        public string $name,
+    ) {}
+}
+```
+
+The client generates a UUID per attempt and sends it with the request:
+
+```json
+POST /users/register
+{
+  "request_id": "019d4784-7b26-78a6-ba36-3b74ce5ad751",
+  "email": "alice@example.com",
+  "name": "Alice"
+}
+```
+
+If the same `request_id` is submitted again within 24 hours, the second dispatch is silently skipped.
+
+## Strategy 2: Method Override
+
+Override `idempotencyKey()` on the command class for custom logic:
+
+```php
+final readonly class ProcessPayment extends AbstractCommand
+{
+    public function __construct(
+        public string $paymentId,
+        public int $amount,
+        public string $currency,
+    ) {}
+
+    // Custom logic — combine multiple fields into one key
+    public function idempotencyKey(): ?string
+    {
+        return $this->paymentId; // or hash of multiple fields
+    }
+}
+```
+
+`IdempotencyKeyPass` detects that `idempotencyKey()` is overridden on `ProcessPayment` and sets strategy `method`. At runtime, the bus calls `$command->idempotencyKey()`.
+
+## Strategy 3: None (Default)
+
+If neither approach is used, the strategy is `none` — idempotency check is skipped:
+
+```php
+final readonly class UpdateUserName extends AbstractCommand
+{
+    public function __construct(
+        public string $userId,
+        public string $name,
+    ) {}
+    // No idempotencyKey() override, no #[AsIdempotencyKey] — strategy: none
+}
+```
+
+This is fine for commands where duplicates are acceptable or impossible (e.g. updating user preferences where last-write-wins is correct).
+
+<Callout type="warn" title="Cannot Use Both Strategies on Same Command">
+Using both `#[AsIdempotencyKey]` on a property AND overriding `idempotencyKey()` throws at compile time:
+
+```
+Command "ProcessPayment" uses both #[AsIdempotencyKey] on property "$paymentId"
+AND overrides idempotencyKey() method.
+Use one or the other.
+```
+</Callout>
+
+## Idempotency Stores
+
+| Store | Backed by | TTL | Survives Restart |
+|---|---|---|---|
+| `RedisCommandIdempotencyStore` | PSR-16 `CacheInterface` (Redis) | Yes | No (unless Redis persistence enabled) |
+| `InMemoryCommandIdempotencyStore` | PHP array | No | No |
+
+Redis store key format: `vortos_cmd_idempotency_{idempotencyKey}`
+
+### Swap Store
+
+```php title="config/cqrs.php"
+use Vortos\Cqrs\Command\Idempotency\InMemoryCommandIdempotencyStore;
+
+// For tests — no Redis needed
+$config->commandBus()->idempotencyStore(InMemoryCommandIdempotencyStore::class);
+```
+
+### Custom Store (e.g. PostgreSQL for audit trail)
+
+```php
+use Vortos\Cqrs\Command\Idempotency\CommandIdempotencyStoreInterface;
+
+final class DbalCommandIdempotencyStore implements CommandIdempotencyStoreInterface
+{
+    public function __construct(private \Doctrine\DBAL\Connection $connection) {}
+
+    public function wasProcessed(string $idempotencyKey): bool
+    {
+        return (bool) $this->connection->fetchOne(
+            'SELECT 1 FROM command_idempotency WHERE key = ?',
+            [$idempotencyKey],
+        );
+    }
+
+    public function markProcessed(string $idempotencyKey, int $ttl = 86400): void
+    {
+        $this->connection->insert('command_idempotency', [
+            'key'        => $idempotencyKey,
+            'expires_at' => (new \DateTimeImmutable())->modify("+{$ttl} seconds")->format('Y-m-d H:i:s'),
+        ]);
+    }
+}
+```
+
+Register in `config/services.php` and configure:
+
+```php title="config/cqrs.php"
+$config->commandBus()->idempotencyStore(DbalCommandIdempotencyStore::class);
+```
+
+## Strict Mode
+
+By default, duplicate commands are **silently skipped** — no exception, no log. Enable strict mode to throw `DuplicateCommandException` instead:
+
+```php title="config/cqrs.php"
+$config->commandBus()->strictIdempotency(true);
+```
+
+```php
+use Vortos\Cqrs\Exception\DuplicateCommandException;
+
+try {
+    $this->commandBus->dispatch($command);
+} catch (DuplicateCommandException $e) {
+    // The command was already processed
+    return new JsonResponse(['status' => 'already_processed'], 200);
+}
+```
+
+Use strict mode when the caller needs to know the command was a duplicate — for example, to return a specific HTTP status or log a warning. Lenient mode (default) is correct for most cases — the client already got a success response on the first attempt, the retry is just confirmation.
+
+## TTL
+
+Idempotency keys expire after the configured TTL (default 24 hours). After expiry, the same key can be reused:
+
+```php
+$config->commandBus()->idempotencyTtl(3600);  // 1 hour
+$config->commandBus()->idempotencyTtl(86400); // 24 hours (default)
+$config->commandBus()->idempotencyTtl(604800); // 7 days for financial operations
+```
+
+Choose a TTL long enough to cover your client's retry window. For payment operations, use at least 7 days — payment processors can retry for days on network failures.

@@ -1,0 +1,99 @@
+---
+title: Identity
+description: AggregateId — typed UuidV7 identifiers, generate vs fromString, equality, and why typed IDs matter.
+---
+
+# Identity
+
+`AggregateId` is the abstract base for all typed aggregate identifiers. It wraps a UuidV7 string and provides type-safe identity — `UserId` and `OrderId` are distinct types even though both wrap UUIDs.
+
+## Define a Typed ID
+
+```php title="src/User/Domain/UserId.php"
+use Vortos\Domain\Identity\AggregateId;
+
+final class UserId extends AggregateId {}
+```
+
+That is all. One line. The base class provides everything.
+
+## API
+
+```php
+// Generate a new time-sortable UUID
+$id = UserId::generate();
+
+// Reconstruct from string (from DB, request, etc.)
+$id = UserId::fromString('019d4784-7b26-78a6-ba36-3b74ce5ad751');
+
+// Throws InvalidArgumentException for invalid UUID
+UserId::fromString('not-a-uuid'); // throws
+
+// Convert to string
+(string) $id;           // '019d4784-7b26-78a6-ba36-3b74ce5ad751'
+$id->toString();        // '019d4784-7b26-78a6-ba36-3b74ce5ad751'
+
+// Equality
+$id->equals($otherId);  // true if same UUID value
+```
+
+## UuidV7 — Time-Sortable
+
+`generate()` uses Symfony's `UuidV7` — monotonically increasing, time-sortable UUIDs. This matters for database indexes:
+
+| UUID Version | Sortable | DB Index Performance |
+|---|---|---|
+| UuidV4 | No | Poor — random inserts fragment B-tree indexes |
+| UuidV7 | Yes | Excellent — sequential inserts append to index |
+| Auto-increment | N/A | Excellent — but not distributed-safe |
+
+In high-throughput applications, UuidV4 primary keys cause significant index fragmentation. UuidV7 gives you distributed-safe IDs with the index performance of sequential integers.
+
+## Why Typed IDs
+
+```php
+// Without typed IDs — easy to mix up
+function transferFunds(string $fromAccountId, string $toAccountId): void { ... }
+transferFunds($userId, $accountId); // wrong order — no compile error
+
+// With typed IDs — impossible to mix up at type system level
+function transferFunds(AccountId $from, AccountId $to): void { ... }
+transferFunds(new UserId($userId), new AccountId($accountId)); // type error
+```
+
+Each aggregate has its own ID type. The PHP type system prevents passing a `UserId` where an `AccountId` is expected.
+
+## Usage in Aggregates
+
+```php
+final class User extends AggregateRoot
+{
+    private function __construct(private UserId $id, ...) {}
+
+    public function getId(): UserId { return $this->id; }  // returns UserId, not AggregateId
+}
+
+// In repositories
+public function findById(AggregateId $id): ?AggregateRoot { ... }
+
+// In application code — type-safe
+$user = $userRepository->findById(UserId::fromString($command->userId));
+```
+
+## fromString in Controllers and Handlers
+
+Always reconstruct from the string representation received from the request:
+
+```php
+final class GetUserHandler
+{
+    public function __invoke(GetUser $query): ?array
+    {
+        $id = UserId::fromString($query->userId);
+        // Throws InvalidArgumentException if not a valid UUID
+        // Handle this with a try/catch or let it propagate as 400
+    }
+}
+```
+
+Catch `\InvalidArgumentException` in your exception listener to return 400 for invalid UUIDs received from clients.

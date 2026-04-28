@@ -1,0 +1,90 @@
+---
+title: Authorization
+description: Policy-based authorization with compile-time discovery, role hierarchy, scoped permissions, time-limited grants, and resource ownership.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Authorization
+
+Vortos authorization is policy-based. Each resource type has exactly one policy class. Policies decide whether an identity can perform an action on a resource. Everything is discovered and wired at compile time — zero reflection at runtime.
+
+<Callout type="info" title="Compile-Time Discovery">
+`PolicyRegistryPass` scans all services tagged `vortos.policy` at compile time and builds a `ServiceLocator`. At runtime, permission checks do a single map lookup — O(1), zero reflection.
+</Callout>
+
+## Permission Format
+
+All permissions follow `resource.action.scope`:
+
+```
+athletes.update.own          → athlete resource, update action, own scope
+competitions.create.any      → competition resource, create action, any scope
+documents.delete.global      → document resource, delete action, global scope
+```
+
+- **resource** — what is being acted on (`athletes`, `documents`, `invoices`)
+- **action** — what is being done (`create`, `read`, `update`, `delete`, `list`, `export`)
+- **scope** — who can do it (`any`, `own`, `federation`, `global`)
+
+## Installation
+
+```bash
+composer require vortos/vortos-authorization
+```
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Authorization\DependencyInjection\AuthorizationPackage;
+
+$packages = [
+    new CachePackage(),
+    new AuthPackage(),
+    new AuthorizationPackage(), // after AuthPackage
+];
+```
+
+## Configuration
+
+```php title="config/authorization.php"
+use Vortos\Authorization\DependencyInjection\VortosAuthorizationConfig;
+
+return static function (VortosAuthorizationConfig $config): void {
+    $config->roleHierarchy([
+        'ROLE_SUPER_ADMIN' => ['ROLE_ADMIN'],
+        'ROLE_ADMIN'       => ['ROLE_MANAGER'],
+        'ROLE_MANAGER'     => ['ROLE_USER'],
+    ]);
+};
+```
+
+No config file is required for basic usage — empty hierarchy works, policies use exact role matching.
+
+## Middleware Priority Chain
+
+```
+priority 8: RouterListener           — route matching, sets _controller
+priority 7: RateLimitMiddleware      — rate limit checks
+priority 6: AuthMiddleware           — token validation, sets identity
+priority 5.5: TwoFactorMiddleware    — 2FA enforcement
+priority 5: AuthorizationMiddleware  — permission checks ← here
+priority 4.5: OwnershipMiddleware    — ownership checks
+priority 4: FeatureAccessMiddleware  — feature plan checks
+priority 3: QuotaMiddleware          — quota checks
+priority 2: AuditMiddleware          — audit logging
+```
+
+## Module Overview
+
+<Cards>
+  <Card title="Policies" href="/docs/authorization/policies" description="Write PolicyInterface implementations — the authorization logic for each resource type." />
+  <Card title="RoleVoter" href="/docs/authorization/role-voter" description="Role-based checks with hierarchy expansion — hasRole, atLeast, hasAny, hasAll." />
+  <Card title="Middleware" href="/docs/authorization/middleware" description="How AuthorizationMiddleware enforces #[RequiresPermission] at priority 5." />
+  <Card title="PolicyEngine" href="/docs/authorization/policy-engine" description="Programmatic authorization checks — can() and authorize() in handlers." />
+  <Card title="Scoped Permissions" href="/docs/authorization/scoped" description="Grant permissions within org, team, or project scope." />
+  <Card title="Time-Limited Access" href="/docs/authorization/temporal" description="Grant permissions that expire automatically — beta access, trial features." />
+  <Card title="Ownership" href="/docs/authorization/ownership" description="Enforce that users can only access resources they own." />
+  <Card title="Testing" href="/docs/authorization/testing" description="Test policies, engine, and middleware in isolation." />
+</Cards>

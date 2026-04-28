@@ -1,0 +1,155 @@
+---
+title: DBAL
+description: Connection factory, supported DSN drivers, lazy connection, SSL/TLS, and advanced DBAL configuration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# DBAL
+
+`vortos-persistence-dbal` provides Doctrine DBAL integration for the write side. It registers a shared `Connection` instance and the `UnitOfWork` transaction boundary.
+
+## What Gets Registered
+
+```
+Connection::class       — shared, lazy, built from DATABASE_URL
+UnitOfWork::class       — transaction boundary
+UnitOfWorkInterface     — aliased to UnitOfWork
+```
+
+## Supported Drivers
+
+`ConnectionFactory::fromDsn()` maps DSN scheme to DBAL driver automatically:
+
+| DSN Scheme | Driver | Database |
+|---|---|---|
+| `pgsql://` or `postgres://` | `pdo_pgsql` | PostgreSQL |
+| `mysql://` | `pdo_mysql` | MySQL / MariaDB |
+| `sqlite:///` | `pdo_sqlite` | SQLite |
+| `sqlsrv://` | `pdo_sqlsrv` | SQL Server |
+| `oci8://` | `oci8` | Oracle |
+
+## Standard Connection (DSN)
+
+```bash
+# .env
+DATABASE_URL=pgsql://postgres:secret@write_db:5432/myapp
+```
+
+```php title="config/persistence.php"
+$config->writeDsn($_ENV['DATABASE_URL']);
+```
+
+The connection is **lazy** — no TCP handshake occurs until the first query. Container construction never fails due to the database being unreachable.
+
+## Advanced Connection (fromParams)
+
+For configurations that a DSN string cannot express — SSL certificates, Unix sockets, custom PDO attributes:
+
+```php
+use Vortos\PersistenceDbal\Connection\ConnectionFactory;
+use Doctrine\DBAL\Connection;
+
+// In a custom extension or service factory:
+$connection = ConnectionFactory::fromParams([
+    'driver'   => 'pdo_pgsql',
+    'host'     => 'db.example.com',
+    'port'     => 5432,
+    'dbname'   => 'myapp',
+    'user'     => 'app',
+    'password' => 'secret',
+    'driverOptions' => [
+        'sslmode'     => 'verify-full',
+        'sslrootcert' => '/etc/ssl/certs/rds-ca.pem',
+    ],
+]);
+```
+
+### SSL/TLS for AWS RDS
+
+```php
+$connection = ConnectionFactory::fromParams([
+    'driver'        => 'pdo_pgsql',
+    'url'           => $_ENV['DATABASE_URL'],
+    'driverOptions' => [
+        \PDO::PGSQL_ATTR_SSL_MODE => 'verify-full',
+        'sslrootcert' => '/etc/ssl/certs/rds-ca-2019-root.pem',
+    ],
+]);
+```
+
+### Unix Socket
+
+```php
+$connection = ConnectionFactory::fromParams([
+    'driver'   => 'pdo_pgsql',
+    'host'     => '/var/run/postgresql',
+    'dbname'   => 'myapp',
+    'user'     => 'app',
+]);
+```
+
+## Lazy Connection
+
+The `Connection` is registered with `->setLazy(true)`:
+
+```
+Container constructed
+    │
+    ├── Connection object created (immediately)
+    │       └── NO database connection yet
+    │
+    ▼
+First query executed
+    │
+    ├── TCP handshake to PostgreSQL
+    ├── Authentication
+    └── Connection established
+```
+
+This means your application boots instantly even if the database is temporarily unavailable. The connection is only established when the first query runs.
+
+## Connection is Shared
+
+The `Connection` is registered with `setShared(true)` — the entire application uses a single instance. This is critical for transaction atomicity:
+
+```
+UnitOfWork::run() → beginTransaction() on Connection A
+    │
+    ├── UserRepository::save() uses Connection A      ← same transaction
+    └── OutboxWriter::store() uses Connection A       ← same transaction
+        │
+        └── commit() on Connection A                  ← atomic
+```
+
+If the connection were not shared, each service would have its own transaction — atomicity would be lost.
+
+<Callout type="warn" title="Never setShared(false) on Connection">
+Changing `Connection` registration to `setShared(false)` breaks transaction atomicity silently. The aggregate save and outbox write would be in separate transactions — one could succeed while the other fails.
+</Callout>
+
+## Connection is Public
+
+`Connection::class` is registered as `setPublic(true)` so that other extensions (like `MessagingExtension`) can reference it via `new Reference(Connection::class)` across package boundaries.
+
+## QueryBuilder
+
+Always use `createQueryBuilder()` for custom queries in repositories — never raw SQL strings:
+
+```php
+// CORRECT
+$this->connection()->createQueryBuilder()
+    ->select('*')
+    ->from('users')
+    ->where('email = :email')
+    ->setParameter('email', $email)
+    ->executeQuery()
+    ->fetchAssociative();
+
+// WRONG — never do this
+$this->connection()->executeQuery(
+    "SELECT * FROM users WHERE email = '" . $email . "'"
+);
+```
+
+QueryBuilder handles parameter escaping, is type-safe, and works across all supported DBAL drivers.

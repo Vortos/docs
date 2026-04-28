@@ -1,0 +1,240 @@
+---
+title: Testing
+description: Test policies, PolicyEngine, RoleVoter, and middleware in isolation — with no container required.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing Authorization
+
+Authorization components are plain PHP classes — test them directly with no container, no database, and no HTTP stack.
+
+## Testing a Policy
+
+```php
+use Vortos\Auth\Identity\UserIdentity;
+use Vortos\Auth\Identity\AnonymousIdentity;
+use Vortos\Authorization\Voter\RoleVoter;
+
+final class DocumentPolicyTest extends TestCase
+{
+    private DocumentPolicy $policy;
+
+    protected function setUp(): void
+    {
+        $roleVoter = new RoleVoter([
+            'ROLE_ADMIN' => ['ROLE_USER'],
+            'ROLE_USER'  => [],
+        ]);
+
+        $this->policy = new DocumentPolicy($roleVoter);
+    }
+
+    public function test_admin_can_delete_any_document(): void
+    {
+        $identity = new UserIdentity('user-1', ['ROLE_ADMIN']);
+        $this->assertTrue($this->policy->can($identity, 'delete', 'any', ['author_id' => 'other-user']));
+    }
+
+    public function test_user_can_only_delete_own_document(): void
+    {
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+
+        $this->assertTrue($this->policy->can($identity, 'delete', 'own', ['author_id' => 'user-1']));
+        $this->assertFalse($this->policy->can($identity, 'delete', 'own', ['author_id' => 'other-user']));
+    }
+
+    public function test_user_cannot_delete_with_any_scope(): void
+    {
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+        $this->assertFalse($this->policy->can($identity, 'delete', 'any'));
+    }
+
+    public function test_user_with_plan_attribute(): void
+    {
+        $identity = new UserIdentity('user-1', ['ROLE_USER'], ['plan' => 'pro']);
+        $this->assertTrue($this->policy->can($identity, 'export', 'any'));
+
+        $freeUser = new UserIdentity('user-2', ['ROLE_USER'], ['plan' => 'free']);
+        $this->assertFalse($this->policy->can($freeUser, 'export', 'any'));
+    }
+}
+```
+
+## Testing PolicyEngine
+
+```php
+use Vortos\Authorization\Engine\PolicyEngine;
+use Vortos\Authorization\Engine\PolicyRegistry;
+use Vortos\Authorization\Exception\AccessDeniedException;
+
+final class PolicyEngineTest extends TestCase
+{
+    private function makeEngine(array $policies): PolicyEngine
+    {
+        $locator = new \Symfony\Component\DependencyInjection\ServiceLocator(
+            array_map(fn($p) => fn() => $p, $policies)
+        );
+
+        return new PolicyEngine(new PolicyRegistry($locator));
+    }
+
+    public function test_can_returns_true_when_policy_allows(): void
+    {
+        $policy = $this->createMock(\Vortos\Authorization\Contract\PolicyInterface::class);
+        $policy->method('supports')->willReturn(true);
+        $policy->method('can')->willReturn(true);
+
+        $engine = $this->makeEngine(['documents' => $policy]);
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+
+        $this->assertTrue($engine->can($identity, 'documents.read.any'));
+    }
+
+    public function test_can_returns_false_for_anonymous(): void
+    {
+        $engine = $this->makeEngine([]);
+        $this->assertFalse($engine->can(new AnonymousIdentity(), 'documents.read.any'));
+    }
+
+    public function test_can_returns_false_for_invalid_format(): void
+    {
+        $engine = $this->makeEngine([]);
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+        $this->assertFalse($engine->can($identity, 'invalid-permission'));
+    }
+
+    public function test_authorize_throws_for_denied(): void
+    {
+        $policy = $this->createMock(\Vortos\Authorization\Contract\PolicyInterface::class);
+        $policy->method('supports')->willReturn(true);
+        $policy->method('can')->willReturn(false);
+
+        $engine = $this->makeEngine(['documents' => $policy]);
+        $identity = new UserIdentity('user-1', ['ROLE_USER']);
+
+        $this->expectException(AccessDeniedException::class);
+        $engine->authorize($identity, 'documents.delete.any');
+    }
+}
+```
+
+## Testing RoleVoter
+
+```php
+final class RoleVoterTest extends TestCase
+{
+    private RoleVoter $voter;
+
+    protected function setUp(): void
+    {
+        $this->voter = new RoleVoter([
+            'ROLE_ADMIN'   => ['ROLE_MANAGER'],
+            'ROLE_MANAGER' => ['ROLE_USER'],
+        ]);
+    }
+
+    public function test_exact_role_match(): void
+    {
+        $identity = new UserIdentity('1', ['ROLE_ADMIN']);
+        $this->assertTrue($this->voter->hasRole($identity, 'ROLE_ADMIN'));
+    }
+
+    public function test_hierarchy_expansion(): void
+    {
+        $identity = new UserIdentity('1', ['ROLE_ADMIN']);
+        // ROLE_ADMIN → ROLE_MANAGER → ROLE_USER
+        $this->assertTrue($this->voter->atLeast($identity, 'ROLE_USER'));
+    }
+
+    public function test_has_any(): void
+    {
+        $identity = new UserIdentity('1', ['ROLE_MANAGER']);
+        $this->assertTrue($this->voter->hasAny($identity, ['ROLE_ADMIN', 'ROLE_MANAGER']));
+        $this->assertFalse($this->voter->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN']));
+    }
+
+    public function test_has_all(): void
+    {
+        $identity = new UserIdentity('1', ['ROLE_ADMIN']);
+        // ROLE_ADMIN expands to include ROLE_MANAGER and ROLE_USER
+        $this->assertTrue($this->voter->hasAll($identity, ['ROLE_ADMIN', 'ROLE_MANAGER', 'ROLE_USER']));
+    }
+}
+```
+
+## Testing Scoped Permissions
+
+```php
+use Vortos\Authorization\Scope\Contract\ScopedPermissionStoreInterface;
+use Vortos\Authorization\Scope\ScopedAuthorizationManager;
+
+final class ScopedAuthorizationTest extends TestCase
+{
+    public function test_grant_and_check(): void
+    {
+        $store = $this->createMock(ScopedPermissionStoreInterface::class);
+        $store->method('has')
+            ->with('user-1', 'org', 'org-123', 'documents.edit')
+            ->willReturn(true);
+
+        $manager = new ScopedAuthorizationManager($store);
+
+        $this->assertTrue(
+            $manager->forScope('org', 'org-123')->has('user-1', 'documents.edit')
+        );
+    }
+}
+```
+
+## Testing the Middleware
+
+```php
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpKernel\Event\RequestEvent;
+use Symfony\Component\HttpKernel\HttpKernelInterface;
+use Vortos\Authorization\Middleware\AuthorizationMiddleware;
+
+final class AuthorizationMiddlewareTest extends TestCase
+{
+    private function makeEvent(string $controller, bool $authenticated = true): RequestEvent
+    {
+        $request = Request::create('/test');
+        $request->attributes->set('_controller', $controller);
+
+        $adapter = new \Vortos\Cache\Adapter\ArrayAdapter();
+        $identity = $authenticated
+            ? new UserIdentity('user-1', ['ROLE_USER'])
+            : new AnonymousIdentity();
+        $adapter->set('auth:identity', $identity);
+
+        $kernel = $this->createMock(HttpKernelInterface::class);
+        return new RequestEvent($kernel, $request, HttpKernelInterface::MAIN_REQUEST);
+    }
+
+    public function test_passes_through_when_no_permission_attribute(): void
+    {
+        $engine = $this->createMock(\Vortos\Authorization\Engine\PolicyEngine::class);
+        $engine->expects($this->never())->method('can');
+
+        $provider = new \Vortos\Auth\Identity\CurrentUserProvider(new \Vortos\Cache\Adapter\ArrayAdapter());
+        $middleware = new AuthorizationMiddleware($engine, $provider);
+
+        $event = $this->makeEvent(\stdClass::class);
+        $middleware->onKernelRequest($event);
+
+        $this->assertNull($event->getResponse());
+    }
+}
+```
+
+<Callout type="info" title="Test Identity Attributes">
+`UserIdentity` accepts a third `$attributes` array parameter for extra JWT claims — use this in tests to simulate different subscription plans or org memberships without a real JWT:
+
+```php
+$identity = new UserIdentity('user-1', ['ROLE_USER'], [
+    'plan'   => 'pro',
+    'org_id' => 'org-123',
+]);
+```
+</Callout>
