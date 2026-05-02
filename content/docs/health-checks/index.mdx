@@ -1,0 +1,224 @@
+---
+title: Health Checks
+description: Built-in and custom health checks with a scrubbed public endpoint and a token-gated detail endpoint — 503 on degraded.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Health Checks
+
+Vortos exposes a `GET /health` endpoint backed by a registry of named checks. Each check reports whether a dependency is reachable and how long it took. The public response is scrubbed. Full detail — including latency and error messages — requires a bearer token.
+
+## Architecture
+
+```
+GET /health
+    │
+    ▼
+HealthController
+    │
+    ▼
+HealthRegistry::run()
+    ├── DatabaseHealthCheck::check()      ← PostgreSQL via DBAL
+    ├── MongoHealthCheck::check()         ← MongoDB
+    ├── RedisHealthCheck::check()         ← Redis
+    ├── KafkaHealthCheck::check()         ← Kafka
+    └── YourCustomHealthCheck::check()    ← your checks
+    │
+    ▼
+All healthy → 200 {"status":"ok", ...}
+Any degraded → 503 {"status":"degraded", ...}
+```
+
+## The /health Endpoint
+
+### Public Response (no token)
+
+```
+GET /health
+```
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": { "status": "ok" },
+    "redis":    { "status": "ok" }
+  }
+}
+```
+
+Latency and error details are stripped. Safe to expose to load balancer health probes without leaking infrastructure detail.
+
+### Detailed Response (with token)
+
+```
+GET /health
+X-Health-Token: your-secret-token
+```
+
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": { "status": "ok", "latency_ms": 1.2 },
+    "redis":    { "status": "ok", "latency_ms": 0.4 }
+  }
+}
+```
+
+### Degraded Response (503)
+
+When any check fails, the endpoint returns `503 Service Unavailable` regardless of the token:
+
+```json
+{
+  "status": "degraded",
+  "checks": {
+    "database": {
+      "status":     "degraded",
+      "latency_ms": 312.1,
+      "error":      "Connection refused"
+    }
+  }
+}
+```
+
+HTTP 503 makes this compatible with load balancer health checks that gate traffic on status codes.
+
+## Environment Variables
+
+```bash
+HEALTH_TOKEN=your-secret-token
+```
+
+If `HEALTH_TOKEN` is not set, the detailed response is never returned — the public scrubbed response is always served.
+
+<Callout type="warn" title="Set HEALTH_TOKEN in Production">
+Without `HEALTH_TOKEN`, there is no way to retrieve latency or error detail from the endpoint. Set it in your environment and store it alongside your other operational secrets.
+</Callout>
+
+## Built-In Checks
+
+Each check auto-registers when its module is active. Nothing needs to be wired manually.
+
+| Check name | Module required | What it checks |
+|---|---|---|
+| `database` | `vortos-persistence-dbal` | PostgreSQL — `SELECT 1` via DBAL `Connection` |
+| `mongodb` | `vortos-persistence-mongo` | MongoDB — `ping` command on the database |
+| `redis` | `vortos-cache` | Redis — `PING` command |
+| `kafka` | `vortos-messaging` | Kafka — metadata fetch from broker |
+
+If a module is not installed, its check is simply absent from the registry — no configuration required.
+
+## Writing a Custom Health Check
+
+Implement `HealthCheckInterface` and add `#[AsHealthCheck]`. The attribute auto-registers the check — no manual DI wiring.
+
+### HealthCheckInterface
+
+```php
+interface HealthCheckInterface
+{
+    public function name(): string;
+    public function check(): HealthResult;
+}
+```
+
+### HealthResult
+
+```php
+final class HealthResult
+{
+    public function __construct(
+        public readonly string  $name,
+        public readonly bool    $healthy,
+        public readonly float   $latencyMs,
+        public readonly ?string $error = null,
+    ) {}
+}
+```
+
+### Example
+
+```php title="src/Payment/Infrastructure/Health/PaymentGatewayHealthCheck.php"
+use Vortos\Foundation\Health\Attribute\AsHealthCheck;
+use Vortos\Foundation\Health\Contract\HealthCheckInterface;
+use Vortos\Foundation\Health\HealthResult;
+
+#[AsHealthCheck]
+final class PaymentGatewayHealthCheck implements HealthCheckInterface
+{
+    public function __construct(private readonly PaymentClient $client) {}
+
+    public function name(): string
+    {
+        return 'payment-gateway';
+    }
+
+    public function check(): HealthResult
+    {
+        $start = hrtime(true);
+        try {
+            $this->client->ping();
+            return new HealthResult(
+                name:      $this->name(),
+                healthy:   true,
+                latencyMs: (hrtime(true) - $start) / 1e6,
+            );
+        } catch (\Throwable $e) {
+            return new HealthResult(
+                name:      $this->name(),
+                healthy:   false,
+                latencyMs: (hrtime(true) - $start) / 1e6,
+                error:     $e->getMessage(),
+            );
+        }
+    }
+}
+```
+
+`#[AsHealthCheck]` is detected by `HealthCheckCompilerPass` at compile time. The check is registered in `HealthRegistry` automatically — no entry in `config/services.php` is needed.
+
+### Always Catch \Throwable
+
+Health checks run during a live request. An uncaught exception propagates as a 500, not a 503. Always wrap your check in `try/catch \Throwable` and return a degraded `HealthResult` — the endpoint will convert that to 503 correctly.
+
+## HealthRegistry
+
+`HealthRegistry` holds all registered checks and runs them on demand. You can inject it to run checks programmatically — for example, in a readiness gate before starting a worker:
+
+```php
+use Vortos\Health\HealthRegistry;
+
+final class WorkerBootstrap
+{
+    public function __construct(private readonly HealthRegistry $registry) {}
+
+    public function assertReady(): void
+    {
+        $results = $this->registry->run();
+
+        foreach ($results as $result) {
+            if (!$result->healthy) {
+                throw new \RuntimeException(
+                    "Dependency '{$result->name}' is not ready: {$result->error}"
+                );
+            }
+        }
+    }
+}
+```
+
+## Deployment Use
+
+```bash
+# Wait for readiness in a deploy script
+until curl -sf http://localhost/health; do
+  echo "Waiting for /health..."
+  sleep 2
+done
+echo "Application is healthy."
+```
+
+For staging and production, use the `X-Health-Token` header in your monitoring system to capture latency trends without exposing them publicly.

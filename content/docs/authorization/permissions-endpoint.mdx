@@ -1,0 +1,82 @@
+---
+title: Permissions Endpoint
+description: "GET /api/me/permissions — returns the current user's hierarchy-expanded roles for frontend consumption."
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Permissions Endpoint
+
+`GET /api/me/permissions` returns the authenticated user's roles, expanded through the role hierarchy. This endpoint powers `@vortos/permissions` on the frontend.
+
+```http
+GET /api/me/permissions
+Authorization: Bearer <token>
+```
+
+```json
+{
+  "permissions": ["ROLE_ADMIN", "ROLE_MANAGER", "ROLE_USER"]
+}
+```
+
+If the user is unauthenticated the response is `{ "permissions": [] }` — no error.
+
+## How it works
+
+The `PermissionsController` in the Authorization module injects `CurrentUserProvider` and `RoleVoter`. It calls `RoleVoter::expand()` to resolve the full inherited role list before returning it.
+
+```
+User JWT roles: ['ROLE_ADMIN']
+Role hierarchy: ROLE_ADMIN → [ROLE_MANAGER, ROLE_USER]
+Response:       ['ROLE_ADMIN', 'ROLE_MANAGER', 'ROLE_USER']
+```
+
+The hierarchy is defined in `config/authorization.php`:
+
+```php title="config/authorization.php"
+use Vortos\Authorization\DependencyInjection\VortosAuthorizationConfig;
+
+return static function (VortosAuthorizationConfig $config): void {
+    $config->roleHierarchy([
+        'ROLE_SUPER_ADMIN' => ['ROLE_ADMIN'],
+        'ROLE_ADMIN'       => ['ROLE_MANAGER', 'ROLE_SUPPORT'],
+        'ROLE_MANAGER'     => ['ROLE_USER'],
+        'ROLE_SUPPORT'     => ['ROLE_USER'],
+    ]);
+};
+```
+
+## Frontend usage
+
+Install `@vortos/permissions` and wrap your app with `PermissionsProvider`:
+
+```tsx title="src/App.tsx"
+import { PermissionsProvider } from '@vortos/permissions';
+
+export function App() {
+  return (
+    <PermissionsProvider endpoint="/api/me/permissions">
+      <Router />
+    </PermissionsProvider>
+  );
+}
+```
+
+Then use the hooks anywhere:
+
+```tsx
+import { usePermission, useAnyPermission, Can } from '@vortos/permissions';
+
+// Hook
+const isAdmin = usePermission('ROLE_ADMIN')
+
+// Component
+<Can permission="ROLE_MANAGER">
+  <ManageTeamButton />
+</Can>
+```
+
+<Callout type="info" title="Permissions vs Feature Flags">
+Permissions are permanent RBAC — they live as long as the user has that role and are never deleted. Feature flags are temporary rollout controls — they are deleted after full rollout. Both can gate UI, but they are separate concerns served by separate packages.
+</Callout>

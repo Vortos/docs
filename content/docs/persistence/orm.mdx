@@ -1,0 +1,237 @@
+---
+title: Doctrine ORM
+description: Zero-SQL aggregate persistence via Doctrine ORM — OrmAggregateRoot, OrmWriteRepository, OrmUnitOfWork, and automatic schema generation.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Doctrine ORM
+
+`vortos/vortos-persistence-orm` is an optional module that adds Doctrine ORM support to the write side. Extend `OrmAggregateRoot` and `OrmWriteRepository` — SQL, `toRow()`, and `fromRow()` disappear entirely.
+
+## When to Use ORM vs DBAL
+
+Both modules implement the same `WriteRepositoryInterface` and `UnitOfWorkInterface`. Choose based on your access patterns and team preferences.
+
+| | ORM | DBAL |
+|---|---|---|
+| SQL required | None — Doctrine generates it | Full control via QueryBuilder |
+| Aggregate mapping | Doctrine entity annotations | `toRow()` / `fromRow()` |
+| Schema management | `vortos:orm:schema --force` | Manual migrations |
+| Optimistic locking | `#[ORM\Version]` — Doctrine-managed | `version` column — base class managed |
+| Bulk operations | Not provided | `batchInsert`, `batchUpdate`, `batchUpsert` |
+| Custom queries | DQL or `createQueryBuilder()` | DBAL `createQueryBuilder()` |
+| Use when | Entity model fits cleanly, no heavy bulk writes | Full SQL control, bulk operations, complex projections |
+
+<Callout type="info" title="Domain AggregateRoot Is Untouched">
+`Vortos\Domain\Aggregate\AggregateRoot` has no Doctrine dependency. `OrmAggregateRoot` extends it — your domain model stays infrastructure-free.
+</Callout>
+
+## Installation
+
+```bash
+composer require vortos/vortos-persistence-orm
+```
+
+The package is auto-discovered. No manual registration is required.
+
+<Callout type="warn" title="Do Not Use Both ORM and DBAL on the Write Side">
+Do not install both `vortos-persistence-dbal` and `vortos-persistence-orm` in the same application. Both register `UnitOfWorkInterface` — the last registered package wins and the other's unit of work becomes unreachable.
+</Callout>
+
+## Environment Variables
+
+```bash
+DATABASE_URL=pgsql://postgres:secret@write_db:5432/myapp
+```
+
+Same `DATABASE_URL` as the DBAL module — `PersistenceOrmExtension` reads `vortos.persistence.write_dsn` which is set from `DATABASE_URL` by the core persistence module.
+
+## Services Registered
+
+```
+EntityManager::class          — shared, lazy
+EntityManagerInterface::class — aliased to EntityManager
+Connection::class             — DBAL connection extracted from EntityManager
+                                (shared with OutboxWriter for atomic writes)
+OrmUnitOfWork::class          — transaction boundary
+UnitOfWorkInterface::class    — aliased to OrmUnitOfWork
+```
+
+---
+
+## OrmAggregateRoot
+
+Extend `OrmAggregateRoot` instead of `AggregateRoot` for any aggregate persisted via Doctrine.
+
+`OrmAggregateRoot` is a `#[MappedSuperclass]` that adds a single `#[ORM\Version]` column — `ormVersion`. Doctrine increments this column automatically on every `flush()` and detects concurrent modifications via `UPDATE ... WHERE ormVersion = :expected`. The behaviour is identical to the DBAL module's optimistic locking, but fully managed by Doctrine.
+
+```php title="src/User/Domain/Entity/User.php"
+use Doctrine\ORM\Mapping as ORM;
+use Vortos\PersistenceOrm\Aggregate\OrmAggregateRoot;
+
+#[ORM\Entity]
+#[ORM\Table(name: 'users')]
+final class User extends OrmAggregateRoot
+{
+    #[ORM\Id]
+    #[ORM\Column(type: 'string', length: 36)]
+    private string $id;
+
+    #[ORM\Column(type: 'string', length: 255)]
+    private string $email;
+
+    private function __construct(UserId $id, string $email)
+    {
+        $this->id    = (string) $id;
+        $this->email = $email;
+    }
+
+    public static function register(UserId $id, string $email): self
+    {
+        $instance = new self($id, $email);
+        $instance->recordEvent(new UserRegistered((string) $id, $email));
+        return $instance;
+    }
+
+    public function getId(): UserId { return UserId::fromString($this->id); }
+    public function getEmail(): string { return $this->email; }
+}
+```
+
+Do not declare an `ormVersion` column in your entity — it is inherited from `OrmAggregateRoot`.
+
+---
+
+## OrmWriteRepository
+
+Extend `OrmWriteRepository` and implement one method: `entityClass()`. `findById()`, `save()`, and `delete()` are provided for free.
+
+```php title="src/User/Infrastructure/Repository/UserRepository.php"
+use Vortos\PersistenceOrm\Write\OrmWriteRepository;
+
+final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
+{
+    protected function entityClass(): string
+    {
+        return User::class;
+    }
+}
+```
+
+No `toRow()`, no `fromRow()`, no column map. Doctrine handles serialisation from the entity's `#[ORM\Column]` annotations.
+
+### Built-In Operations
+
+| Method | Behaviour |
+|---|---|
+| `findById(AggregateId $id)` | `EntityManager::find()` — returns `null` if not found |
+| `save(AggregateRoot $aggregate)` | `persist()` + `flush()` — Doctrine throws on version conflict |
+| `delete(AggregateRoot $aggregate)` | `remove()` + `flush()` |
+
+Both `save()` and `delete()` catch Doctrine's `OptimisticLockException` and rethrow it as `Vortos\Domain\Repository\Exception\OptimisticLockException` — the same exception your application code already handles from the DBAL module.
+
+### Custom Queries
+
+For queries beyond `findById()`, use the protected `em()` accessor:
+
+```php
+final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
+{
+    protected function entityClass(): string
+    {
+        return User::class;
+    }
+
+    public function findByEmail(string $email): ?User
+    {
+        return $this->em()->createQueryBuilder()
+            ->select('u')
+            ->from(User::class, 'u')
+            ->where('u.email = :email')
+            ->setParameter('email', $email)
+            ->getQuery()
+            ->getOneOrNullResult();
+    }
+}
+```
+
+---
+
+## OrmUnitOfWork
+
+`OrmUnitOfWork` implements `UnitOfWorkInterface` and wraps `EntityManager::wrapInTransaction()`. The API is identical to the DBAL `UnitOfWork` — no application code changes are needed when switching persistence backends.
+
+```php
+use Vortos\Persistence\Transaction\UnitOfWorkInterface;
+
+final class RegisterUserHandler
+{
+    public function __construct(
+        private readonly UnitOfWorkInterface     $unitOfWork,
+        private readonly UserRepositoryInterface $users,
+    ) {}
+
+    public function __invoke(RegisterUser $command): void
+    {
+        $this->unitOfWork->run(function () use ($command) {
+            $user = User::register(UserId::generate(), $command->email);
+            $this->users->save($user);
+        });
+    }
+}
+```
+
+<Callout type="info" title="CommandBus Manages the Transaction Automatically">
+The `CommandBus` wraps every handler in `UnitOfWork::run()` automatically via `TransactionalMiddleware`. Inject `UnitOfWorkInterface` directly only when you need explicit transaction boundaries outside of a command handler.
+</Callout>
+
+---
+
+## Schema Management
+
+`vortos:orm:schema` generates and applies DDL from your entity mappings.
+
+```bash
+# Preview the SQL without executing
+php vortos vortos:orm:schema --dump-sql
+
+# Apply schema changes to the database
+php vortos vortos:orm:schema --force
+
+# Preview the DROP statements
+php vortos vortos:orm:schema --dump-sql --drop
+
+# Drop all mapped tables (destructive)
+php vortos vortos:orm:schema --drop --force
+```
+
+### Typical Workflow
+
+```bash
+# 1. Add a new entity or column, then preview
+php vortos vortos:orm:schema --dump-sql
+
+# 2. Apply
+php vortos vortos:orm:schema --force
+```
+
+<Callout type="warn" title="--drop --force Is Destructive">
+`--drop --force` drops all tables mapped by Doctrine in one operation. Always run `--dump-sql --drop` first to see exactly what will be dropped before running against any environment with real data.
+</Callout>
+
+---
+
+## Smart Stubs
+
+`vortos:make:entity` and `vortos:make:write-repository` auto-detect whether `vortos-persistence-orm` is installed and generate the correct base class — no flags needed.
+
+```bash
+# Generates User extending OrmAggregateRoot (with #[ORM\Entity], #[ORM\Table], #[ORM\Id])
+php vortos vortos:make:entity User --context=User
+
+# Generates UserRepository extending OrmWriteRepository (with entityClass() only)
+php vortos vortos:make:write-repository User --context=User
+```
+
+When ORM is detected, the command prints `[ORM]` next to the command name in the output. When only DBAL is installed, the standard `AggregateRoot` / `DbalWriteRepository` stubs are generated instead.

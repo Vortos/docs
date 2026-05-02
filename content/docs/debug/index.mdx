@@ -1,0 +1,170 @@
+---
+title: Debug Commands
+description: vortos:debug:routes and vortos:debug:container — inspect registered routes and DI container services from the command line.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Debug Commands
+
+`vortos/vortos-debug` is an optional package that adds two diagnostic commands: `vortos:debug:routes` and `vortos:debug:container`. Both read the compiled container — what you see is exactly what is registered at runtime.
+
+## Installation
+
+```bash
+composer require vortos/vortos-debug --dev
+```
+
+The package is auto-discovered after installation — no manual registration needed.
+
+<Callout type="info" title="Development Dependency">
+Install as a `--dev` dependency. The debug package exposes internal service and route detail that should not be present in production builds.
+</Callout>
+
+---
+
+## vortos:debug:routes
+
+Lists all routes registered in the compiled `RouteCollection`.
+
+```bash
+php vortos vortos:debug:routes
+```
+
+Output is a table with one row per route. HTTP method badges are colour-coded (`GET` green, `POST` yellow, `PUT` blue, `DELETE` red, `PATCH` cyan). Columns: method, path, name, controller.
+
+```
+Method  Path                  Name              Controller
+──────  ────────────────────  ────────────────  ──────────────────────────────────────────────
+GET     /users/{id}           user.show         App\User\Http\UserController::show
+POST    /users                user.create       App\User\Http\UserController::create
+DELETE  /users/{id}           user.delete       App\User\Http\UserController::delete
+GET     /health               health            Vortos\Health\Http\HealthController::__invoke
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--filter=<string>` | Show only routes whose path or name contains `<string>` |
+| `--method=<METHOD>` | Show only routes matching the HTTP method (case-insensitive) |
+| `--full` | Show full class namespace in the controller column (truncated by default) |
+| `--json` | Output as JSON instead of a table |
+
+### Examples
+
+```bash
+# Filter by path or name substring
+php vortos vortos:debug:routes --filter=user
+
+# Filter by HTTP method
+php vortos vortos:debug:routes --method=POST
+
+# Show full namespace in controller column
+php vortos vortos:debug:routes --filter=user --full
+
+# Machine-readable output
+php vortos vortos:debug:routes --json
+```
+
+`--json` output:
+
+```json
+[
+  {
+    "name":       "user.show",
+    "path":       "/users/{id}",
+    "methods":    ["GET"],
+    "controller": "App\\User\\Http\\UserController::show"
+  }
+]
+```
+
+---
+
+## vortos:debug:container
+
+Lists all services registered in the compiled DI container.
+
+```bash
+php vortos vortos:debug:container
+```
+
+Output is a table with one row per service. Columns: service ID, public flag, shared flag, lazy flag.
+
+```
+Service ID                                              Public  Shared  Lazy
+──────────────────────────────────────────────────────  ──────  ──────  ────
+App\User\Infrastructure\Repository\UserRepository       yes     yes     no
+App\User\Application\RegisterUserHandler                no      yes     no
+Vortos\Cache\Adapter\RedisAdapter                       no      yes     yes
+Doctrine\DBAL\Connection                                yes     yes     yes
+```
+
+### Options
+
+| Option | Description |
+|---|---|
+| `--filter=<string>` | Show only services whose ID contains `<string>` |
+| `--tag=<tag>` | Show only services tagged with `<tag>` |
+| `--service=<id>` | Show full detail for a single service |
+| `--aliases` | Include alias entries (hidden by default) |
+| `--json` | Output as JSON instead of a table |
+
+### Examples
+
+```bash
+# Filter by class name substring
+php vortos vortos:debug:container --filter=Repository
+
+# List all services tagged as console commands
+php vortos vortos:debug:container --tag=console.command
+
+# Full detail for a single service — shows class, arguments, tags, aliases
+php vortos vortos:debug:container --service=App\\User\\Infrastructure\\Repository\\UserRepository
+
+# Include alias entries in the output
+php vortos vortos:debug:container --aliases
+
+# Machine-readable output
+php vortos vortos:debug:container --json
+```
+
+`--service` detail output:
+
+```
+Service: App\User\Infrastructure\Repository\UserRepository
+──────────────────────────────────────────────────────────
+  Class:    App\User\Infrastructure\Repository\UserRepository
+  Public:   yes
+  Shared:   yes
+  Lazy:     no
+  Tags:     (none)
+  Aliases:  UserRepositoryInterface
+  Arguments:
+    $connection → @Doctrine\DBAL\Connection
+```
+
+`--json` output (list mode):
+
+```json
+[
+  {
+    "id":     "App\\User\\Infrastructure\\Repository\\UserRepository",
+    "public": true,
+    "shared": true,
+    "lazy":   false,
+    "tags":   []
+  }
+]
+```
+
+---
+
+## Tips
+
+**Verify auto-registration.** After adding `#[AsHealthCheck]`, `#[AsCommandHandler]`, or any other attribute that triggers auto-registration, run `vortos:debug:container --filter=HealthCheck` to confirm the service is present and tagged correctly.
+
+**Find what is tagged.** `--tag=vortos.health_check` lists every health check registered in the container. Use this to audit which checks are active in a given environment.
+
+**Debug missing routes.** If a controller route is not responding, `vortos:debug:routes --filter=your-path` confirms whether the route was compiled at all. A missing route means the controller class is not tagged `vortos.api.controller` — check that `#[ApiController]` is present.

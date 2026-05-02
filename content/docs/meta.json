@@ -8,6 +8,9 @@
     "cqrs",
     "persistence",
     "cache",
-    "tracing"
+    "tracing",
+    "health-checks",
+    "debug",
+    "feature-flags"
   ]
 }

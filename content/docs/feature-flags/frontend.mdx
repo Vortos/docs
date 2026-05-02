@@ -1,0 +1,184 @@
+---
+title: Frontend Integration
+description: "@vortos/flags and @vortos/permissions — React hooks and components for feature flags and role-based permissions."
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Frontend Integration
+
+Feature flags and permissions are two separate npm packages. Both fetch once on boot — everything after that is local with no per-component network requests.
+
+| Package | Responsibility | Backend endpoint |
+|---|---|---|
+| `@vortos/flags` | Feature rollout | `GET /api/flags` |
+| `@vortos/permissions` | Role-based access | `GET /api/me/permissions` |
+
+## Installation
+
+```bash
+npm install @vortos/flags @vortos/permissions
+```
+
+## Setup
+
+Wrap your app once with both providers:
+
+```tsx title="src/App.tsx"
+import { FeatureFlagProvider } from '@vortos/flags';
+import { PermissionsProvider } from '@vortos/permissions';
+
+export function App() {
+  return (
+    <FeatureFlagProvider endpoint="/api/flags">
+      <PermissionsProvider endpoint="/api/me/permissions">
+        <Router />
+      </PermissionsProvider>
+    </FeatureFlagProvider>
+  );
+}
+```
+
+Order does not matter — the two providers are independent.
+
+## Feature Flags
+
+### Component
+
+```tsx
+// Render children only when the flag is on
+<FeatureFlag name="new-checkout">
+  <NewCheckout />
+</FeatureFlag>
+
+// With a fallback when the flag is off
+<FeatureFlag name="new-checkout" fallback={<OldCheckout />}>
+  <NewCheckout />
+</FeatureFlag>
+```
+
+### Hook
+
+```tsx
+const hasNewDashboard = useFlag('new-dashboard')
+
+if (!hasNewDashboard) return <Navigate to="/" />
+return <NewDashboard />
+```
+
+## Variants
+
+```tsx
+const layout = useVariant('pricing-layout') // 'control' | 'cards' | 'table'
+
+if (layout === 'cards') return <CardPricing />
+if (layout === 'table') return <TablePricing />
+return <DefaultPricing />
+```
+
+`useVariant` returns `null` if the flag does not exist or the user has no assigned variant.
+
+## Permissions
+
+Import from `@vortos/permissions`:
+
+```tsx
+import { Can, usePermission, usePermissions, useAnyPermission, useAllPermissions } from '@vortos/permissions';
+```
+
+Permissions are the user's expanded roles returned by `GET /api/me/permissions`. Role hierarchy is applied server-side — if `ROLE_ADMIN` inherits `ROLE_USER`, both are in the list.
+
+### Component
+
+```tsx
+// Render children only when role is granted
+<Can permission="ROLE_ADMIN">
+  <AdminPanel />
+</Can>
+
+// With a fallback
+<Can permission="ROLE_ADMIN" fallback={<p>Access denied.</p>}>
+  <AdminPanel />
+</Can>
+```
+
+### Hooks
+
+```tsx
+// Single role check
+const isAdmin = usePermission('ROLE_ADMIN')
+
+// ALL listed roles must be present
+const canExport = useAllPermissions('ROLE_USER', 'ROLE_VERIFIED')
+
+// ANY of the listed roles is enough
+const isPrivileged = useAnyPermission('ROLE_ADMIN', 'ROLE_SUPER_ADMIN')
+
+// Full expanded role list
+const roles = usePermissions() // string[]
+```
+
+## Combining Flags and Permissions
+
+A feature must be rolled out **and** the user must have the role — both must pass.
+
+```tsx
+import { useFlag } from '@vortos/flags';
+import { usePermission } from '@vortos/permissions';
+
+const isRolledOut = useFlag('analytics-tab')
+const hasAccess   = usePermission('ROLE_ANALYST')
+
+{isRolledOut && hasAccess && <AnalyticsNav />}
+```
+
+In a route guard:
+
+```tsx
+function AnalyticsRoute() {
+  const isRolledOut = useFlag('analytics-tab')
+  const hasAccess   = usePermission('ROLE_ANALYST')
+
+  if (!isRolledOut || !hasAccess) return <Navigate to="/" />
+  return <Analytics />
+}
+```
+
+<Callout type="info" title="Why both?">
+Flags control rollout breadth — temporary, deleted after full rollout. Permissions control access rights — permanent RBAC, never deleted. Both must be true for a user to see a feature.
+</Callout>
+
+## Provider Props
+
+### FeatureFlagProvider
+
+| Prop | Default | Description |
+|---|---|---|
+| `endpoint` | `/api/flags` | URL to fetch flag state from |
+| `headers` | `{}` | Extra request headers |
+
+### PermissionsProvider
+
+| Prop | Default | Description |
+|---|---|---|
+| `endpoint` | `/api/me/permissions` | URL to fetch permissions from |
+| `headers` | `{}` | Extra request headers |
+
+## With Auth Headers
+
+```tsx
+import { FeatureFlagProvider } from '@vortos/flags';
+import { PermissionsProvider } from '@vortos/permissions';
+
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  headers={{ Authorization: `Bearer ${token}` }}
+>
+  <PermissionsProvider
+    endpoint="/api/me/permissions"
+    headers={{ Authorization: `Bearer ${token}` }}
+  >
+    <Router />
+  </PermissionsProvider>
+</FeatureFlagProvider>
+```

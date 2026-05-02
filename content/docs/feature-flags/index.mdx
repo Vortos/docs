@@ -1,0 +1,155 @@
+---
+title: Feature Flags
+description: Percentage rollout, user targeting, attribute rules, kill switch — database-backed with Redis cache.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Feature Flags
+
+`vortos/vortos-feature-flags` lets you ship every feature to production and control visibility through configuration — no redeploy, no downtime, instant kill switch.
+
+Feature flags are **temporary rollout gates**: they exist during a feature's rollout and are removed once it is fully live. For permanent capability grants (RBAC, subscription tiers), see [Authorization](/docs/authorization).
+
+## Architecture
+
+```
+php vortos vortos:flags:create new-checkout
+php vortos vortos:flags:enable new-checkout --rollout=25
+         ↓ stored in DB
+
+Request → FlagRegistry::isEnabled('new-checkout', $context)
+         ↓ Redis cache (60s TTL) → DB on miss
+         ↓ FlagEvaluator walks rules in order
+         → true/false
+```
+
+Flags are stored in the database and cached in Redis with a 60-second TTL. Cold misses hit the DB; everything else is a sub-millisecond cache read.
+
+## Installation
+
+```bash
+composer require vortos/vortos-feature-flags
+```
+
+Run the module migration to create the flags tables:
+
+```bash
+php vortos vortos:migrate
+```
+
+<Callout type="info" title="Migration source">
+The migration file is `20240101000000_create_feature_flags.sql` located in the module's `Resources/migrations/` directory. `vortos:migrate` picks it up automatically.
+</Callout>
+
+## Quick Start
+
+```bash
+# 1. Create a flag (disabled by default)
+php vortos vortos:flags:create new-checkout
+
+# 2. Enable for 10% of users
+php vortos vortos:flags:enable new-checkout --rollout=10
+
+# 3. Ramp to full rollout
+php vortos vortos:flags:enable new-checkout --rollout=100
+```
+
+## Checking Flags in Code
+
+Inject `FlagRegistry` anywhere — controllers, services, query handlers:
+
+```php
+use Vortos\FeatureFlags\FlagRegistry;
+use Vortos\FeatureFlags\FlagContext;
+
+final class CheckoutController
+{
+    public function __construct(private readonly FlagRegistry $flags) {}
+
+    public function index(): Response
+    {
+        // Anonymous check — no user context
+        if ($this->flags->isEnabled('new-checkout')) {
+            return $this->render('checkout/new.html.twig');
+        }
+
+        return $this->render('checkout/legacy.html.twig');
+    }
+}
+```
+
+Pass a `FlagContext` to enable user targeting and attribute rules:
+
+```php
+$context = new FlagContext(
+    userId: $user->getId(),
+    attributes: ['plan' => $user->plan, 'role' => $user->role],
+);
+
+$this->flags->isEnabled('new-checkout', $context);
+```
+
+For A/B variants:
+
+```php
+$variant = $this->flags->variant('cta-button', $context);
+// returns 'control' | 'blue' | 'green'
+```
+
+## `#[RequiresFlag]` on Controllers
+
+Annotate a controller to gate the entire route behind a flag. Returns 404 if the flag is off — no extra code in the action:
+
+```php
+use Vortos\FeatureFlags\Attribute\RequiresFlag;
+
+#[RequiresFlag('new-dashboard')]
+final class NewDashboardController
+{
+    public function __invoke(): Response
+    {
+        // Only reachable when 'new-dashboard' is enabled
+        return $this->render('dashboard/new.html.twig');
+    }
+}
+```
+
+<Callout type="info" title="Context in attribute checks">
+`#[RequiresFlag]` uses the registered `FlagContextResolver` to build the context automatically. Wire up a resolver to make targeting work here too — see below.
+</Callout>
+
+## FlagContextResolver
+
+By default, all requests are evaluated as anonymous (no `userId`, no attributes). Override `FlagContextResolverInterface` to inject real user data — this is required for user targeting and attribute rules to work:
+
+```php title="src/Infrastructure/Flags/UserFlagContextResolver.php"
+use Vortos\FeatureFlags\FlagContext;
+use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
+use Symfony\Component\HttpFoundation\Request;
+
+final class UserFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly CurrentUserProvider $auth) {}
+
+    public function resolve(Request $request): FlagContext
+    {
+        $user = $this->auth->current();
+
+        if (!$user->isAuthenticated()) {
+            return new FlagContext();
+        }
+
+        return new FlagContext(
+            userId: (string) $user->getId(),
+            attributes: ['plan' => $user->plan, 'role' => $user->role],
+        );
+    }
+}
+```
+
+```php title="config/services.php"
+$services->alias(FlagContextResolverInterface::class, UserFlagContextResolver::class);
+```
+
+Register once — used by both `FlagRegistry::isEnabled()` (when no context is passed) and `#[RequiresFlag]`.

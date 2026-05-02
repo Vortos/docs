@@ -6,6 +6,7 @@
     "read-repositories",
     "unit-of-work",
     "dbal",
+    "orm",
     "mongodb",
     "optimistic-locking",
     "pagination",

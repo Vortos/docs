@@ -4,6 +4,7 @@
     "index",
     "policies",
     "role-voter",
+    "permissions-endpoint",
     "middleware",
     "policy-engine",
     "scoped",

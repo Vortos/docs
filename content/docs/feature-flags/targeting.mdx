@@ -1,0 +1,125 @@
+---
+title: Targeting Rules
+description: Percentage rollout, user whitelists, attribute-based rules, and A/B variants.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Targeting Rules
+
+Rules are evaluated in insertion order — **first match wins**. If no rule matches, the flag returns `false` even if it is enabled. A flag with no rules and status `enabled` is `true` for everyone.
+
+```
+FlagEvaluator:
+  1. Flag disabled?         → false (short-circuit, no rules evaluated)
+  2. Walk rules in order
+       rule matches?        → true  (stop)
+       rule does not match? → next rule
+  3. No rule matched        → false
+```
+
+## Rule Types
+
+### Users Whitelist
+
+Specific user IDs always receive the flag, regardless of other rules. Use for internal QA, beta testers, or forcing a flag on for your own account.
+
+```bash
+php vortos vortos:flags:add-rule new-checkout --type=users --users=user-123,user-456
+```
+
+```php
+$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-123')); // true
+$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-999')); // false (no other rules match)
+```
+
+<Callout type="info" title="Anonymous users">
+Requests with no `userId` in `FlagContext` never match a users whitelist rule. Pass an empty `new FlagContext()` and the evaluation falls through to the next rule.
+</Callout>
+
+### Percentage Rollout
+
+Assigns each user deterministically to a bucket via `hash(flagName + userId) % 100`. The same user always gets the same result for the same flag — no session state required.
+
+```bash
+php vortos vortos:flags:enable new-checkout --rollout=25
+# equivalent to:
+php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=25
+```
+
+```php
+// Same user always gets the same result
+$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-abc')); // deterministic
+```
+
+<Callout type="info" title="Anonymous users and percentage rules">
+Users with no `userId` always fall outside the percentage bucket. Percentage rollout requires a `userId` in `FlagContext` — wire up a `FlagContextResolver` to make this work automatically.
+</Callout>
+
+### Attribute Rules
+
+Target by any attribute in `FlagContext::attributes`. Attributes are arbitrary key/value pairs you populate in your `FlagContextResolver`.
+
+| Operator | Behaviour |
+|---|---|
+| `equals` | Attribute value exactly matches the rule value |
+| `not_equals` | Attribute value does not match the rule value |
+| `in` | Attribute value is in the comma-separated list |
+| `not_in` | Attribute value is not in the comma-separated list |
+| `contains` | Attribute value contains the rule value as a substring |
+
+```bash
+# Enterprise users only
+php vortos vortos:flags:add-rule feature --type=attribute --attribute=plan --operator=equals --value=enterprise
+
+# Everyone except free tier
+php vortos vortos:flags:add-rule feature --type=attribute --attribute=plan --operator=not_equals --value=free
+
+# Specific regions
+php vortos vortos:flags:add-rule feature --type=attribute --attribute=region --operator=in --value=eu-west,eu-central
+
+# Email domain targeting
+php vortos vortos:flags:add-rule feature --type=attribute --attribute=email --operator=contains --value=@acme.com
+```
+
+## Rule Chain Example
+
+Combine rule types to build a staged rollout: enterprise customers and beta users get full access, then 10% of everyone else.
+
+```bash
+php vortos vortos:flags:add-rule new-checkout --type=attribute --attribute=plan --operator=equals --value=enterprise
+php vortos vortos:flags:add-rule new-checkout --type=users --users=beta-user-1,beta-user-2
+php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=10
+```
+
+```
+Evaluation order:
+  1. plan = enterprise  → true  (enterprise users always in)
+  2. users whitelist    → true  (beta users always in)
+  3. percentage 10%     → hash  (10% of all other users)
+  4. fallback           → false
+```
+
+## Variants (A/B Testing)
+
+Variants extend percentage rollout across multiple buckets. Each variant is assigned a weight; users are deterministically bucketed into exactly one variant.
+
+<Callout type="info" title="No variant command yet">
+Variants are configured directly in storage. The `vortos:flags:add-rule` command does not support variants yet. Use the admin API or set them directly in the `feature_flag_variants` table.
+</Callout>
+
+```php title="Backend"
+// Flag 'cta-button' has variants: control 34%, blue 33%, green 33%
+$variant = $flags->variant('cta-button', $context);
+// 'control' | 'blue' | 'green' — same user always gets the same variant
+```
+
+```tsx title="Frontend"
+const variant = useVariant('cta-button') // 'control' | 'blue' | 'green'
+
+if (variant === 'blue')  return <BlueCta />
+if (variant === 'green') return <GreenCta />
+return <DefaultCta />
+```
+
+Variant bucketing uses the same `hash(flagName + userId) % 100` mechanism as percentage rollout. A user in variant `blue` stays in `blue` across sessions and deployments as long as the variant weights don't change.

@@ -25,6 +25,9 @@ $roles->hasAny($identity, ['ROLE_ADMIN', 'ROLE_SUPER_ADMIN'])  // bool
 
 // User must have ALL of these roles (or inherit all via hierarchy)
 $roles->hasAll($identity, ['ROLE_USER', 'ROLE_VERIFIED'])      // bool
+
+// Return all roles the identity holds, including inherited ones
+$roles->expand($identity)  // string[]  e.g. ['ROLE_ADMIN', 'ROLE_USER']
 ```
 
 ## Role Hierarchy
