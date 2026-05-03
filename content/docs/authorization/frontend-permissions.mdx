@@ -1,0 +1,372 @@
+---
+title: Frontend Permissions
+description: "@vortos/permissions — React provider, hooks, route guards, cache state, and enterprise-safe permission rendering."
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Frontend Permissions
+
+`@vortos/permissions` gives React applications a local, observable copy of the current user's permissions. The backend still decides what the user is allowed to do; the package only helps the frontend render the correct UI without fetching permissions in every component.
+
+```txt
+Backend decides.
+Frontend remembers.
+Components ask locally.
+Backend still enforces.
+```
+
+<Callout type="warn" title="Security boundary">
+Frontend permission checks are UX only. Every protected API route, command, query, and controller must still enforce authorization on the backend.
+</Callout>
+
+## Installation
+
+```bash
+npm install @vortos/permissions
+```
+
+## Basic Setup
+
+Wrap the application once near the router:
+
+```tsx title="src/App.tsx"
+import { PermissionsProvider } from '@vortos/permissions';
+
+export function App() {
+  return (
+    <PermissionsProvider endpoint="/api/me/permissions">
+      <Router />
+    </PermissionsProvider>
+  );
+}
+```
+
+The endpoint is configurable. `/api/me/permissions` is only the default convention used by Vortos.
+
+```tsx
+<PermissionsProvider endpoint="/internal/session/permissions">
+  <App />
+</PermissionsProvider>
+```
+
+Any route is valid if it returns the expected contract:
+
+```json
+{
+  "permissions": ["athletes.update.own", "reports.read.any"]
+}
+```
+
+## Response Contract
+
+The minimal response is a list of expanded permissions:
+
+```json
+{
+  "permissions": ["ROLE_ADMIN", "ROLE_MANAGER", "athletes.update.any"]
+}
+```
+
+Enterprise applications can return metadata too:
+
+```json
+{
+  "permissions": ["athletes.update.own"],
+  "roles": ["ROLE_COACH"],
+  "scopes": {
+    "federationId": "fed_123",
+    "teamIds": ["team_7", "team_9"]
+  },
+  "version": "perm_2026_05_04_001"
+}
+```
+
+`permissions` drives UI checks. `roles`, `scopes`, and `version` are exposed for debugging, audit displays, tenant-aware screens, and observability.
+
+## Simple Hooks
+
+The original hooks remain simple and backward-compatible:
+
+```tsx
+import {
+  usePermission,
+  usePermissions,
+  useAnyPermission,
+  useAllPermissions,
+} from '@vortos/permissions';
+
+const canEdit = usePermission('athletes.update.own');
+const permissions = usePermissions();
+const canOpenAdmin = useAnyPermission('ROLE_ADMIN', 'ROLE_SUPER_ADMIN');
+const canSeeAnalytics = useAllPermissions('reports.read.any', 'analytics.view.any');
+```
+
+Use these when the component only needs a boolean or the raw permission list.
+
+## Stateful Hooks
+
+Large applications need to know whether permission data is loading, stale, refreshing, or failed. Use `usePermissionsState()` when the component needs the full state:
+
+```tsx
+import { usePermissionsState } from '@vortos/permissions';
+
+function PermissionDebugPanel() {
+  const {
+    permissions,
+    roles,
+    scopes,
+    version,
+    loading,
+    refreshing,
+    stale,
+    error,
+    refetch,
+    has,
+    hasAny,
+    hasAll,
+  } = usePermissionsState();
+
+  if (loading) return <Spinner />;
+  if (error) return <RetryPanel error={error} onRetry={refetch} />;
+
+  return (
+    <section>
+      <p>Version: {version ?? 'unknown'}</p>
+      <p>Stale: {stale ? 'yes' : 'no'}</p>
+      <button disabled={refreshing} onClick={() => refetch()}>
+        Refresh permissions
+      </button>
+    </section>
+  );
+}
+```
+
+For one permission plus state:
+
+```tsx
+import { usePermissionState } from '@vortos/permissions';
+
+function DeleteButton() {
+  const { allowed, loading, error, refetch } = usePermissionState('posts.delete.any');
+
+  if (loading) return <Button disabled>Loading</Button>;
+  if (error) return <Button onClick={() => refetch()}>Retry</Button>;
+
+  return <Button disabled={!allowed}>Delete</Button>;
+}
+```
+
+## Rendering With `Can`
+
+`Can` keeps JSX readable for buttons, menu items, cards, and table actions:
+
+```tsx
+import { Can } from '@vortos/permissions';
+
+<Can permission="posts.delete.any">
+  <DeletePostButton />
+</Can>
+```
+
+Use a fallback when the user should see an alternate UI:
+
+```tsx
+<Can permission="billing.manage" fallback={<ReadOnlyBillingNotice />}>
+  <BillingSettings />
+</Can>
+```
+
+Enterprise applications often prefer disabled actions instead of hidden actions because disabled controls explain that the action exists but is unavailable:
+
+```tsx
+<Can
+  permission="invoices.refund.any"
+  fallbackMode="disable"
+  deniedReason="You need the invoices.refund.any permission."
+>
+  <button>Refund invoice</button>
+</Can>
+```
+
+Use `fallbackMode="skeleton"` when the page layout should stay stable during loading or denial:
+
+```tsx
+<Can
+  permission="analytics.view.any"
+  fallbackMode="skeleton"
+  loadingFallback={<AnalyticsSkeleton />}
+  fallback={<AnalyticsSkeleton />}
+>
+  <AnalyticsDashboard />
+</Can>
+```
+
+## Route Guards
+
+Use `RequirePermission` to guard a route subtree or a whole page:
+
+```tsx
+import { RequirePermission } from '@vortos/permissions';
+
+export function AdminRoute() {
+  return (
+    <RequirePermission
+      permission="admin.dashboard.view"
+      loadingFallback={<PageSpinner />}
+      fallback={<Navigate to="/" replace />}
+    >
+      <AdminDashboard />
+    </RequirePermission>
+  );
+}
+```
+
+This is a frontend route guard only. The backend route behind `AdminDashboard` must still check the same permission.
+
+## Auth Headers
+
+Headers are part of the provider's refetch identity. If the token changes, the provider refetches:
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  headers={{ Authorization: `Bearer ${token}` }}
+>
+  <Router />
+</PermissionsProvider>
+```
+
+This matters after login, logout, tenant switch, role update, or token refresh. Without header-aware refetching, the browser can keep showing the previous user's permissions.
+
+## Refreshing And Staleness
+
+Permissions are remote configuration. They should be cached locally, but the cache state must be observable, refreshable, and safely stale.
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  headers={{ Authorization: `Bearer ${token}` }}
+  staleTime={30_000}
+  refreshInterval={60_000}
+  refetchOnWindowFocus
+>
+  <Router />
+</PermissionsProvider>
+```
+
+| Prop | What it does |
+|---|---|
+| `staleTime` | Marks data stale after the configured number of milliseconds |
+| `refreshInterval` | Polls the endpoint on an interval |
+| `refetchOnWindowFocus` | Refetches when the browser window becomes active and data is stale |
+| `refetch` | Manual refresh function exposed by `usePermissionsState()` |
+
+Polling is usually enough for permissions. Real-time permission updates are rarely necessary unless admins expect open browser tabs to change immediately after a role edit.
+
+## Request Safety
+
+The provider cancels in-flight requests with `AbortController` when the endpoint, headers, or component lifecycle changes. That prevents older requests from overwriting newer permission state.
+
+Retries are optional:
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  retries={2}
+  retryDelayMs={500}
+>
+  <Router />
+</PermissionsProvider>
+```
+
+The retry schedule is linear:
+
+```txt
+try immediately
+retry after 500ms
+retry after 1000ms
+then fail
+```
+
+## Session Cache
+
+Use session cache to speed up app boot while a fresh request runs:
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  persist
+  cacheKey={`permissions:${userId}:${tenantId}`}
+>
+  <Router />
+</PermissionsProvider>
+```
+
+Always include user and tenant identity in the cache key:
+
+```txt
+permissions:${userId}:${tenantId}
+```
+
+Without this, one user's cached permissions can appear briefly after another user logs in on the same browser.
+
+## SSR And Initial Data
+
+Server-rendered apps can pass initial permissions to avoid first-paint flicker:
+
+```tsx
+<PermissionsProvider
+  initialPermissions={serverPermissions}
+  initialRoles={serverRoles}
+  initialScopes={serverScopes}
+  initialVersion={serverPermissionVersion}
+>
+  <App />
+</PermissionsProvider>
+```
+
+The provider still refetches on the client after mount, so server data is only the initial state.
+
+## Observability
+
+Use `onError` and `onUpdate` to connect permission state to logging and analytics:
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  onError={(error) => logger.capture(error)}
+  onUpdate={(state) => {
+    analytics.track('permissions.updated', {
+      count: state.permissions.length,
+      version: state.version,
+      stale: state.stale,
+    });
+  }}
+>
+  <Router />
+</PermissionsProvider>
+```
+
+This is useful in enterprise apps because permission bugs are usually environment-specific: tenant, role hierarchy, stale token, or backend deployment mismatch.
+
+## Recommended Production Setup
+
+```tsx
+<PermissionsProvider
+  endpoint="/api/me/permissions"
+  headers={{ Authorization: `Bearer ${token}` }}
+  staleTime={30_000}
+  refreshInterval={60_000}
+  refetchOnWindowFocus
+  retries={2}
+  retryDelayMs={500}
+  persist
+  cacheKey={`permissions:${userId}:${tenantId}`}
+  onError={(error) => logger.capture(error)}
+>
+  <Router />
+</PermissionsProvider>
+```
+
+This gives you local reads, observable cache state, auth-aware refreshes, request cancellation, retry behavior, and safe tenant-aware cache persistence.

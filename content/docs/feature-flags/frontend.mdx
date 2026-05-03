@@ -1,184 +1,444 @@
 ---
 title: Frontend Integration
-description: "@vortos/flags and @vortos/permissions — React hooks and components for feature flags and role-based permissions."
+description: "@vortos/flags — React provider, hooks, payloads, variants, targeting context, exposure tracking, and enterprise-safe refresh behavior."
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Frontend Integration
 
-Feature flags and permissions are two separate npm packages. Both fetch once on boot — everything after that is local with no per-component network requests.
+`@vortos/flags` gives React applications a local, observable copy of the current user's feature flag state. The backend evaluates rollout rules; the frontend reads the result from React context.
 
-| Package | Responsibility | Backend endpoint |
-|---|---|---|
-| `@vortos/flags` | Feature rollout | `GET /api/flags` |
-| `@vortos/permissions` | Role-based access | `GET /api/me/permissions` |
-
-## Installation
-
-```bash
-npm install @vortos/flags @vortos/permissions
+```txt
+Backend evaluates.
+Frontend remembers.
+Components ask locally.
+Backend can change rollout without redeploying frontend.
 ```
 
-## Setup
+Feature flags answer: **should this product feature be visible or enabled right now?**
 
-Wrap your app once with both providers:
+Permissions answer: **is this user allowed to perform this action?**
 
-```tsx title="src/App.tsx"
-import { FeatureFlagProvider } from '@vortos/flags';
-import { PermissionsProvider } from '@vortos/permissions';
-
-export function App() {
-  return (
-    <FeatureFlagProvider endpoint="/api/flags">
-      <PermissionsProvider endpoint="/api/me/permissions">
-        <Router />
-      </PermissionsProvider>
-    </FeatureFlagProvider>
-  );
-}
-```
-
-Order does not matter — the two providers are independent.
-
-## Feature Flags
-
-### Component
-
-```tsx
-// Render children only when the flag is on
-<FeatureFlag name="new-checkout">
-  <NewCheckout />
-</FeatureFlag>
-
-// With a fallback when the flag is off
-<FeatureFlag name="new-checkout" fallback={<OldCheckout />}>
-  <NewCheckout />
-</FeatureFlag>
-```
-
-### Hook
-
-```tsx
-const hasNewDashboard = useFlag('new-dashboard')
-
-if (!hasNewDashboard) return <Navigate to="/" />
-return <NewDashboard />
-```
-
-## Variants
-
-```tsx
-const layout = useVariant('pricing-layout') // 'control' | 'cards' | 'table'
-
-if (layout === 'cards') return <CardPricing />
-if (layout === 'table') return <TablePricing />
-return <DefaultPricing />
-```
-
-`useVariant` returns `null` if the flag does not exist or the user has no assigned variant.
-
-## Permissions
-
-Import from `@vortos/permissions`:
-
-```tsx
-import { Can, usePermission, usePermissions, useAnyPermission, useAllPermissions } from '@vortos/permissions';
-```
-
-Permissions are the user's expanded roles returned by `GET /api/me/permissions`. Role hierarchy is applied server-side — if `ROLE_ADMIN` inherits `ROLE_USER`, both are in the list.
-
-### Component
-
-```tsx
-// Render children only when role is granted
-<Can permission="ROLE_ADMIN">
-  <AdminPanel />
-</Can>
-
-// With a fallback
-<Can permission="ROLE_ADMIN" fallback={<p>Access denied.</p>}>
-  <AdminPanel />
-</Can>
-```
-
-### Hooks
-
-```tsx
-// Single role check
-const isAdmin = usePermission('ROLE_ADMIN')
-
-// ALL listed roles must be present
-const canExport = useAllPermissions('ROLE_USER', 'ROLE_VERIFIED')
-
-// ANY of the listed roles is enough
-const isPrivileged = useAnyPermission('ROLE_ADMIN', 'ROLE_SUPER_ADMIN')
-
-// Full expanded role list
-const roles = usePermissions() // string[]
-```
-
-## Combining Flags and Permissions
-
-A feature must be rolled out **and** the user must have the role — both must pass.
+Use both when a feature requires rollout and authorization:
 
 ```tsx
 import { useFlag } from '@vortos/flags';
 import { usePermission } from '@vortos/permissions';
 
-const isRolledOut = useFlag('analytics-tab')
-const hasAccess   = usePermission('ROLE_ANALYST')
+const rolledOut = useFlag('analytics-tab');
+const allowed = usePermission('analytics.view.any');
 
-{isRolledOut && hasAccess && <AnalyticsNav />}
+return rolledOut && allowed ? <AnalyticsNav /> : null;
 ```
 
-In a route guard:
+## Installation
 
-```tsx
-function AnalyticsRoute() {
-  const isRolledOut = useFlag('analytics-tab')
-  const hasAccess   = usePermission('ROLE_ANALYST')
+```bash
+npm install @vortos/flags
+```
 
-  if (!isRolledOut || !hasAccess) return <Navigate to="/" />
-  return <Analytics />
+## Basic Setup
+
+Wrap the application once near the router:
+
+```tsx title="src/App.tsx"
+import { FeatureFlagProvider } from '@vortos/flags';
+
+export function App() {
+  return (
+    <FeatureFlagProvider endpoint="/api/flags">
+      <Router />
+    </FeatureFlagProvider>
+  );
 }
 ```
 
-<Callout type="info" title="Why both?">
-Flags control rollout breadth — temporary, deleted after full rollout. Permissions control access rights — permanent RBAC, never deleted. Both must be true for a user to see a feature.
-</Callout>
-
-## Provider Props
-
-### FeatureFlagProvider
-
-| Prop | Default | Description |
-|---|---|---|
-| `endpoint` | `/api/flags` | URL to fetch flag state from |
-| `headers` | `{}` | Extra request headers |
-
-### PermissionsProvider
-
-| Prop | Default | Description |
-|---|---|---|
-| `endpoint` | `/api/me/permissions` | URL to fetch permissions from |
-| `headers` | `{}` | Extra request headers |
-
-## With Auth Headers
+The endpoint is configurable. `/api/flags` is only the default convention.
 
 ```tsx
-import { FeatureFlagProvider } from '@vortos/flags';
-import { PermissionsProvider } from '@vortos/permissions';
+<FeatureFlagProvider endpoint="/internal/frontend/flags">
+  <App />
+</FeatureFlagProvider>
+```
 
+Any route is valid if it returns the expected contract.
+
+## Response Contract
+
+The minimal response contains enabled flags:
+
+```json
+{
+  "flags": ["new-dashboard", "analytics-tab"]
+}
+```
+
+Variants support experiments and gradual UI changes:
+
+```json
+{
+  "flags": ["new-checkout"],
+  "variants": {
+    "checkout-layout": "variant-b"
+  }
+}
+```
+
+Payloads carry remote configuration:
+
+```json
+{
+  "flags": ["new-dashboard"],
+  "variants": {
+    "checkout-layout": "variant-b"
+  },
+  "payloads": {
+    "new-dashboard": {
+      "maxWidgets": 8,
+      "layout": "compact"
+    }
+  },
+  "version": "flags_2026_05_04_001"
+}
+```
+
+Use booleans for rollout, variants for A/B choices, and payloads for small product configuration values. Do not put secrets in payloads because they are delivered to the browser.
+
+## Simple Hooks
+
+The original simple APIs remain backward-compatible:
+
+```tsx
+import { FeatureFlag, useFlag, useVariant } from '@vortos/flags';
+
+const enabled = useFlag('new-dashboard');
+const variant = useVariant('checkout-layout', 'control');
+```
+
+Use `FeatureFlag` for simple rendering:
+
+```tsx
+<FeatureFlag name="new-checkout" fallback={<OldCheckout />}>
+  <NewCheckout />
+</FeatureFlag>
+```
+
+## Stateful Hooks
+
+Large applications need to show loading, stale, refreshing, and error states. Use `useFlagState()` when the component needs operational state:
+
+```tsx
+import { useFlagState } from '@vortos/flags';
+
+function DashboardEntry() {
+  const { enabled, loading, error, stale, refetch } = useFlagState('new-dashboard');
+
+  if (loading) return <DashboardSkeleton />;
+  if (error) return <RetryPanel error={error} onRetry={refetch} />;
+
+  return enabled ? <NewDashboard stale={stale} /> : <OldDashboard />;
+}
+```
+
+Use `useFlagContext()` for global diagnostics:
+
+```tsx
+import { useFlagContext } from '@vortos/flags';
+
+function FlagDebugPanel() {
+  const { flags, variants, payloads, version, refreshing, refetch } = useFlagContext();
+
+  return (
+    <section>
+      <p>Version: {version ?? 'unknown'}</p>
+      <p>Flags: {flags.length}</p>
+      <button disabled={refreshing} onClick={() => refetch()}>
+        Refresh flags
+      </button>
+    </section>
+  );
+}
+```
+
+## Payloads
+
+Payloads are useful when a feature needs configuration, not only on/off state:
+
+```tsx
+import { useFlagPayload } from '@vortos/flags';
+
+type DashboardPayload = {
+  maxWidgets: number;
+  layout: 'compact' | 'comfortable';
+};
+
+const config = useFlagPayload<DashboardPayload>('new-dashboard', {
+  maxWidgets: 4,
+  layout: 'comfortable',
+});
+
+return <Dashboard maxWidgets={config.maxWidgets} layout={config.layout} />;
+```
+
+Payloads should be small, public, and safe to cache. They are not a replacement for backend authorization or private configuration.
+
+## Variants
+
+Use variants for experiments and cohort-specific UI:
+
+```tsx
+const variant = useVariant('checkout-layout', 'control');
+
+if (variant === 'variant-b') return <CheckoutB />;
+return <CheckoutA />;
+```
+
+Validate allowed variants when the app only supports known values:
+
+```tsx
+const variant = useVariant('checkout-layout', {
+  default: 'control',
+  allowed: ['control', 'variant-a', 'variant-b'],
+});
+```
+
+If the backend returns an unknown variant, the hook returns the configured default. This prevents a backend typo from breaking the frontend render path.
+
+For full state plus exposure tracking:
+
+```tsx
+const { variant, loading, error, trackExposure } = useVariantState(
+  'checkout-layout',
+  {
+    default: 'control',
+    allowed: ['control', 'variant-a', 'variant-b'],
+    trackExposure: true,
+  }
+);
+```
+
+## Exposure Tracking
+
+A/B tests are only useful when the system records what the user actually saw. `@vortos/flags` can report exposures in two ways.
+
+Use a callback:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  onExposure={(event) => {
+    analytics.track('flag.exposure', event);
+  }}
+>
+  <App />
+</FeatureFlagProvider>
+```
+
+Or post exposure events to an endpoint:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  exposureEndpoint="/api/flags/exposures"
+>
+  <App />
+</FeatureFlagProvider>
+```
+
+Exposure events are deduplicated per flag and variant during a provider lifecycle:
+
+```json
+{
+  "name": "checkout-layout",
+  "variant": "variant-b",
+  "timestamp": 1777837079000
+}
+```
+
+Track exposure only when the user actually sees the feature or variant. Do not record exposure during prefetches, hidden tabs, or unused route branches.
+
+## Targeting Context
+
+The backend can evaluate flags differently per user, role, tenant, country, plan, or custom attributes. Pass targeting context to the provider:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  context={{
+    userId,
+    tenantId,
+    role,
+    country,
+    plan: 'enterprise',
+    attributes: {
+      federationId,
+      betaGroup: 'coaches',
+    },
+  }}
+>
+  <App />
+</FeatureFlagProvider>
+```
+
+The provider sends this context as a request header named `X-Vortos-Flag-Context` by default. Change the header name if your gateway or backend expects another convention:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  context={flagContext}
+  contextHeaderName="X-App-Flag-Context"
+>
+  <App />
+</FeatureFlagProvider>
+```
+
+The context is part of the provider's refetch identity. If the user, tenant, role, or plan changes, the provider refetches flags.
+
+## Auth Headers
+
+Headers are also part of the provider's refetch identity:
+
+```tsx
 <FeatureFlagProvider
   endpoint="/api/flags"
   headers={{ Authorization: `Bearer ${token}` }}
 >
-  <PermissionsProvider
-    endpoint="/api/me/permissions"
-    headers={{ Authorization: `Bearer ${token}` }}
-  >
-    <Router />
-  </PermissionsProvider>
+  <Router />
 </FeatureFlagProvider>
 ```
+
+This matters after login, logout, tenant switch, token refresh, or role changes. The browser should not keep using flag state evaluated for a previous identity.
+
+## Refreshing And Staleness
+
+Feature flag state is remote configuration. It should be cached locally, but the cache state must be observable, refreshable, and safely stale.
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  staleTime={30_000}
+  refreshInterval={60_000}
+  refetchOnWindowFocus
+>
+  <Router />
+</FeatureFlagProvider>
+```
+
+| Prop | What it does |
+|---|---|
+| `staleTime` | Marks data stale after the configured number of milliseconds |
+| `refreshInterval` | Polls the endpoint on an interval |
+| `refetchOnWindowFocus` | Refetches when the browser window becomes active and data is stale |
+| `refetch` | Manual refresh function exposed by stateful hooks |
+
+Polling is the right first step for most apps. SSE or WebSockets only become necessary when product operators expect open screens to react immediately to flag changes.
+
+## Request Safety
+
+The provider cancels in-flight requests with `AbortController` when endpoint, headers, targeting context, or component lifecycle changes. That prevents an older request from overwriting newer flag state.
+
+Retries are optional:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  retries={2}
+  retryDelayMs={500}
+>
+  <Router />
+</FeatureFlagProvider>
+```
+
+The retry schedule is linear:
+
+```txt
+try immediately
+retry after 500ms
+retry after 1000ms
+then fail
+```
+
+## Session Cache
+
+Use session cache to speed up app boot while a fresh request runs:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  persist
+  cacheKey={`flags:${userId}:${tenantId}`}
+>
+  <Router />
+</FeatureFlagProvider>
+```
+
+Always include identity and tenant information in the cache key:
+
+```txt
+flags:${userId}:${tenantId}
+```
+
+Without this, one user's cached flags can appear briefly after another user logs in on the same browser.
+
+## SSR And Initial Data
+
+Server-rendered apps can pass initial flags to avoid first-paint flicker:
+
+```tsx
+<FeatureFlagProvider
+  initialFlags={serverFlags}
+  initialVariants={serverVariants}
+  initialPayloads={serverPayloads}
+  initialVersion={serverFlagVersion}
+>
+  <App />
+</FeatureFlagProvider>
+```
+
+The provider still refetches on the client after mount, so server data is only the initial state.
+
+## Observability
+
+Use `onError` and `onUpdate` to connect flag state to logging and analytics:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  onError={(error) => logger.capture(error)}
+  onUpdate={(state) => {
+    analytics.track('flags.updated', {
+      count: state.flags.length,
+      version: state.version,
+      stale: state.stale,
+    });
+  }}
+>
+  <Router />
+</FeatureFlagProvider>
+```
+
+This is useful in enterprise systems because flag behavior often depends on tenant, plan, region, and rollout percentage.
+
+## Recommended Production Setup
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  headers={{ Authorization: `Bearer ${token}` }}
+  context={{ userId, tenantId, role, plan }}
+  staleTime={30_000}
+  refreshInterval={60_000}
+  refetchOnWindowFocus
+  retries={2}
+  retryDelayMs={500}
+  persist
+  cacheKey={`flags:${userId}:${tenantId}`}
+  exposureEndpoint="/api/flags/exposures"
+  onError={(error) => logger.capture(error)}
+>
+  <Router />
+</FeatureFlagProvider>
+```
+
+This gives you local reads, observable cache state, targeting-aware refreshes, request cancellation, retry behavior, exposure tracking, and safe tenant-aware cache persistence.

@@ -5,6 +5,7 @@
     "policies",
     "role-voter",
     "permissions-endpoint",
+    "frontend-permissions",
     "middleware",
     "policy-engine",
     "scoped",
