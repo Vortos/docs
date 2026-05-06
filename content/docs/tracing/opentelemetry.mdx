@@ -13,6 +13,8 @@ By default, `TracingInterface` is backed by `NoOpTracer` — zero overhead, no d
 
 `OpenTelemetryTracer` is included in `vortos-tracing` (`src/Tracing/OpenTelemetry/`). It wraps the `open-telemetry/sdk` PHP package. The wiring to replace `NoOpTracer` is done in `config/services.php` — not automatic yet.
 
+`OpenTelemetryTracer` implements Symfony's `ResetInterface`. In FrankenPHP worker mode, Vortos calls `Runner::cleanUp()` after each request, and cleanup detaches any OpenTelemetry scopes that are still active.
+
 ## Install OpenTelemetry SDK
 
 ```bash
@@ -32,6 +34,27 @@ $services->set(NoOpTracer::class, OpenTelemetryTracer::class)
     ->arg('$tracer', service('otel.tracer'))   // inject OTel SDK tracer
     ->public(false);
 ```
+
+## Scope cleanup
+
+Every `startSpan()` activates an OpenTelemetry scope. Ending the span detaches that scope. If a request exits with scopes still active, `OpenTelemetryTracer::reset()` detaches them during framework cleanup.
+
+```php
+$span = $this->tracer->startSpan('billing.charge');
+
+try {
+    // work
+    $span->setStatus('ok');
+} catch (\Throwable $e) {
+    $span->recordException($e);
+    $span->setStatus('error');
+    throw $e;
+} finally {
+    $span->end();
+}
+```
+
+Always end spans yourself. Reset exists to keep long-running workers safe when something goes wrong.
 
 The decorator chain wires itself around whatever is registered as `NoOpTracer::class`. Replacing this registration swaps the inner tracer without touching `SamplingTracer` or `ModuleAwareTracer`.
 

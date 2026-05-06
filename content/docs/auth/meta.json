@@ -3,6 +3,7 @@
   "pages": [
     "index",
     "tokens",
+    "authorization-version",
     "protecting-routes",
     "current-user",
     "passwords",

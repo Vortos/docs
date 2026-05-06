@@ -1,0 +1,141 @@
+---
+title: Cache and Versioning
+description: Redis permission cache, request memoization, role generation invalidation, token authz versions, and emergency deny lists.
+---
+
+# Cache and Versioning
+
+Permission resolution touches roles, role hierarchy, role permissions, and temporal grants. Vortos layers caching so normal requests do not repeatedly rebuild the same data.
+
+## Resolver chain
+
+When Redis is available:
+
+```text
+PermissionResolverInterface
+  -> RequestMemoizedPermissionResolver
+  -> CachedPermissionResolver
+  -> DatabasePermissionResolver
+```
+
+Without Redis:
+
+```text
+PermissionResolverInterface
+  -> RequestMemoizedPermissionResolver
+  -> DatabasePermissionResolver
+```
+
+## Request memoization
+
+`RequestMemoizedPermissionResolver` keeps the resolved permissions for the current request. Multiple checks in one request reuse the same `ResolvedPermissions` object.
+
+This is important when a controller, a query handler, and a serializer all ask about permissions.
+
+## Redis resolved-permission cache
+
+`CachedPermissionResolver` stores resolved permissions under a hashed user key:
+
+```text
+authorization:resolved_permissions:{sha256(userId)}
+```
+
+Current behavior:
+
+| Setting | Value |
+|---|---|
+| TTL | 60 seconds |
+| Rebuild lock TTL | 500 ms |
+| Lock behavior | First request rebuilds, concurrent requests wait briefly |
+| Payload | `ResolvedPermissions::toArray()` plus role generation hash |
+
+Cache keys never include raw user IDs.
+
+## Role generation invalidation
+
+When Redis is available, role permission storage is wrapped by `GenerationalRolePermissionStore`.
+
+When a role's permissions change, its generation changes. Cached user permissions include a hash of the expanded role generations. If any role generation changed, the cache entry is stale even before the TTL expires.
+
+This prevents users from keeping old role permissions after a role-level grant or revoke.
+
+## User authz version
+
+User role changes are more direct. `UserRoleAdminService` does three things inside one transaction:
+
+1. Assigns or removes the user role.
+2. Increments the user's authorization version.
+3. Invalidates that user's resolved permission cache.
+
+JWT access tokens include:
+
+```json
+{
+  "authz_version": 4
+}
+```
+
+During authorization, `PolicyEngine` compares the token claim with the runtime version from `AuthorizationVersionStoreInterface`.
+
+If the token value is older, the decision is:
+
+```text
+stale_token
+```
+
+The user must refresh or reauthenticate to receive a token with the new version.
+
+## Configure version checks
+
+Version checks are enabled by default.
+
+```php title="config/authorization.php"
+use Vortos\Authorization\DependencyInjection\VortosAuthorizationConfig;
+
+return static function (VortosAuthorizationConfig $config): void {
+    $config->authzVersionCheck(true);
+};
+```
+
+Only disable this in tests or special local workflows:
+
+```php
+$config->authzVersionCheck(false);
+```
+
+## Emergency deny list
+
+When Redis is available, Vortos registers `RedisEmergencyDenyList`. The policy engine checks it before permissions and policies.
+
+If the user is denied, the decision reason is:
+
+```text
+emergency_denied
+```
+
+Use this for incident response and immediate user lockout. It is checked on every authorization decision and is not bypassed by regular permissions.
+
+## Break-glass bypass
+
+Break-glass is disabled by default. Enable it explicitly:
+
+```php title="config/authorization.php"
+$config->breakGlassBypass(true);
+$config->breakGlassRole('ROLE_SUPER_ADMIN');
+```
+
+Break-glass only works for permissions marked `bypassable` in their catalog metadata:
+
+```php
+public static function meta(): array
+{
+    return [
+        self::ReadAny => self::bypassable(
+            'Read any order',
+            'Allows emergency read access during incidents.',
+        ),
+    ];
+}
+```
+
+It does not bypass unknown permissions, invalid permission formats, unauthenticated users, stale tokens, or emergency deny list checks.

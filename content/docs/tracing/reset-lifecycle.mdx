@@ -1,0 +1,143 @@
+---
+title: Reset Lifecycle
+description: FrankenPHP-safe tracing, ResetInterface discovery, ServicesResetter, OpenTelemetry scope cleanup, and worker-mode rules.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Reset Lifecycle
+
+Vortos supports long-running runtimes such as FrankenPHP worker mode. In worker mode, the service container can live across many requests, so request-local state must be reset manually after each request.
+
+Tracing is one of the most important reset targets because OpenTelemetry context scopes are stack-like. If a scope is not detached, the next request can inherit the previous request's trace context.
+
+## The rule
+
+Every worker request must end with:
+
+```php
+$runner->cleanUp();
+```
+
+Typical entrypoint:
+
+```php
+$runner = new Runner(
+    environment: $_SERVER['APP_ENV'] ?? 'prod',
+    debug: ($_SERVER['APP_DEBUG'] ?? '0') === '1',
+    projectRoot: dirname(__DIR__),
+);
+
+try {
+    $response = $runner->run();
+    $response->send();
+} finally {
+    $runner->cleanUp();
+}
+```
+
+<Callout type="warn" title="Worker safety">
+Skipping cleanup can leak current user identity, request cache entries, and active tracing scopes into the next request.
+</Callout>
+
+## What Runner cleanup does
+
+`Runner::cleanUp()` performs three tasks:
+
+1. Calls `ServicesResetter::reset()` if it exists.
+2. Clears the request-scoped `ArrayAdapter`.
+3. Keeps the container alive only in FrankenPHP worker mode.
+
+In non-worker mode, the container is discarded after the request.
+
+## Resettable service discovery
+
+`ResettableServicesPass` scans all container definitions at compile time. Any service whose class implements:
+
+```php
+Symfony\Contracts\Service\ResetInterface
+```
+
+is added to `ServicesResetter`.
+
+At cleanup time, `ServicesResetter` fetches those services from a service locator and calls `reset()` on each one.
+
+## OpenTelemetryTracer reset
+
+`OpenTelemetryTracer` implements `ResetInterface`.
+
+It tracks every active OpenTelemetry scope created by:
+
+```php
+$otelSpan->activate();
+Context::storage()->attach($context);
+```
+
+When a span ends normally, `OpenTelemetrySpan` detaches its own scope and tells the tracer to remove that scope from the active-scope list.
+
+If code forgets to end a span, throws before cleanup, or extracts context without ending every nested span, `OpenTelemetryTracer::reset()` detaches whatever scopes remain.
+
+## Why this matters
+
+Without reset, a persistent worker can produce traces like:
+
+```text
+request A root span
+  request B span accidentally parented under request A
+```
+
+That breaks trace trees and can leak correlation IDs into logs and outgoing messages.
+
+With reset:
+
+```text
+request A
+  cleanup detaches remaining scopes
+request B starts with a clean context
+```
+
+## Writing resettable services
+
+If your module stores request-specific state in a shared service, implement `ResetInterface`:
+
+```php
+use Symfony\Contracts\Service\ResetInterface;
+
+final class RequestMemoizedThing implements ResetInterface
+{
+    private array $memo = [];
+
+    public function get(string $key): mixed
+    {
+        return $this->memo[$key] ??= $this->load($key);
+    }
+
+    public function reset(): void
+    {
+        $this->memo = [];
+    }
+}
+```
+
+No manual tagging is required. The compiler pass discovers it.
+
+## Best practices
+
+Always end spans in a `finally` block:
+
+```php
+$span = $this->tracer->startSpan('orders.place');
+
+try {
+    // work
+    $span->setStatus('ok');
+} catch (\Throwable $e) {
+    $span->recordException($e);
+    $span->setStatus('error');
+    throw $e;
+} finally {
+    $span->end();
+}
+```
+
+Reset is a safety net. It is not a replacement for ending spans correctly.

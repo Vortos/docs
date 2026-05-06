@@ -5,6 +5,8 @@
     "samplers",
     "modules",
     "spans",
-    "opentelemetry"
+    "opentelemetry",
+    "reset-lifecycle",
+    "authorization"
   ]
 }

@@ -1,0 +1,167 @@
+---
+title: Internals
+description: Compiler passes, DI wiring, resolver chain, middleware order, Redis fallbacks, and contributor notes for the authorization module.
+---
+
+# Authorization Internals
+
+This page is for contributors and future debugging. It explains how the authorization module is wired.
+
+## Package and extension
+
+`AuthorizationPackage` registers `AuthorizationExtension` and compiler passes.
+
+`AuthorizationExtension` reads:
+
+```text
+config/authorization.php
+config/{env}/authorization.php
+```
+
+The fluent config object is `VortosAuthorizationConfig`.
+
+## Main services
+
+| Service | Responsibility |
+|---|---|
+| `RoleVoter` | Expands and checks role hierarchy |
+| `PermissionRegistry` | Holds compile-time permission metadata |
+| `PolicyRegistry` | Holds discovered policies keyed by resource |
+| `PolicyEngine` | Central authorization decision engine |
+| `AuthorizationMiddleware` | Enforces `#[RequiresPermission]` on controllers |
+| `ControllerPermissionMap` | Compile-time map of controller requirements |
+| `DatabasePermissionResolver` | Builds permissions from roles and runtime tables |
+| `RequestMemoizedPermissionResolver` | Per-request resolver memoization |
+| `CachedPermissionResolver` | Redis cache for resolved permissions |
+| `UserRoleAdminService` | Mutates user roles with audit/version/cache side effects |
+| `RolePermissionAdminService` | Mutates role permissions with audit side effects |
+
+## Compiler passes
+
+`PermissionRegistryPass` does two jobs:
+
+1. Discover permission catalogs and build `PermissionRegistry`.
+2. Scan `vortos.api.controller` services for `#[RequiresPermission]` and build `ControllerPermissionMap`.
+
+`PolicyRegistryPass` discovers `#[AsPolicy]` services and fills the policy service locator.
+
+Ownership has its own compiler pass:
+
+```text
+OwnershipCompilerPass
+```
+
+It builds the route map and policy map for ownership middleware.
+
+## Controller permission map
+
+Runtime request handling does not reflect controller attributes.
+
+At compile time, `PermissionRegistryPass` scans controller classes and methods:
+
+```php
+#[RequiresPermission('athletes.update.own', resourceParam: 'id')]
+public function __invoke(string $id): JsonResponse
+```
+
+It stores:
+
+```php
+[
+    App\Athlete\Http\UpdateAthleteController::class . '::__invoke' => [
+        [
+            'permission' => 'athletes.update.own',
+            'resourceParam' => 'id',
+            'scope' => null,
+            'scopeMode' => 'All',
+        ],
+    ],
+]
+```
+
+At runtime, `AuthorizationMiddleware` only looks up the current controller in `ControllerPermissionMap`.
+
+## Request order
+
+Important event priorities:
+
+```text
+RouterListener              priority 8
+AuthMiddleware              priority 6
+AuthorizationMiddleware     priority 5
+OwnershipMiddleware         priority 45 in code, intended between authorization and feature access
+ControllerResolver          priority 0
+```
+
+The authorization middleware expects routing and auth identity to already be available.
+
+## Policy engine decision order
+
+`PolicyEngine::decide()` evaluates in this order:
+
+1. Parse `resource.action.scope`.
+2. Deny if the permission is not registered.
+3. Deny if the identity is unauthenticated.
+4. Deny if the emergency deny list blocks the user.
+5. Deny if `authz_version` is stale.
+6. Allow break-glass bypass only if enabled and permission metadata says `bypassable`.
+7. Resolve permissions.
+8. Deny if the resolved permissions do not include the requested permission.
+9. Deny if scoped permission checks fail.
+10. Deny if no policy exists for the resource.
+11. Call the resource policy.
+12. Allow only if the policy returns true.
+
+The decision object contains:
+
+```php
+$decision->allowed();
+$decision->denied();
+$decision->reason();
+$decision->requiredPermission();
+```
+
+## Redis and null fallbacks
+
+When Redis exists, the module uses:
+
+| Interface | Implementation |
+|---|---|
+| `EmergencyDenyListInterface` | `RedisEmergencyDenyList` |
+| `AuthorizationVersionStoreInterface` | `RedisAuthorizationVersionStore` |
+| `ScopedPermissionStoreInterface` | `RedisScopedPermissionStore` |
+| `TemporalPermissionStoreInterface` | `RedisTemporalPermissionStore` |
+| `RolePermissionStoreInterface` | `GenerationalRolePermissionStore` wrapping DBAL |
+| `AuthorizationCacheInvalidatorInterface` | `CachedPermissionInvalidator` |
+
+Without Redis, the module falls back where possible:
+
+| Interface | Implementation |
+|---|---|
+| `EmergencyDenyListInterface` | `NullEmergencyDenyList` |
+| `AuthorizationVersionStoreInterface` | `NullAuthorizationVersionStore` |
+| `ScopedPermissionStoreInterface` | `NullScopedPermissionStore` |
+| `RolePermissionStoreInterface` | `DbalRolePermissionStore` |
+| `AuthorizationCacheInvalidatorInterface` | `NullAuthorizationCacheInvalidator` |
+
+Temporal authorization is only registered when Redis is available.
+
+## Tracing hooks
+
+Authorization tracing is opt-in:
+
+```php
+$config->traceDecisions(true);
+$config->traceResolver(true);
+$config->traceAdminMutations(true);
+```
+
+When tracing is enabled and the tracing module is installed, authorization emits spans for:
+
+| Span family | Examples |
+|---|---|
+| Decisions | `authorization.decision` |
+| Resolver work | `authorization.resolver.database`, `authorization.resolver.cache_hit`, `authorization.resolver.cache_miss` |
+| Admin mutations | `authorization.admin.user_role.assign`, `authorization.admin.role_permission.grant` |
+
+User IDs are hashed before being added to span attributes.

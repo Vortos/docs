@@ -1,0 +1,148 @@
+---
+title: Permission Catalogs
+description: Register permissions, metadata, dangerous actions, bypassable permissions, and default role grants.
+---
+
+# Permission Catalogs
+
+A permission catalog is a compile-time list of permissions for one resource. Vortos uses catalogs to validate controller attributes, list available permissions, seed default grants, and show metadata to administrators.
+
+## Define permissions
+
+```php
+use Vortos\Authorization\Attribute\PermissionCatalog;
+use Vortos\Authorization\Permission\AbstractPermissionCatalog;
+
+#[PermissionCatalog(resource: 'orders', group: 'Orders')]
+final class OrderPermissions extends AbstractPermissionCatalog
+{
+    public const ListAny = 'list.any';
+    public const ReadOwn = 'read.own';
+    public const ReadAny = 'read.any';
+    public const CreateOwn = 'create.own';
+    public const CancelOwn = 'cancel.own';
+    public const CancelAny = 'cancel.any';
+}
+```
+
+The final permission string must have exactly three parts:
+
+```text
+resource.action.scope
+```
+
+Because the catalog resource is `orders`, these constants become:
+
+```text
+orders.list.any
+orders.read.own
+orders.read.any
+orders.create.own
+orders.cancel.own
+orders.cancel.any
+```
+
+## Add default grants
+
+`grants()` declares the permissions that a role should receive when you run `vortos:auth:seed`.
+
+```php
+public static function grants(): array
+{
+    return [
+        'ROLE_CUSTOMER' => [
+            self::ReadOwn,
+            self::CreateOwn,
+            self::CancelOwn,
+        ],
+        'ROLE_SUPPORT' => [
+            self::ListAny,
+            self::ReadAny,
+            self::CancelAny,
+        ],
+    ];
+}
+```
+
+Run the seed command:
+
+```bash
+php vortos auth:seed
+```
+
+Expected result: rows are inserted into `role_permissions`. Existing rows are ignored with `ON CONFLICT DO NOTHING`.
+
+## Add metadata
+
+Metadata is used by admin tools and safety checks.
+
+```php
+public static function meta(): array
+{
+    return [
+        self::CancelAny => self::dangerous(
+            'Cancel any order',
+            'Allows staff to cancel orders owned by any customer.',
+        ),
+        self::ReadAny => self::describe(
+            'Read any order',
+            'Allows staff to view all customer orders.',
+        ),
+    ];
+}
+```
+
+Available helpers:
+
+| Helper | Meaning |
+|---|---|
+| `describe($label, $description = null)` | Normal permission metadata |
+| `dangerous($label, $description = null)` | Marks the permission as dangerous |
+| `bypassable($label, $description = null, $dangerous = false)` | Allows break-glass bypass if enabled |
+
+Dangerous permissions require an audit reason when granted or revoked by `RolePermissionAdminService`.
+
+## List registered permissions
+
+```bash
+php vortos auth:permissions
+php vortos auth:permissions --dangerous
+php vortos auth:permissions --json
+```
+
+This command reads `PermissionRegistry`, so it only lists permissions discovered during container compilation.
+
+## What compile-time discovery does
+
+`PermissionRegistryPass` scans services tagged as `vortos.permission_catalog`.
+
+For every public string constant it:
+
+1. Normalizes `action.scope` into `resource.action.scope`.
+2. Rejects invalid formats.
+3. Rejects duplicate permission strings.
+4. Stores action, scope, label, description, dangerous flag, bypassable flag, group, and catalog class.
+5. Collects default grants from `grants()`.
+6. Builds the controller permission map from `#[RequiresPermission]`.
+
+If a controller uses a permission that is not in a catalog, the container fails to compile.
+
+## Naming rules
+
+Use plural resource names and short action names:
+
+| Good | Avoid |
+|---|---|
+| `orders.read.own` | `order.can_read_current_users_order` |
+| `athletes.update.any` | `athlete.edit.admin` |
+| `reports.export.any` | `export_reports` |
+
+Keep `scope` meaningful:
+
+| Scope | Meaning |
+|---|---|
+| `own` | Resource belongs to the current user |
+| `any` | Resource can belong to any user |
+| `global` | System-level operation |
+| `org` | Scoped to an organization grant |
+| `team` | Scoped to a team grant |

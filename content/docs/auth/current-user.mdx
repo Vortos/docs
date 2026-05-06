@@ -1,6 +1,6 @@
 ---
 title: Current User
-description: Accessing the authenticated user identity.
+description: CurrentUserProvider, anonymous identities, request cleanup, and how identity attributes carry JWT claims.
 ---
 
 # Current User
@@ -25,9 +25,10 @@ final class SomeHandler
             throw new UnauthorizedException();
         }
 
-        // $user->id()             — user ID string
-        // $user->roles()          — ['ROLE_USER', 'ROLE_ADMIN']
-        // $user->hasRole('ROLE_ADMIN')   — bool
+        // $user->id()                   user ID string
+        // $user->roles()                ['ROLE_USER', 'ROLE_ADMIN']
+        // $user->hasRole('ROLE_ADMIN')  bool
+        // $user->getAttribute('x')      JWT/custom identity attribute
     }
 }
 ```
@@ -48,7 +49,7 @@ if (!$user->isAuthenticated()) {
 $userId = $user->id(); // safe, guaranteed authenticated
 ```
 
-## UserIdentity properties
+## UserIdentity contract
 
 ```php
 interface UserIdentityInterface
@@ -57,12 +58,36 @@ interface UserIdentityInterface
     public function roles(): array;          // ['ROLE_USER', 'ROLE_ADMIN']
     public function isAuthenticated(): bool; // always true for UserIdentity
     public function hasRole(string $role): bool;
+    public function getAttribute(string $key, mixed $default = null): mixed;
+}
+```
+
+JWT claims that are not core claims become identity attributes. This is how authorization receives `authz_version`.
+
+```php
+$version = $this->currentUser->get()->getAttribute('authz_version', 0);
+```
+
+## Request cleanup
+
+In worker mode, Vortos keeps the compiled container alive between requests. `Runner::cleanUp()` clears the request-scoped `ArrayAdapter` after each request so the next request cannot see the previous request's identity.
+
+This is why worker entrypoints must always call cleanup after handling a request.
+
+```php
+$runner = new Runner(...);
+
+try {
+    $response = $runner->run();
+    $response->send();
+} finally {
+    $runner->cleanUp();
 }
 ```
 
 ## Why not inject the full User aggregate
 
-Injecting a full `User` aggregate as "the current user" requires a database query on every request even when the full aggregate is not needed. `UserIdentity` carries only what is in the JWT — zero database queries for identity access.
+Injecting a full `User` aggregate as "the current user" requires a database query on every request even when the full aggregate is not needed. `UserIdentity` carries only what is in the JWT, so identity access does not query the database.
 
 When your handler needs the full `User` aggregate, load it explicitly:
 

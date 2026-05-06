@@ -1,0 +1,203 @@
+---
+title: Quickstart
+description: Build one protected feature with a permission catalog, a policy, runtime grants, and a protected controller.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Authorization Quickstart
+
+Authorization in Vortos has two layers:
+
+1. A user must have the required permission in the runtime RBAC store.
+2. The policy for that resource must allow the action for the current resource.
+
+The permission answers "may this user attempt this action?". The policy answers "may this user perform it on this resource?".
+
+## 1. Create a permission catalog
+
+Permission catalogs are discovered at container compile time. They are the only valid source of permissions.
+
+```php title="src/Athlete/Infrastructure/Authorization/AthletePermissions.php"
+namespace App\Athlete\Infrastructure\Authorization;
+
+use Vortos\Authorization\Attribute\PermissionCatalog;
+use Vortos\Authorization\Permission\AbstractPermissionCatalog;
+
+#[PermissionCatalog(resource: 'athletes', group: 'Athletes')]
+final class AthletePermissions extends AbstractPermissionCatalog
+{
+    public const ListAny = 'list.any';
+    public const ReadAny = 'read.any';
+    public const CreateAny = 'create.any';
+    public const UpdateOwn = 'update.own';
+    public const UpdateAny = 'update.any';
+    public const DeleteAny = 'delete.any';
+
+    public static function grants(): array
+    {
+        return [
+            'ROLE_USER' => [
+                self::ListAny,
+                self::ReadAny,
+            ],
+            'ROLE_COACH' => [
+                self::CreateAny,
+                self::UpdateOwn,
+            ],
+            'ROLE_ADMIN' => [
+                self::UpdateAny,
+                self::DeleteAny,
+            ],
+        ];
+    }
+
+    public static function meta(): array
+    {
+        return [
+            self::DeleteAny => self::dangerous(
+                'Delete any athlete',
+                'Allows deleting athlete records across the application.',
+            ),
+        ];
+    }
+}
+```
+
+Catalog constants can be `action.scope` or full `resource.action.scope`. With `resource: 'athletes'`, `update.own` becomes `athletes.update.own`.
+
+## 2. Create a policy
+
+Each permission resource needs a policy with the same resource name.
+
+```php title="src/Athlete/Infrastructure/Policy/AthletePolicy.php"
+namespace App\Athlete\Infrastructure\Policy;
+
+use Vortos\Authorization\Attribute\AsPolicy;
+use Vortos\Authorization\Context\AuthorizationContext;
+use Vortos\Authorization\Contract\PolicyInterface;
+
+#[AsPolicy(resource: 'athletes')]
+final class AthletePolicy implements PolicyInterface
+{
+    public function can(
+        AuthorizationContext $auth,
+        string $action,
+        string $scope,
+        mixed $resource = null,
+    ): bool {
+        return match ($action) {
+            'list', 'read' => $auth->atLeast('ROLE_USER'),
+            'create' => $auth->atLeast('ROLE_COACH'),
+            'update' => $scope === 'own'
+                ? $resource === $auth->user()->id()
+                : $auth->atLeast('ROLE_ADMIN'),
+            'delete' => $auth->hasAnyRole(['ROLE_ADMIN', 'ROLE_SUPER_ADMIN']),
+            default => false,
+        };
+    }
+}
+```
+
+The engine parses `athletes.update.own` into:
+
+| Segment | Value |
+|---|---|
+| resource | `athletes` |
+| action | `update` |
+| scope | `own` |
+
+It then asks the `athletes` policy whether that action and scope are allowed.
+
+## 3. Seed default role grants
+
+Default grants from all catalogs are copied into the runtime database with:
+
+```bash
+php vortos auth:seed
+```
+
+Preview the rows first:
+
+```bash
+php vortos auth:seed --dry-run
+```
+
+This writes to `role_permissions`. It does not assign roles to users.
+
+## 4. Assign a runtime role to a user
+
+```bash
+php vortos auth:user-role:assign user-123 ROLE_COACH \
+  --actor admin-1 \
+  --reason "Promoted to coach"
+```
+
+This writes to `user_roles`, increments the user's authorization version, invalidates their permission cache, and records an audit entry.
+
+## 5. Protect a controller
+
+```php title="src/Athlete/Http/UpdateAthleteController.php"
+use Symfony\Component\Routing\Attribute\Route;
+use Vortos\Authorization\Attribute\RequiresPermission;
+use Vortos\Http\Attribute\ApiController;
+
+#[ApiController]
+final class UpdateAthleteController
+{
+    #[Route('/athletes/{id}', methods: ['PATCH'])]
+    #[RequiresPermission('athletes.update.own', resourceParam: 'id')]
+    public function __invoke(string $id): JsonResponse
+    {
+        // This only runs after AuthorizationMiddleware allows the request.
+    }
+}
+```
+
+`resourceParam: 'id'` passes the route `{id}` value to the policy as `$resource`.
+
+<Callout type="info" title="Compile-time validation">
+If a controller references an unknown permission, container compilation fails. Add the permission to a `#[PermissionCatalog]` class before using it in `#[RequiresPermission]`.
+</Callout>
+
+## 6. Check the current user permissions
+
+The authorization module exposes:
+
+```text
+GET /api/me/permissions
+```
+
+Authenticated response:
+
+```json
+{
+  "permissions": ["athletes.create.any", "athletes.update.own"],
+  "roles": ["ROLE_COACH"],
+  "expandedRoles": ["ROLE_COACH", "ROLE_USER"],
+  "version": "sha256..."
+}
+```
+
+Unauthenticated response:
+
+```json
+{
+  "permissions": [],
+  "roles": [],
+  "expandedRoles": [],
+  "version": "sha256..."
+}
+```
+
+## The full request flow
+
+```text
+RouterListener
+  -> AuthMiddleware sets CurrentUserProvider
+  -> AuthorizationMiddleware reads ControllerPermissionMap
+  -> PolicyEngine checks permission registry, identity, deny list, authz version, resolver, scoped grants, policy
+  -> controller executes
+```
+
+If any step denies access, the controller is not called.

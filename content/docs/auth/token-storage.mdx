@@ -1,47 +1,76 @@
 ---
 title: Token Storage
-description: Refresh token tracking and revocation.
+description: Redis and in-memory refresh token storage, key formats, rotation, revocation, and test configuration.
 ---
+
+import { Callout } from 'fumadocs-ui/components/callout';
 
 # Token Storage
 
-`TokenStorageInterface` tracks refresh tokens for revocation. Access tokens are not tracked — their short TTL is the revocation mechanism.
+`TokenStorageInterface` tracks refresh tokens for revocation. Access tokens are not tracked because their short TTL is the revocation mechanism.
 
 ## Why only track refresh tokens
 
 | Token type | TTL | Revocation |
 |-----------|-----|-----------|
-| Access token | 15 min | TTL expiry |
-| Refresh token | 7 days | JTI blacklist in Redis |
+| Access token | 15 min | JWT expiry |
+| Refresh token | 7 days | JTI storage |
 
-Checking Redis on every API request (access token validation) would add significant latency. The 15-minute TTL makes explicit revocation unnecessary for access tokens — a stolen token expires quickly.
+Checking Redis on every API request would add latency to access token validation. The access token TTL keeps the compromise window short.
 
 Refresh tokens require explicit revocation — a 7-day validity window is too long to rely on TTL alone.
 
-## Redis key format
+## RedisTokenStorage
 
+Use Redis in real applications:
+
+```php title="config/auth.php"
+use Vortos\Auth\Storage\RedisTokenStorage;
+
+$config->tokenStorage(RedisTokenStorage::class);
 ```
-vortos_auth:token:{jti}          — userId, TTL matches token expiry
-vortos_auth:user_tokens:{userId} — SET of active JTIs for this user
+
+Key format:
+
+```text
+vortos_auth:token:{jti}          value: userId, TTL matches token expiry
+vortos_auth:user_tokens:{userId} SET of active JTIs for this user
 ```
 
 <Callout type="info">
-Auth keys use the prefix `vortos_auth:` — **separate from your application cache prefix**. Running `vortos:cache:clear` does **not** affect auth tokens. Users are not logged out when you clear the cache.
+Auth keys use the prefix `vortos_auth:`, separate from your application cache prefix. Running `vortos:cache:clear` does not affect auth tokens. Users are not logged out when you clear the cache.
 </Callout>
 
-## Swapping storage
+## InMemoryTokenStorage
 
-For testing:
+Use in-memory storage only for tests and local experiments:
 
-```php
-// config/test/auth.php
+```php title="config/test/auth.php"
+use Vortos\Auth\Storage\InMemoryTokenStorage;
+
 $config->tokenStorage(InMemoryTokenStorage::class);
 ```
+
+It stores JTIs in a PHP array and enforces TTL lazily when `isValid()` is called.
+
+## Custom storage
 
 For custom storage (e.g. PostgreSQL for audit requirements):
 
 ```php
 $config->tokenStorage(DbalTokenStorage::class);
+```
+
+Your class must implement:
+
+```php
+interface TokenStorageInterface
+{
+    public function store(string $jti, string $userId, int $expiresAt): void;
+    public function isValid(string $jti): bool;
+    public function revoke(string $jti): void;
+    public function revokeAllForUser(string $userId): void;
+}
 ```
 
 ## Token rotation

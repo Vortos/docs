@@ -1,0 +1,121 @@
+---
+title: Admin Commands
+description: Console commands for listing permissions, seeding grants, assigning roles, mutating role permissions, and explaining decisions.
+---
+
+# Admin Commands
+
+Authorization ships operational commands for local development, deployments, and admin automation.
+
+## List permissions
+
+```bash
+php vortos auth:permissions
+php vortos auth:permissions --dangerous
+php vortos auth:permissions --json
+```
+
+Use this after adding a catalog to confirm that the container discovered it.
+
+## Seed default grants
+
+```bash
+php vortos auth:seed
+php vortos auth:seed --dry-run
+```
+
+The seed command reads `PermissionRegistry::defaultGrants()` and inserts missing rows into `role_permissions`.
+
+It is safe to run repeatedly.
+
+## Show user roles
+
+```bash
+php vortos auth:roles user-123
+php vortos auth:roles user-123 --json
+```
+
+This shows runtime roles, expanded roles, current authorization version, and deny-list state.
+
+## Assign and remove user roles
+
+```bash
+php vortos auth:user-role:assign user-123 ROLE_COACH \
+  --actor admin-1 \
+  --reason "Approved by federation admin"
+```
+
+```bash
+php vortos auth:user-role:remove user-123 ROLE_COACH \
+  --actor admin-1 \
+  --reason "Left federation"
+```
+
+Options:
+
+| Option | Meaning |
+|---|---|
+| `--actor` | Admin user ID performing the change |
+| `--reason` | Human audit reason |
+| `--metadata key=value` | Repeatable audit metadata |
+| `--json` | Machine-readable output |
+
+User role changes increment the target user's authorization version and invalidate their permission cache.
+
+## Grant and revoke role permissions
+
+```bash
+php vortos auth:role-permission:grant ROLE_SUPPORT orders.read.any \
+  --actor admin-1 \
+  --reason "Support ticket workflow"
+```
+
+```bash
+php vortos auth:role-permission:revoke ROLE_SUPPORT orders.read.any \
+  --actor admin-1 \
+  --reason "Access review completed"
+```
+
+The permission must exist in a catalog. Unknown permissions are rejected.
+
+If the permission is marked `dangerous`, a reason is required.
+
+## Check a decision
+
+```bash
+php vortos auth:can user-123 orders.cancel.any
+```
+
+Simulate JWT/bootstrap roles:
+
+```bash
+php vortos auth:can user-123 orders.cancel.any --role ROLE_SUPPORT
+```
+
+Simulate a token authorization version:
+
+```bash
+php vortos auth:can user-123 orders.cancel.any --authz-version 4
+```
+
+## Explain a decision
+
+```bash
+php vortos auth:explain user-123 orders.cancel.any
+php vortos auth:explain user-123 orders.cancel.any --json
+```
+
+Decision reasons include:
+
+| Reason | Meaning |
+|---|---|
+| `allowed` | Resolver and policy both allowed |
+| `unauthenticated` | Identity is anonymous |
+| `stale_token` | JWT `authz_version` is older than runtime version |
+| `emergency_denied` | User is on the deny list |
+| `invalid_permission_format` | Permission is not `resource.action.scope` |
+| `unknown_permission` | Permission is not registered in a catalog |
+| `missing_permission` | User lacks the permission after resolving roles |
+| `scoped_permission_denied` | Scoped grant check failed |
+| `policy_not_found` | No `#[AsPolicy]` for the resource |
+| `resource_denied` | Policy denied the resource/action/scope |

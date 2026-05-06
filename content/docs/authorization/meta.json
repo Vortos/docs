@@ -2,8 +2,14 @@
   "title": "Authorization",
   "pages": [
     "index",
+    "quickstart",
+    "permission-catalogs",
     "policies",
     "role-voter",
+    "runtime-rbac",
+    "admin-commands",
+    "cache-and-versioning",
+    "audit-log",
     "permissions-endpoint",
     "frontend-permissions",
     "middleware",
@@ -11,6 +17,7 @@
     "scoped",
     "temporal",
     "ownership",
+    "internals",
     "testing"
   ]
 }

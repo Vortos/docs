@@ -1,25 +1,32 @@
 ---
 title: Token Lifecycle
-description: How access and refresh tokens work in Vortos.
+description: Access tokens, refresh tokens, rotation, JWT claims, and how auth connects to authorization.
 ---
 
 # Token Lifecycle
 
+Vortos uses signed JWT access tokens and refresh-token rotation.
+
+| Token | Default TTL | Stored server-side | Purpose |
+|---|---:|---|---|
+| Access token | 900 seconds | No | Authenticate API requests |
+| Refresh token | 604800 seconds | Yes, by JTI | Issue the next token pair |
+
 ## Access tokens
 
-Short-lived (default 15 minutes). Used for API authentication on every request.
+Access tokens are short-lived and sent on every API request:
 
-```
+```text
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```
 
-Access tokens are **not tracked in Redis**. Their short TTL is the revocation mechanism. If a token is compromised, it expires in at most 15 minutes.
+Access tokens are not tracked in Redis. Their short TTL is the revocation mechanism.
 
 ## Refresh tokens
 
-Long-lived (default 7 days). Used only to obtain new access tokens. Store in an `httpOnly` cookie — never in `localStorage`.
+Refresh tokens are longer-lived and used only to obtain a new access and refresh pair. Store them in an `httpOnly` cookie, not in `localStorage`.
 
-Refresh tokens **are tracked in Redis** by their JTI (JWT ID). This enables explicit revocation on logout.
+Refresh tokens are tracked by their JTI. This enables explicit revocation on logout and one-use token rotation.
 
 ## Token pair structure
 
@@ -33,12 +40,33 @@ Refresh tokens **are tracked in Redis** by their JTI (JWT ID). This enables expl
 }
 ```
 
-## Issuing tokens (login)
+## Configure auth
+
+```php title="config/auth.php"
+use Vortos\Auth\DependencyInjection\VortosAuthConfig;
+use Vortos\Auth\Storage\RedisTokenStorage;
+
+return static function (VortosAuthConfig $config): void {
+    $config
+        ->secret($_ENV['JWT_SECRET'])
+        ->issuer('squaura')
+        ->accessTokenTtl(900)
+        ->refreshTokenTtl(604800)
+        ->tokenStorage(RedisTokenStorage::class);
+};
+```
+
+## Issue tokens at login
 
 ```php
+use Vortos\Auth\Identity\UserIdentity;
+
 $identity = new UserIdentity(
     id: (string) $user->getId(),
     roles: $user->getRoles(),
+    attributes: [
+        'authz_version' => $currentAuthzVersion,
+    ],
 );
 
 $token = $this->jwtService->issue($identity);
@@ -48,13 +76,14 @@ return new JsonResponse($token->toArray());
 
 ## Validating tokens (every request)
 
-`AuthMiddleware` does this automatically. You never call `validate()` directly unless building a custom flow.
+`AuthMiddleware` validates access tokens automatically on every main request. You usually do not call `validate()` directly unless building a custom flow.
 
 ```php
 // AuthMiddleware does this for you:
 $identity = $this->jwtService->validate($accessToken);
-// Returns UserIdentity with id and roles from JWT claims
 ```
+
+`JwtService::validate()` returns a `UserIdentity` with ID, roles, and remaining JWT claims as identity attributes.
 
 ## Refreshing tokens
 
@@ -64,6 +93,21 @@ $newToken = $this->jwtService->refresh($refreshToken, $identity);
 ```
 
 Token rotation: the old refresh token is revoked before the new pair is issued. A stolen refresh token cannot be reused after legitimate use.
+
+To refresh, first extract the user ID from the refresh token, load the current user and roles, then call `refresh()` with a fresh identity:
+
+```php
+$userId = $this->jwtService->getUserIdFromRefreshToken($refreshToken);
+$user = $this->users->get($userId);
+
+$identity = new UserIdentity(
+    id: $userId,
+    roles: $user->roles(),
+    attributes: ['authz_version' => $this->versions->versionForUser($userId)],
+);
+
+$newToken = $this->jwtService->refresh($refreshToken, $identity);
+```
 
 ## Logout
 
@@ -82,6 +126,7 @@ $this->jwtService->revokeAll($identity->id());
   "iat": 1234567890,
   "exp": 1234568790,
   "roles": ["ROLE_USER", "ROLE_ADMIN"],
+  "authz_version": 4,
   "type": "access"
 }
 ```
@@ -98,13 +143,18 @@ $this->jwtService->revokeAll($identity->id());
 }
 ```
 
-## Token TTL configuration
+`authz_version` is used by the authorization module to reject stale access tokens after role changes.
 
-```php
-// config/auth.php
-$config
-    ->accessTokenTtl(900)     // 15 min — balance security vs UX
-    ->refreshTokenTtl(604800); // 7 days — adjust to your session policy
-```
+## Expected failures
 
-Shorter access TTL = smaller compromise window. Longer refresh TTL = less friction for users (less frequent re-login).
+`JwtService` throws framework exceptions for custom flows:
+
+| Exception | Meaning |
+|---|---|
+| `TokenExpiredException` | Token `exp` is in the past |
+| `TokenInvalidException` | Signature, payload, type, or format is invalid |
+| `TokenRevokedException` | Refresh token JTI is missing or revoked |
+
+`AuthMiddleware` catches token errors and treats the request as anonymous. A protected route then returns 401.
+
+Shorter access TTL means a smaller compromise window. Longer refresh TTL means less login friction.

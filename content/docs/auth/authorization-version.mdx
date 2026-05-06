@@ -1,0 +1,109 @@
+---
+title: Authorization Version
+description: How JWT authz_version prevents old access tokens from keeping revoked roles and permissions.
+---
+
+# Authorization Version
+
+`authz_version` connects authentication to authorization.
+
+Access tokens are stateless. Without a version check, a user whose role was removed could keep using the old access token until it expires. Vortos solves this by embedding the user's authorization version in each access token.
+
+## The claim
+
+When `JwtService::issue()` creates an access token, it copies the identity attribute:
+
+```php
+$identity->getAttribute('authz_version', 0)
+```
+
+into the JWT:
+
+```json
+{
+  "sub": "user-123",
+  "roles": ["ROLE_COACH"],
+  "authz_version": 4,
+  "type": "access"
+}
+```
+
+When the token is validated, `JwtService` preserves unknown claims as identity attributes. `PolicyEngine` can then read the token version from the current identity.
+
+## Runtime version
+
+The authorization module stores the current runtime version in `AuthorizationVersionStoreInterface`.
+
+With Redis available, this is `RedisAuthorizationVersionStore`.
+
+When a user role is assigned or removed, `UserRoleAdminService` increments the target user's runtime version.
+
+## Decision behavior
+
+During an authorization decision:
+
+```text
+token authz_version < runtime authz version
+  -> deny with stale_token
+```
+
+The user must refresh or reauthenticate to get a token with the latest version.
+
+## Issue tokens correctly
+
+When you issue or refresh tokens, include the current runtime version:
+
+```php
+use Vortos\Auth\Identity\UserIdentity;
+use Vortos\Authorization\Contract\AuthorizationVersionStoreInterface;
+
+final class LoginController
+{
+    public function __construct(
+        private JwtService $jwt,
+        private AuthorizationVersionStoreInterface $versions,
+    ) {}
+
+    public function __invoke(LoginRequest $request): JsonResponse
+    {
+        $user = $this->users->verifyCredentials($request);
+
+        $identity = new UserIdentity(
+            id: $user->id(),
+            roles: $user->roles(),
+            attributes: [
+                'authz_version' => $this->versions->versionForUser($user->id()),
+            ],
+        );
+
+        return new JsonResponse($this->jwt->issue($identity)->toArray());
+    }
+}
+```
+
+## Configure the check
+
+Enabled by default:
+
+```php title="config/authorization.php"
+$config->authzVersionCheck(true);
+```
+
+Disable only for tests or local experiments:
+
+```php
+$config->authzVersionCheck(false);
+```
+
+## What changes increment the version
+
+Built-in behavior:
+
+| Change | Version incremented |
+|---|---|
+| Assign user role | Yes |
+| Remove user role | Yes |
+| Grant permission to role | No, role generation cache handles this |
+| Revoke permission from role | No, role generation cache handles this |
+
+Role-permission changes affect all users with that role, so Redis role generations invalidate resolved-permission caches. User-role changes affect one user, so that user's version is incremented.

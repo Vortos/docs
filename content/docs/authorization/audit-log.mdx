@@ -1,0 +1,118 @@
+---
+title: Authorization Audit Log
+description: Audit rows written by role and permission mutations, request context capture, and the authorization_audit_log schema.
+---
+
+# Authorization Audit Log
+
+Authorization admin mutations are audited automatically.
+
+This is separate from the general auth audit middleware. The authorization audit log records changes to roles and permissions.
+
+## Table
+
+The module migration creates:
+
+```sql
+CREATE TABLE authorization_audit_log (
+    id VARCHAR(64) NOT NULL,
+    actor_user_id VARCHAR(190) NOT NULL,
+    action VARCHAR(190) NOT NULL,
+    target_user_id VARCHAR(190) DEFAULT NULL,
+    role VARCHAR(150) DEFAULT NULL,
+    permission VARCHAR(190) DEFAULT NULL,
+    reason TEXT DEFAULT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    request_id VARCHAR(190) DEFAULT NULL,
+    correlation_id VARCHAR(190) DEFAULT NULL,
+    ip_address VARCHAR(64) DEFAULT NULL,
+    user_agent TEXT DEFAULT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id)
+);
+```
+
+Indexes are created for actor, target, action, role, permission, request, correlation, and creation time.
+
+## Actions
+
+The built-in admin services write these actions:
+
+| Action | Written by |
+|---|---|
+| `user_role.assigned` | `UserRoleAdminService::assign()` |
+| `user_role.removed` | `UserRoleAdminService::remove()` |
+| `role_permission.granted` | `RolePermissionAdminService::grant()` |
+| `role_permission.revoked` | `RolePermissionAdminService::revoke()` |
+
+## Add context
+
+When the request stack is available, `AuthorizationAuditContextProvider` adds:
+
+| Field | Source |
+|---|---|
+| `request_id` | Request header or framework request context |
+| `correlation_id` | Tracing correlation ID if tracing is installed |
+| `ip_address` | Current HTTP request |
+| `user_agent` | Current HTTP request |
+
+Console commands still write audit rows. In CLI there may be no HTTP request context, so request-specific fields can be null.
+
+## Add metadata from commands
+
+```bash
+php vortos auth:user-role:assign user-123 ROLE_ADMIN \
+  --actor admin-1 \
+  --reason "Approved access request" \
+  --metadata ticket=SEC-123 \
+  --metadata reviewer=alice
+```
+
+`metadata` is stored as JSON text.
+
+## Dangerous permission guard
+
+If a catalog marks a permission dangerous:
+
+```php
+public static function meta(): array
+{
+    return [
+        self::DeleteAny => self::dangerous('Delete any athlete'),
+    ];
+}
+```
+
+Then grant and revoke operations require a reason:
+
+```bash
+php vortos auth:role-permission:grant ROLE_ADMIN athletes.delete.any \
+  --actor admin-1 \
+  --reason "Break-fix access approved"
+```
+
+Without a reason, the admin service throws an `InvalidArgumentException`.
+
+## Query examples
+
+```sql
+SELECT *
+FROM authorization_audit_log
+WHERE target_user_id = 'user-123'
+ORDER BY created_at DESC;
+```
+
+```sql
+SELECT *
+FROM authorization_audit_log
+WHERE permission = 'athletes.delete.any'
+ORDER BY created_at DESC;
+```
+
+```sql
+SELECT *
+FROM authorization_audit_log
+WHERE action = 'role_permission.granted'
+  AND created_at > NOW() - INTERVAL '7 days'
+ORDER BY created_at DESC;
+```

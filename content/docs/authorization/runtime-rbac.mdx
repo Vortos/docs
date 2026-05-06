@@ -1,0 +1,138 @@
+---
+title: Runtime RBAC
+description: User roles, role permissions, database tables, stores, and how resolved permissions are assembled.
+---
+
+# Runtime RBAC
+
+Vortos separates static permission definitions from runtime grants.
+
+| Concern | Source |
+|---|---|
+| What permissions exist | `#[PermissionCatalog]` classes |
+| Which permissions a role has | `role_permissions` table |
+| Which roles a user has | `user_roles` table |
+| Which roles imply other roles | `config/authorization.php` role hierarchy |
+| Which permission a user has right now | `PermissionResolverInterface` |
+
+## Tables
+
+The authorization module ships migrations for:
+
+```sql
+CREATE TABLE role_permissions (
+    role VARCHAR(150) NOT NULL,
+    permission VARCHAR(190) NOT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (role, permission)
+);
+
+CREATE TABLE user_roles (
+    user_id VARCHAR(190) NOT NULL,
+    role VARCHAR(150) NOT NULL,
+    created_at TIMESTAMP(0) WITHOUT TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, role)
+);
+```
+
+Publish or run the module migrations before using runtime RBAC.
+
+## Seed default grants
+
+Catalog default grants are copied into `role_permissions` with:
+
+```bash
+php vortos auth:seed
+```
+
+Use dry-run in deployments and local debugging:
+
+```bash
+php vortos auth:seed --dry-run
+```
+
+## Assign roles to users
+
+```bash
+php vortos auth:user-role:assign user-123 ROLE_ADMIN \
+  --actor admin-1 \
+  --reason "Promoted after approval"
+```
+
+Remove roles:
+
+```bash
+php vortos auth:user-role:remove user-123 ROLE_ADMIN \
+  --actor admin-1 \
+  --reason "Access no longer required"
+```
+
+Expected side effects:
+
+1. The row in `user_roles` is inserted or removed.
+2. The user's authorization version is incremented.
+3. Their resolved permission cache is invalidated.
+4. An `authorization_audit_log` row is written.
+5. An admin mutation trace span may be emitted if enabled.
+
+## Grant permissions to roles
+
+```bash
+php vortos auth:role-permission:grant ROLE_SUPPORT orders.read.any \
+  --actor admin-1 \
+  --reason "Support team needs order lookup"
+```
+
+Revoke:
+
+```bash
+php vortos auth:role-permission:revoke ROLE_SUPPORT orders.read.any \
+  --actor admin-1 \
+  --reason "Temporary access ended"
+```
+
+Dangerous permissions require a non-empty `--reason`.
+
+## How resolved permissions are built
+
+`DatabasePermissionResolver` resolves a user like this:
+
+1. Start with roles from the JWT identity.
+2. Merge roles from `user_roles`.
+3. Expand roles through `RoleVoter`.
+4. Load permissions for all expanded roles from `role_permissions`.
+5. Add active temporal grants from Redis, if temporal storage is available.
+6. Return a `ResolvedPermissions` object.
+
+The result contains:
+
+```php
+$resolved->userId();
+$resolved->roles();
+$resolved->expandedRoles();
+$resolved->permissions();
+$resolved->has('orders.read.any');
+$resolved->temporalGrantCount();
+```
+
+## Inspect a user
+
+```bash
+php vortos auth:roles user-123
+php vortos auth:roles user-123 --json
+```
+
+Check a permission:
+
+```bash
+php vortos auth:can user-123 orders.read.any
+php vortos auth:can user-123 orders.read.any --role ROLE_SUPPORT
+```
+
+Explain a decision:
+
+```bash
+php vortos auth:explain user-123 orders.read.any --json
+```
+
+`auth:explain` is the command to use when a permission check is surprising. It shows the decision reason, roles, expanded roles, role permissions, authz version data, and deny-list state.

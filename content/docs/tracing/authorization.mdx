@@ -1,0 +1,91 @@
+---
+title: Authorization Tracing
+description: Trace authorization decisions, permission resolver cache behavior, and admin role/permission mutations.
+---
+
+# Authorization Tracing
+
+Authorization tracing is opt-in. It only emits spans when the tracing module is installed and the relevant authorization tracing switches are enabled.
+
+## Enable authorization spans
+
+```php title="config/authorization.php"
+use Vortos\Authorization\DependencyInjection\VortosAuthorizationConfig;
+
+return static function (VortosAuthorizationConfig $config): void {
+    $config
+        ->traceDecisions(true)
+        ->traceResolver(true)
+        ->traceAdminMutations(true);
+};
+```
+
+## Decision spans
+
+When `traceDecisions(true)` is enabled, `PolicyEngine` creates:
+
+```text
+authorization.decision
+```
+
+Attributes include:
+
+| Attribute | Meaning |
+|---|---|
+| `authorization.permission` | Permission being checked |
+| `authorization.user_id_hash` | SHA-256 hash of the user ID |
+| `authorization.scoped` | Whether scoped permission checking is involved |
+| `authorization.critical` | Whether break-glass bypass is disabled for this decision |
+| `authorization.allowed` | Final boolean result |
+| `authorization.reason` | Decision reason |
+
+User IDs are hashed before they are placed on spans.
+
+## Resolver spans
+
+When `traceResolver(true)` is enabled, resolver work can emit:
+
+```text
+authorization.resolver.database
+authorization.resolver.cache_hit
+authorization.resolver.cache_miss
+```
+
+Database resolver spans include counts for roles, expanded roles, permissions, and temporal grants.
+
+Cache spans help answer:
+
+1. Did this request use the Redis permission cache?
+2. Did the cache entry become stale because role generations changed?
+3. Is the database resolver being hit more often than expected?
+
+## Admin mutation spans
+
+When `traceAdminMutations(true)` is enabled, role and permission changes emit spans such as:
+
+```text
+authorization.admin.user_role.assign
+authorization.admin.user_role.remove
+authorization.admin.role_permission.grant
+authorization.admin.role_permission.revoke
+```
+
+Attributes include hashed actor/target user IDs, role, and permission.
+
+## Disable noisy authorization spans
+
+Authorization spans use the tracing module tag:
+
+```php
+TracingModule::Authorization
+```
+
+You can disable the whole module:
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingModule;
+
+$config->disable(TracingModule::Authorization);
+```
+
+This keeps other tracing modules active while suppressing authorization spans.
