@@ -50,7 +50,7 @@ php vortos setup --profile=minimal
 |---|---|---|---|---|
 | `docker` | FrankenPHP Docker | Redis | Kafka | You want the current full Docker stack |
 | `minimal` | Local PHP | In-memory | In-memory | You want the quickest local setup |
-| `custom` | Interactive choice | Interactive choice | Interactive choice | You want to choose the underlying preset |
+| `custom` | Interactive choice | Interactive choice | Interactive choice | You want to choose each setup category |
 
 Profiles do not mean every application must use the same infrastructure. They are shortcuts over the capabilities Vortos currently ships. Future packages can add more choices.
 
@@ -62,7 +62,56 @@ Customize
 Cancel
 ```
 
-Choose `Customize` to select a specific runtime preset before setup writes files.
+Choose `Customize` to walk through each setup category before setup writes files:
+
+| Category | Current choices |
+|---|---|
+| Runtime | FrankenPHP Docker, PHP-FPM Docker, Local PHP |
+| Write database | PostgreSQL |
+| Read database | None, MongoDB |
+| Cache | Redis, in-memory cache |
+| Messaging | Kafka, in-memory messaging |
+
+Some categories have only one supported option today. They are still part of the custom flow so future packages can add more choices without changing how setup works.
+
+Setup choices are registered as capabilities, not hardcoded in the setup command. The command reads capabilities by category and renders whatever is available.
+
+## Adding Setup Options From Modules
+
+A module can add a new setup option by registering a `SetupCapabilityInterface` service tagged with `vortos.setup_capability`.
+
+Use this key format:
+
+```text
+category.option
+```
+
+Supported categories:
+
+| Category | Purpose | Example keys |
+|---|---|---|
+| `runtime` | PHP runtime and process model | `runtime.roadrunner` |
+| `write_db` | Primary write database | `write_db.mysql` |
+| `read_db` | Optional read/projection database | `read_db.postgres` |
+| `cache` | Cache driver | `cache.memcached` |
+| `messaging` | Message broker or in-memory driver | `messaging.rabbitmq` |
+
+Example module registration:
+
+```php title="MySqlPersistenceExtension.php"
+use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Vortos\Setup\Capability\StaticSetupCapability;
+
+$container->register('vortos.mysql.setup_capability', StaticSetupCapability::class)
+    ->setArgument('$key', 'write_db.mysql')
+    ->setArgument('$label', 'MySQL')
+    ->setArgument('$category', 'write_db')
+    ->setArgument('$composerPackages', ['vortos/vortos-persistence-mysql'])
+    ->addTag('vortos.setup_capability')
+    ->setPublic(false);
+```
+
+That makes the option appear in the matching `Customize` step. The module still needs to provide the actual implementation behind the choice: services, config defaults, environment mapping, Docker support if needed, migrations if needed, and tests.
 
 ## Presets
 
