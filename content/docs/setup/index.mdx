@@ -37,6 +37,23 @@ cd my-app
 php vortos setup
 ```
 
+## Profiles
+
+Profiles are shortcuts for common setup paths:
+
+```bash
+php vortos setup --profile=docker
+php vortos setup --profile=minimal
+```
+
+| Profile | Runtime | Cache | Messaging | Use when |
+|---|---|---|---|---|
+| `docker` | FrankenPHP Docker | Redis | Kafka | You want the current full Docker stack |
+| `minimal` | Local PHP | In-memory | In-memory | You want the quickest local setup |
+| `custom` | Interactive choice | Interactive choice | Interactive choice | You want to choose the underlying preset |
+
+Profiles do not mean every application must use the same infrastructure. They are shortcuts over the capabilities Vortos currently ships. Future packages can add more choices.
+
 ## Presets
 
 Use the interactive menu or pass a preset explicitly:
@@ -59,17 +76,32 @@ php vortos setup --preset=minimal
 
 Setup writes machine-specific values to `.env.local` and leaves `.env` as the base project template.
 
+Commit `.env` when it contains shared, non-secret project defaults. Do not commit `.env.local`, `.env.*.local`, `.vortos-setup.json`, or generated backup files such as `*.bak.*`.
+
+Use the files this way:
+
+| File | Commit? | Purpose |
+|---|---:|---|
+| `.env` | Yes | Shared defaults that are safe for every developer and environment template |
+| `.env.example` | Yes | Example values and notes for new projects |
+| `.env.local` | No | Local machine overrides, generated secrets, service hosts, driver choices |
+| `.vortos-setup.json` | No | Local setup state used by repeat setup runs |
+
 Generated values include:
 
 ```bash
+APP_NAME=my_app
 APP_ENV=dev
 APP_DEBUG=true
 JWT_SECRET=...
 HEALTH_DETAILS=debug
 HEALTH_TOKEN=...
 VORTOS_CACHE_DRIVER=redis
+VORTOS_CACHE_PREFIX=dev_my_app_
 VORTOS_MESSAGING_DRIVER=kafka
 ```
+
+For Docker-managed services, setup generates local passwords and stores them in `.env.local`. It does not ask for credentials during normal first-run setup. Existing secrets are preserved on rerun unless you pass `--regenerate-secrets`.
 
 For Docker presets, setup publishes Docker files for the selected runtime. For local presets, setup configures in-memory cache and messaging so the framework can boot without Redis or Kafka.
 
@@ -80,8 +112,8 @@ For Docker presets, setup publishes Docker files for the selected runtime. For l
 It detects previous setup state in `.vortos-setup.json`, preserves generated secrets, reports unchanged values, and creates backups before replacing existing Docker files.
 
 ```bash
-php vortos setup --preset=local
-php vortos setup --preset=docker-frankenphp
+php vortos setup --profile=minimal
+php vortos setup --profile=docker
 ```
 
 Changing choices is allowed, but infrastructure-sensitive changes still require developer judgment. For example, switching runtime is safe; switching databases after migrations have been applied should be reviewed before changing production data.
@@ -91,7 +123,7 @@ Changing choices is allowed, but infrastructure-sensitive changes still require 
 Preview setup without writing files:
 
 ```bash
-php vortos setup --preset=docker-frankenphp --dry-run --no-interaction
+php vortos setup --profile=docker --dry-run --no-interaction
 ```
 
 Use this in CI to verify the setup path without modifying the workspace.
@@ -116,7 +148,7 @@ For CI, templates, and automated scaffolding:
 
 ```bash
 php vortos setup \
-  --preset=docker-frankenphp \
+  --profile=docker \
   --no-interaction
 ```
 
@@ -124,9 +156,13 @@ Useful flags:
 
 | Flag | Meaning |
 |---|---|
+| `--profile=...` | Select a setup profile without prompts |
 | `--preset=...` | Select a setup without prompts |
 | `--dry-run` | Preview changes only |
+| `--regenerate-secrets` | Generate new local secrets and service passwords |
 | `--skip-docker-publish` | Configure env/state but do not publish Docker files |
+| `--no-docker-overwrite` | Skip changed Docker files |
+| `--no-docker-backup` | Overwrite Docker files without `.bak` files |
 | `--publish-migrations` | Include migration publishing in the final checklist |
 | `--run-migrations` | Include migration application in the final checklist |
 
@@ -137,7 +173,7 @@ Vortos can run without Docker.
 Use:
 
 ```bash
-php vortos setup --preset=local
+php vortos setup --profile=minimal
 php -S 127.0.0.1:8000 -t public
 ```
 
