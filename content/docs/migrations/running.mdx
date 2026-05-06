@@ -1,0 +1,60 @@
+---
+title: Running Migrations
+description: Run pending migrations safely with preflight checks, advisory locking, dry runs, and production flags.
+---
+
+# Running Migrations
+
+Run all pending migrations:
+
+```bash
+php vortos migrate
+```
+
+Production deployment command:
+
+```bash
+php vortos migrate --force --no-interaction
+```
+
+Preview without executing:
+
+```bash
+php vortos migrate --dry-run --force
+```
+
+## Preflight
+
+Before executing SQL, Vortos checks pending module migrations against the live schema.
+
+If a pending migration owns objects that already exist, migration stops:
+
+```text
+Schema drift detected. No migrations were executed.
+
+→ App\Migrations\Version20260505114121 (Authorization/001_authorization_rbac.php)
+  Drift: compatible existing schema
+  existing table: role_permissions
+  existing table: user_roles
+
+If the existing schema is correct, run:
+  php vortos migrate:adopt VERSION --verify
+```
+
+This prevents duplicate table errors and avoids hiding drift behind `IF NOT EXISTS`.
+
+## Locking
+
+On PostgreSQL, `vortos:migrate` uses an advisory lock so two deployment runners cannot migrate at the same time.
+
+```bash
+php vortos migrate --lock-timeout=60
+```
+
+If the lock cannot be acquired:
+
+```text
+Another migration process is already running.
+```
+
+`--no-lock` exists for unusual local/debug workflows. Do not use it in production.

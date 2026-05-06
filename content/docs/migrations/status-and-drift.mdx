@@ -1,0 +1,53 @@
+---
+title: Status and Drift
+description: Understand migrated, pending, orphaned, clean, compatible existing, partial, and unknown migration states.
+---
+
+# Status and Drift
+
+Check migration state:
+
+```bash
+php vortos migrate:status
+```
+
+Machine-readable output:
+
+```bash
+php vortos migrate:status --json
+```
+
+## Status Fields
+
+| Field | Meaning |
+|---|---|
+| `migrated` | Migration is recorded in `vortos_migrations` |
+| `pending` | Migration class exists but is not recorded |
+| `orphaned` | Migration is recorded but the class no longer exists |
+| `tracked` | Migrated and not checked for drift |
+| `clean` | Pending module migration owns objects that do not exist yet |
+| `compatible_existing` | Pending migration owns objects that already exist and appear compatible |
+| `partial` | Some owned objects or expected columns/indexes are missing |
+| `unknown` | Vortos has no ownership metadata |
+
+## Compatible Existing
+
+This usually means the SQL was already applied manually or migration metadata was lost.
+
+Do not rerun the migration. Adopt it after verification:
+
+```bash
+php vortos migrate:adopt Version20260505114121 --verify
+```
+
+## Partial
+
+Partial means the schema is not safe to adopt automatically.
+
+Examples:
+
+- table exists but index is missing
+- table exists but a column from the provider is missing
+- one table exists but another table owned by the same migration does not
+
+Fix partial drift with a repair migration or manual database work, then rerun status.

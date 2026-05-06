@@ -1,0 +1,54 @@
+---
+title: Production
+description: Production-safe migration workflow for Vortos applications.
+---
+
+# Production Migration Workflow
+
+Use this order in production deployments:
+
+```bash
+php vortos migrate:publish
+php vortos migrate:status --json
+php vortos migrate --force --no-interaction
+```
+
+If status or migrate reports compatible existing schema:
+
+```bash
+php vortos migrate:adopt Version20260505114121 --verify --dry-run
+php vortos migrate:adopt Version20260505114121 --verify --force
+php vortos migrate --force --no-interaction
+```
+
+## Rules
+
+- Do not run `migrate:fresh` in production.
+- Do not use `migrate:baseline` unless transitioning a fully verified existing database.
+- Do not use `--no-lock` in production.
+- Do not edit old migration classes after they have shipped.
+- Always run `migrate:status` before `migrate` when investigating schema problems.
+
+## Duplicate Table Errors
+
+If you see:
+
+```text
+relation "role_permissions" already exists
+```
+
+the likely cause is metadata drift:
+
+```text
+table exists physically
+but migration is not recorded in vortos_migrations
+```
+
+Use:
+
+```bash
+php vortos migrate:status
+php vortos migrate:adopt Version20260505114121 --verify
+```
+
+Do not drop the table unless this is a disposable local database.

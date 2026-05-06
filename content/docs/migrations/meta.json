@@ -1,0 +1,11 @@
+{
+  "title": "Migrations",
+  "pages": [
+    "index",
+    "module-schema-providers",
+    "running",
+    "status-and-drift",
+    "adopting-existing-schema",
+    "production"
+  ]
+}

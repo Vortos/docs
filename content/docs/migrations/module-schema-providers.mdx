@@ -1,0 +1,79 @@
+---
+title: Module Schema Providers
+description: Define framework module migrations as Doctrine DBAL Schema objects instead of raw SQL.
+---
+
+# Module Schema Providers
+
+Framework modules should define migrations with DBAL schema providers.
+
+Provider files live at:
+
+```text
+packages/Vortos/src/{Module}/Resources/migrations/*.php
+```
+
+Each file returns an object implementing `ModuleSchemaProviderInterface`.
+
+```php title="packages/Vortos/src/Authorization/Resources/migrations/001_authorization_rbac.php"
+use Doctrine\DBAL\Schema\Schema;
+use Vortos\Migration\Schema\AbstractModuleSchemaProvider;
+
+return new class extends AbstractModuleSchemaProvider {
+    public function module(): string
+    {
+        return 'Authorization';
+    }
+
+    public function id(): string
+    {
+        return 'authorization.rbac';
+    }
+
+    public function description(): string
+    {
+        return 'Authorization rbac';
+    }
+
+    public function define(Schema $schema): void
+    {
+        $roles = $schema->createTable('role_permissions');
+        $roles->addColumn('role', 'string', ['length' => 150]);
+        $roles->addColumn('permission', 'string', ['length' => 190]);
+        $roles->addColumn('created_at', 'datetime_immutable');
+        $roles->setPrimaryKey(['role', 'permission']);
+        $roles->addIndex(['role'], 'idx_role_permissions_role');
+    }
+};
+```
+
+The provider gives Vortos structured ownership metadata:
+
+```json
+{
+  "tables": ["role_permissions"],
+  "indexes": ["idx_role_permissions_role"]
+}
+```
+
+That metadata powers drift detection and adoption.
+
+## Publishing
+
+```bash
+php vortos migrate:publish
+```
+
+Publishing generates Doctrine migration classes under:
+
+```text
+migrations/
+```
+
+For DBAL providers, generated `CREATE TABLE` and `CREATE INDEX` statements are made idempotent with `IF NOT EXISTS`. Preflight still checks for schema drift before execution.
+
+## Legacy SQL Stubs
+
+Legacy `.sql` files are still supported. If a `.php` schema provider and `.sql` file share the same base name, the provider wins.
+
+This keeps old projects compatible while moving framework modules to structured definitions.

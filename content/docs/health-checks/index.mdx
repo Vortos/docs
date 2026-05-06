@@ -1,155 +1,215 @@
 ---
 title: Health Checks
-description: Built-in and custom health checks with a scrubbed public endpoint and a token-gated detail endpoint — 503 on degraded.
+description: Production health endpoints, readiness checks, token-gated diagnostics, criticality, and custom health checks.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Health Checks
 
-Vortos exposes a `GET /health` endpoint backed by a registry of named checks. Each check reports whether a dependency is reachable and how long it took. The public response is scrubbed. Full detail — including latency and error messages — requires a bearer token.
+Vortos ships with health endpoints for load balancers, container platforms, monitoring tools, and human debugging. The framework separates “the process is alive” from “the app can safely receive traffic” so production infrastructure can make the right decision.
 
-## Architecture
+## Endpoints
 
-```
-GET /health
-    │
-    ▼
-HealthController
-    │
-    ▼
-HealthRegistry::run()
-    ├── DatabaseHealthCheck::check()      ← PostgreSQL via DBAL
-    ├── MongoHealthCheck::check()         ← MongoDB
-    ├── RedisHealthCheck::check()         ← Redis
-    ├── KafkaHealthCheck::check()         ← Kafka
-    └── YourCustomHealthCheck::check()    ← your checks
-    │
-    ▼
-All healthy → 200 {"status":"ok", ...}
-Any degraded → 503 {"status":"degraded", ...}
-```
+| Endpoint | Purpose | Runs dependency checks | Fails on optional checks |
+|---|---:|---:|---:|
+| `GET /health/live` | Process liveness | No | No |
+| `GET /health/ready` | Traffic readiness | Critical checks only | No |
+| `GET /health` | Operational summary | All checks | No |
 
-## The /health Endpoint
+Use `/health/live` for container liveness probes. Use `/health/ready` for Kubernetes readiness probes, deployment gates, and load balancer traffic decisions. Use `/health` for dashboards and humans.
 
-### Public Response (no token)
+## Liveness
 
-```
-GET /health
+```bash
+curl -i http://localhost:8000/health/live
 ```
 
 ```json
 {
   "status": "ok",
+  "mode": "live",
+  "timestamp": "2026-05-06T10:35:21+00:00"
+}
+```
+
+`/health/live` does not touch the database, Redis, MongoDB, Kafka, or any custom check. It only tells the platform that the PHP process can answer HTTP.
+
+## Readiness
+
+```bash
+curl -i http://localhost:8000/health/ready
+```
+
+```json
+{
+  "status": "ok",
+  "mode": "ready",
+  "timestamp": "2026-05-06T10:35:21+00:00",
   "checks": {
     "database": { "status": "ok" },
-    "redis":    { "status": "ok" }
+    "redis": { "status": "ok" }
   }
 }
 ```
 
-Latency and error details are stripped. Safe to expose to load balancer health probes without leaking infrastructure detail.
-
-### Detailed Response (with token)
-
-```
-GET /health
-X-Health-Token: your-secret-token
-```
-
-```json
-{
-  "status": "ok",
-  "checks": {
-    "database": { "status": "ok", "latency_ms": 1.2 },
-    "redis":    { "status": "ok", "latency_ms": 0.4 }
-  }
-}
-```
-
-### Degraded Response (503)
-
-When any check fails, the endpoint returns `503 Service Unavailable` regardless of the token:
+Readiness runs only critical checks. If a critical check is degraded, Vortos returns `503 Service Unavailable`:
 
 ```json
 {
   "status": "degraded",
+  "mode": "ready",
+  "checks": {
+    "database": { "status": "degraded" }
+  }
+}
+```
+
+## Full Health Summary
+
+```bash
+curl -i http://localhost:8000/health
+```
+
+```json
+{
+  "status": "ok",
+  "mode": "health",
+  "timestamp": "2026-05-06T10:35:21+00:00",
+  "checks": {
+    "database": { "status": "ok" },
+    "redis": { "status": "ok" },
+    "kafka": { "status": "degraded" }
+  }
+}
+```
+
+`/health` runs every registered check. Optional degraded checks are reported, but they do not make the endpoint return `503`. Critical degraded checks do.
+
+## Detail Policy
+
+Public responses only show per-check status. Detailed responses include latency, criticality, timeout markers, and stable error codes.
+
+Vortos reads detail behavior from environment variables:
+
+```bash
+HEALTH_DETAILS=debug
+HEALTH_TOKEN=change-me
+HEALTH_EXPOSE_ERRORS=false
+```
+
+| Variable | Default | Values | Meaning |
+|---|---|---|---|
+| `HEALTH_DETAILS` | `debug` | `debug`, `token`, `never`, `always` | Controls when detailed output is returned |
+| `HEALTH_TOKEN` | empty | any secret string | Required when detail access uses the token path |
+| `HEALTH_EXPOSE_ERRORS` | `false` | boolean | Allows raw exception messages outside dev/debug |
+
+Policies:
+
+| Policy | Behavior |
+|---|---|
+| `debug` | Detailed output in `APP_ENV=dev` or `APP_DEBUG=true`; token also works in other environments |
+| `token` | Detailed output only when `X-Health-Token` matches `HEALTH_TOKEN` |
+| `never` | Detailed output is disabled |
+| `always` | Detailed output is always returned |
+
+<Callout type="warn" title="Production Default">
+Keep `HEALTH_DETAILS=debug` or `HEALTH_DETAILS=token` in production and set a strong `HEALTH_TOKEN`. Do not use `always` on a public network.
+</Callout>
+
+## Detailed Output
+
+```bash
+curl \
+  -H "X-Health-Token: change-me" \
+  http://localhost:8000/health
+```
+
+```json
+{
+  "status": "degraded",
+  "mode": "health",
   "checks": {
     "database": {
-      "status":     "degraded",
-      "latency_ms": 312.1,
-      "error":      "Connection refused"
+      "status": "degraded",
+      "latency_ms": 14.22,
+      "critical": true,
+      "error_code": "database_unreachable"
+    },
+    "kafka": {
+      "status": "degraded",
+      "latency_ms": 0,
+      "critical": false,
+      "error_code": "kafka_extension_missing"
     }
   }
 }
 ```
 
-HTTP 503 makes this compatible with load balancer health checks that gate traffic on status codes.
+Raw exception messages are hidden outside `APP_ENV=dev` and `APP_DEBUG=true` unless `HEALTH_EXPOSE_ERRORS=true` is set:
 
-## Environment Variables
-
-```bash
-HEALTH_TOKEN=your-secret-token
+```json
+{
+  "status": "degraded",
+  "latency_ms": 14.22,
+  "critical": true,
+  "error_code": "database_unreachable",
+  "error": "SQLSTATE[08006] connection failed"
+}
 ```
-
-If `HEALTH_TOKEN` is not set, the detailed response is never returned — the public scrubbed response is always served.
-
-<Callout type="warn" title="Set HEALTH_TOKEN in Production">
-Without `HEALTH_TOKEN`, there is no way to retrieve latency or error detail from the endpoint. Set it in your environment and store it alongside your other operational secrets.
-</Callout>
 
 ## Built-In Checks
 
-Each check auto-registers when its module is active. Nothing needs to be wired manually.
+| Check | Module | Critical | What it does |
+|---|---|---:|---|
+| `database` | Persistence DBAL | Yes | Executes `SELECT 1` through Doctrine DBAL |
+| `redis` | Cache | Yes | Sends Redis `PING` |
+| `mongodb` | Persistence Mongo | Yes | Sends MongoDB admin `ping` |
+| `kafka` | Messaging | No | Fetches Kafka broker metadata when Kafka transports exist |
 
-| Check name | Module required | What it checks |
-|---|---|---|
-| `database` | `vortos-persistence-dbal` | PostgreSQL — `SELECT 1` via DBAL `Connection` |
-| `mongodb` | `vortos-persistence-mongo` | MongoDB — `ping` command on the database |
-| `redis` | `vortos-cache` | Redis — `PING` command |
-| `kafka` | `vortos-messaging` | Kafka — metadata fetch from broker |
+If a module is not active, its check is not registered.
 
-If a module is not installed, its check is simply absent from the registry — no configuration required.
+## Criticality
 
-## Writing a Custom Health Check
+Critical checks decide whether `/health/ready` and `/health` return `200` or `503`. Optional checks are useful for visibility, but they do not remove the instance from service.
 
-Implement `HealthCheckInterface` and add `#[AsHealthCheck]`. The attribute auto-registers the check — no manual DI wiring.
+Use critical checks for dependencies required to serve normal traffic. Use optional checks for background systems, analytics pipelines, or integrations where the app can still handle requests.
 
-### HealthCheckInterface
+## Timeouts
 
-```php
-interface HealthCheckInterface
+Each health check can declare a timeout in milliseconds. If a check reports latency above that timeout, Vortos marks it degraded with:
+
+```json
 {
-    public function name(): string;
-    public function check(): HealthResult;
+  "status": "degraded",
+  "error_code": "health_check_timeout",
+  "timed_out": true
 }
 ```
 
-### HealthResult
+<Callout type="info" title="Timeout Semantics">
+The timeout is enforced as a health classification after the check returns. Configure the underlying client timeouts too, so database, Redis, MongoDB, Kafka, and HTTP clients cannot block the request for too long.
+</Callout>
 
-```php
-final class HealthResult
-{
-    public function __construct(
-        public readonly string  $name,
-        public readonly bool    $healthy,
-        public readonly float   $latencyMs,
-        public readonly ?string $error = null,
-    ) {}
-}
-```
+## Custom Checks
 
-### Example
+Add `#[AsHealthCheck]` to any class that implements `HealthCheckInterface`.
 
 ```php title="src/Payment/Infrastructure/Health/PaymentGatewayHealthCheck.php"
+<?php
+
+declare(strict_types=1);
+
+namespace App\Payment\Infrastructure\Health;
+
 use Vortos\Foundation\Health\Attribute\AsHealthCheck;
 use Vortos\Foundation\Health\Contract\HealthCheckInterface;
 use Vortos\Foundation\Health\HealthResult;
 
-#[AsHealthCheck]
+#[AsHealthCheck(critical: false, timeoutMs: 1500)]
 final class PaymentGatewayHealthCheck implements HealthCheckInterface
 {
-    public function __construct(private readonly PaymentClient $client) {}
+    public function __construct(private readonly PaymentGatewayClient $client) {}
 
     public function name(): string
     {
@@ -159,66 +219,58 @@ final class PaymentGatewayHealthCheck implements HealthCheckInterface
     public function check(): HealthResult
     {
         $start = hrtime(true);
+
         try {
             $this->client->ping();
-            return new HealthResult(
-                name:      $this->name(),
-                healthy:   true,
-                latencyMs: (hrtime(true) - $start) / 1e6,
-            );
+
+            return new HealthResult($this->name(), true, $this->ms($start));
         } catch (\Throwable $e) {
             return new HealthResult(
-                name:      $this->name(),
-                healthy:   false,
-                latencyMs: (hrtime(true) - $start) / 1e6,
-                error:     $e->getMessage(),
+                $this->name(),
+                false,
+                $this->ms($start),
+                $e->getMessage(),
+                'payment_gateway_unreachable',
             );
         }
     }
-}
-```
 
-`#[AsHealthCheck]` is detected by `HealthCheckCompilerPass` at compile time. The check is registered in `HealthRegistry` automatically — no entry in `config/services.php` is needed.
-
-### Always Catch \Throwable
-
-Health checks run during a live request. An uncaught exception propagates as a 500, not a 503. Always wrap your check in `try/catch \Throwable` and return a degraded `HealthResult` — the endpoint will convert that to 503 correctly.
-
-## HealthRegistry
-
-`HealthRegistry` holds all registered checks and runs them on demand. You can inject it to run checks programmatically — for example, in a readiness gate before starting a worker:
-
-```php
-use Vortos\Health\HealthRegistry;
-
-final class WorkerBootstrap
-{
-    public function __construct(private readonly HealthRegistry $registry) {}
-
-    public function assertReady(): void
+    private function ms(int $start): float
     {
-        $results = $this->registry->run();
-
-        foreach ($results as $result) {
-            if (!$result->healthy) {
-                throw new \RuntimeException(
-                    "Dependency '{$result->name}' is not ready: {$result->error}"
-                );
-            }
-        }
+        return round((hrtime(true) - $start) / 1_000_000, 2);
     }
 }
 ```
 
-## Deployment Use
+The compiler pass auto-registers attributed checks from `src/`. Framework modules register their own checks through their package extension.
 
-```bash
-# Wait for readiness in a deploy script
-until curl -sf http://localhost/health; do
-  echo "Waiting for /health..."
-  sleep 2
-done
-echo "Application is healthy."
+## Deployment Examples
+
+Kubernetes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8000
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
 ```
 
-For staging and production, use the `X-Health-Token` header in your monitoring system to capture latency trends without exposing them publicly.
+Deployment gate:
+
+```bash
+until curl -sf http://localhost:8000/health/ready; do
+  sleep 2
+done
+```
+
+Monitoring with details:
+
+```bash
+curl -sf \
+  -H "X-Health-Token: $HEALTH_TOKEN" \
+  http://localhost:8000/health
+```

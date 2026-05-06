@@ -1,0 +1,47 @@
+---
+title: Migrations
+description: Doctrine-backed Vortos migrations, module schema providers, drift detection, adoption, and production deployment rules.
+---
+
+# Migrations
+
+Vortos migrations are built on Doctrine Migrations and use the shared DBAL connection.
+
+The framework adds module-aware behavior on top:
+
+- framework modules can ship structured DBAL schema providers
+- `vortos:migrate:publish` publishes module schema into app migration classes
+- `.vortos-published.json` records source, owning module, checksum, tables, and indexes
+- `vortos:migrate:status` reports pending/migrated state and schema drift
+- `vortos:migrate` runs preflight before executing SQL
+- `vortos:migrate:adopt` marks verified existing schema as executed
+- PostgreSQL advisory locking prevents concurrent migration runners
+
+## Commands
+
+```bash
+php vortos migrate:publish
+php vortos migrate:status
+php vortos migrate
+php vortos migrate:adopt Version20260505114121 --verify
+php vortos migrate:rollback --steps=1
+php vortos migrate:fresh --force
+```
+
+`migrate:fresh` is blocked in `prod`.
+
+## Tracking
+
+Doctrine tracks executed migrations in:
+
+```text
+vortos_migrations
+```
+
+Vortos tracks module publish metadata in:
+
+```text
+migrations/.vortos-published.json
+```
+
+The Doctrine table answers "did this migration run?". The Vortos manifest answers "which module migration source produced this migration and which schema objects does it own?".

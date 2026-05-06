@@ -7,6 +7,7 @@
     "messaging",
     "cqrs",
     "persistence",
+    "migrations",
     "cache",
     "tracing",
     "health-checks",

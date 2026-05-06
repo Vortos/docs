@@ -1,0 +1,49 @@
+---
+title: Adopting Existing Schema
+description: Use migrate:adopt to mark verified existing module schema as executed without broad baselining.
+---
+
+# Adopting Existing Schema
+
+Use adoption when schema objects already exist but the migration is not tracked in `vortos_migrations`.
+
+## Adopt One Migration
+
+```bash
+php vortos migrate:adopt Version20260505114121 --verify
+```
+
+`--verify` requires the schema to be `compatible_existing`.
+
+Dry run:
+
+```bash
+php vortos migrate:adopt Version20260505114121 --verify --dry-run
+```
+
+JSON:
+
+```bash
+php vortos migrate:adopt Version20260505114121 --verify --json
+```
+
+## Adopt All Compatible
+
+```bash
+php vortos migrate:adopt --all-compatible --dry-run
+php vortos migrate:adopt --all-compatible --force
+```
+
+This only adopts pending module migrations whose owned schema exists and verifies as compatible.
+
+## Adopt vs Baseline
+
+Prefer adoption in production.
+
+| Command | Use Case |
+|---|---|
+| `migrate:adopt VERSION --verify` | Mark one verified migration as executed |
+| `migrate:adopt --all-compatible` | Mark all verified compatible module migrations |
+| `migrate:baseline` | Mark all pending migrations as executed during one-time transition |
+
+`baseline` is broad. It should only be used when every pending migration has already been physically applied and reviewed.
