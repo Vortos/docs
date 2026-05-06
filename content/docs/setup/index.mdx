@@ -1,0 +1,148 @@
+---
+title: Project Setup
+description: Cross-platform first-run setup for Docker and local Vortos development.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Project Setup
+
+Vortos includes an interactive setup command for first-run project configuration:
+
+```bash
+php vortos setup
+```
+
+The command works on Linux, macOS, and Windows. It uses Symfony Console prompts and PHP filesystem APIs instead of Bash scripts, so it does not depend on `rm`, `sh`, `stty`, `tput`, or Unix symlinks.
+
+## Composer First Run
+
+New projects run setup automatically through Composer:
+
+```json title="composer.json"
+{
+  "scripts": {
+    "post-create-project-cmd": [
+      "@php vortos setup --first-run"
+    ]
+  }
+}
+```
+
+The setup command can be skipped by Composer with Composer's normal `--no-scripts` flag, then run later:
+
+```bash
+composer create-project vortos/vortos my-app --no-scripts
+cd my-app
+php vortos setup
+```
+
+## Presets
+
+Use the interactive menu or pass a preset explicitly:
+
+```bash
+php vortos setup --preset=docker-frankenphp
+php vortos setup --preset=docker-phpfpm
+php vortos setup --preset=local
+php vortos setup --preset=minimal
+```
+
+| Preset | Runtime | Cache | Messaging | Best for |
+|---|---|---|---|---|
+| `docker-frankenphp` | Docker + FrankenPHP | Redis | Kafka | Default full-stack development |
+| `docker-phpfpm` | Docker + PHP-FPM/Nginx | Redis | Kafka | Teams standardizing on Nginx/PHP-FPM |
+| `local` | Local PHP | In-memory | In-memory | Fast local work without Docker services |
+| `minimal` | Local PHP | In-memory | In-memory | Learning, examples, CI smoke checks |
+
+## What Setup Writes
+
+Setup writes machine-specific values to `.env.local` and leaves `.env` as the base project template.
+
+Generated values include:
+
+```bash
+APP_ENV=dev
+APP_DEBUG=true
+JWT_SECRET=...
+HEALTH_DETAILS=debug
+HEALTH_TOKEN=...
+VORTOS_CACHE_DRIVER=redis
+VORTOS_MESSAGING_DRIVER=kafka
+```
+
+For Docker presets, setup publishes Docker files for the selected runtime. For local presets, setup configures in-memory cache and messaging so the framework can boot without Redis or Kafka.
+
+## Repeat Runs
+
+`php vortos setup` is safe to run more than once.
+
+It detects previous setup state in `.vortos-setup.json`, preserves generated secrets, reports unchanged values, and creates backups before replacing existing Docker files.
+
+```bash
+php vortos setup --preset=local
+php vortos setup --preset=docker-frankenphp
+```
+
+Changing choices is allowed, but infrastructure-sensitive changes still require developer judgment. For example, switching runtime is safe; switching databases after migrations have been applied should be reviewed before changing production data.
+
+## Dry Run
+
+Preview setup without writing files:
+
+```bash
+php vortos setup --preset=docker-frankenphp --dry-run --no-interaction
+```
+
+Use this in CI to verify the setup path without modifying the workspace.
+
+## Environment Checks
+
+Setup checks:
+
+| Check | Why it matters |
+|---|---|
+| PHP version | Vortos requires PHP 8.2+ |
+| JSON/OpenSSL extensions | Required by framework services and token generation |
+| Project writability | Required to write `.env.local`, Docker files, and setup state |
+| Docker CLI | Required for Docker presets |
+| Redis/Mongo/Kafka extensions | Required locally when those services are selected outside Docker |
+
+The command reports checks as `OK` or `Needs attention`. It does not hide missing tools.
+
+## Non-Interactive Setup
+
+For CI, templates, and automated scaffolding:
+
+```bash
+php vortos setup \
+  --preset=docker-frankenphp \
+  --no-interaction
+```
+
+Useful flags:
+
+| Flag | Meaning |
+|---|---|
+| `--preset=...` | Select a setup without prompts |
+| `--dry-run` | Preview changes only |
+| `--skip-docker-publish` | Configure env/state but do not publish Docker files |
+| `--publish-migrations` | Include migration publishing in the final checklist |
+| `--run-migrations` | Include migration application in the final checklist |
+
+## Local Development Without Docker
+
+Vortos can run without Docker.
+
+Use:
+
+```bash
+php vortos setup --preset=local
+php -S 127.0.0.1:8000 -t public
+```
+
+The local preset uses in-memory cache and messaging by default. If you want local PostgreSQL, Redis, MongoDB, or Kafka, install the service and PHP extension locally, then adjust `.env.local`.
+
+<Callout type="warn" title="Production">
+Do not use in-memory cache or messaging for production. They are for local development, tests, and simple examples.
+</Callout>

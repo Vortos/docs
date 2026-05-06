@@ -2,6 +2,7 @@
   "title": "Vortos Framework",
   "pages": [
     "getting-started",
+    "setup",
     "auth",
     "authorization",
     "messaging",
@@ -11,6 +12,7 @@
     "cache",
     "tracing",
     "health-checks",
+    "docker",
     "debug",
     "feature-flags"
   ]

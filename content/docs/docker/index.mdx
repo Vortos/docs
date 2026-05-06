@@ -38,7 +38,15 @@ php bin/console vortos:docker:publish --runtime=phpfpm
 php bin/console vortos:docker:publish -r phpfpm
 ```
 
-Files are copied from the package's `stubs/` directory into your project root. Existing files are overwritten.
+Files are copied from the package's `stubs/` directory into your project root. Changed existing files are backed up before replacement.
+
+Useful options:
+
+```bash
+php bin/console vortos:docker:publish --dry-run
+php bin/console vortos:docker:publish --no-overwrite
+php bin/console vortos:docker:publish --no-backup
+```
 
 ## FrankenPHP (Default)
 
@@ -170,8 +178,8 @@ CREATE TABLE IF NOT EXISTS dead_letters (...);
 
 These tables are required by `vortos-messaging`. They are created automatically when the PostgreSQL container starts.
 
-<Callout type="info" title="Re-publishing Overwrites Files">
-Running `vortos:docker:publish` again overwrites existing Docker files with the latest stubs from the package. If you have customised your Docker files, keep them in version control and review diffs after re-publishing.
+<Callout type="info" title="Re-publishing Is Safe">
+Running `vortos:docker:publish` again skips unchanged files and backs up changed files before replacing them. Use `--dry-run` to preview and `--no-overwrite` to protect local customisations.
 </Callout>
 
 ## Choosing a Runtime

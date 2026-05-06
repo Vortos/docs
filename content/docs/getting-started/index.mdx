@@ -31,20 +31,35 @@ composer create-project vortos/vortos my-app --stability=alpha
 cd my-app
 ```
 
-After installation, publish the Docker files:
+After installation, Vortos runs the setup wizard. Choose Docker or local development:
 
 ```bash
-# FrankenPHP (recommended — single binary, worker mode)
-php bin/console vortos:docker:publish
-
-# php-fpm + nginx (traditional)
-php bin/console vortos:docker:publish --runtime=phpfpm
+php vortos setup
 ```
 
-Start the application:
+For non-interactive setup:
 
 ```bash
-docker compose up -d
+php vortos setup --preset=docker-frankenphp --no-interaction
+php vortos setup --preset=local --no-interaction
+```
+
+Start the application with Docker:
+
+```bash
+php vortos up
+```
+
+Or run without Docker:
+
+```bash
+php -S 127.0.0.1:8000 -t public
+```
+
+Then check readiness:
+
+```bash
+curl http://localhost:8000/health/ready
 ```
 
 ## Project Structure
