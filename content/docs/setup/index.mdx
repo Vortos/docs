@@ -137,6 +137,26 @@ Setup writes machine-specific values to `.env.local` and leaves `.env` as the ba
 
 Commit `.env` when it contains shared, non-secret project defaults. Do not commit `.env.local`, `.env.*.local`, `.vortos-setup.json`, or generated backup files such as `*.bak.*`.
 
+Docker development files load `.env` first and `.env.local` second. Generated Docker passwords and service URLs should stay in `.env.local`; do not copy them into `.env`.
+
+Setup does not rewrite `config/*.php` files. Those files are override points for application-specific changes. The framework modules provide env-driven defaults first: setup writes `VORTOS_*` driver choices and DSNs to `.env.local`, then the module config objects use those env values unless a project config file overrides them. Without an env choice, local-safe in-memory drivers are used where possible.
+
+Framework modules read Vortos env names, not vendor-specific container env names:
+
+| Purpose | Framework env |
+|---|---|
+| Write database driver | `VORTOS_WRITE_DB_DRIVER` |
+| Write database DSN | `VORTOS_WRITE_DB_DSN` |
+| Read database driver | `VORTOS_READ_DB_DRIVER` |
+| Read database DSN | `VORTOS_READ_DB_DSN` |
+| Read database name | `VORTOS_READ_DB_NAME` |
+| Cache driver | `VORTOS_CACHE_DRIVER` |
+| Cache DSN | `VORTOS_CACHE_DSN` |
+| Messaging driver | `VORTOS_MESSAGING_DRIVER` |
+| Messaging DSN | `VORTOS_MESSAGING_DSN` |
+
+Docker images can still require vendor-specific env such as `POSTGRES_PASSWORD` or `MONGO_INITDB_ROOT_PASSWORD`. Setup generates those for service bootstrap, but framework modules do not read them.
+
 Use the files this way:
 
 | File | Commit? | Purpose |
@@ -156,8 +176,15 @@ JWT_SECRET=...
 HEALTH_DETAILS=debug
 HEALTH_TOKEN=...
 VORTOS_CACHE_DRIVER=redis
+VORTOS_CACHE_DSN=redis://redis:6379
 VORTOS_CACHE_PREFIX=dev_my_app_
 VORTOS_MESSAGING_DRIVER=kafka
+VORTOS_MESSAGING_DSN=kafka://kafka:9092
+VORTOS_WRITE_DB_DRIVER=postgres
+VORTOS_WRITE_DB_DSN=pgsql://postgres:...@write_db:5432/my_app
+VORTOS_READ_DB_DRIVER=mongo
+VORTOS_READ_DB_DSN=mongodb://root:...@read_db:27017
+VORTOS_READ_DB_NAME=my_app
 ```
 
 For Docker-managed services, setup generates local passwords and stores them in `.env.local`. It does not ask for credentials during normal first-run setup. Existing secrets are preserved on rerun unless you pass `--regenerate-secrets`.
