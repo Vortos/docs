@@ -158,27 +158,27 @@ Or via provisioning (see [Grafana setup](/docs/observability/grafana) for the fu
 In Grafana → **Explore → select Loki**:
 
 **All logs from the app channel:**
-```logql
+```text
 {job="vortos", channel="app"}
 ```
 
 **Error and above only:**
-```logql
+```text
 {job="vortos", level=~"ERROR|CRITICAL|ALERT|EMERGENCY"}
 ```
 
 **Logs containing a specific string:**
-```logql
+```text
 {job="vortos"} |= "payment failed"
 ```
 
 **Parse JSON and filter by a field value:**
-```logql
+```text
 {job="vortos"} | json | order_id = "ord-123"
 ```
 
 **Find all logs for a specific trace:**
-```logql
+```text
 {job="vortos"} | json | trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
 ```
 
