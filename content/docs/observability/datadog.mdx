@@ -1,0 +1,204 @@
+---
+title: Datadog
+description: Send Vortos metrics via DogStatsD and traces via OpenTelemetry to Datadog — Agent setup and full APM configuration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Datadog
+
+[Datadog](https://www.datadoghq.com) is a fully managed observability platform covering metrics, logs, and traces in one product. Vortos connects to Datadog in two ways:
+
+- **Metrics** via DogStatsD — the Datadog Agent accepts StatsD UDP datagrams and forwards them to Datadog
+- **Traces** via OpenTelemetry OTLP — the Datadog Agent accepts OTLP spans and maps them to Datadog APM traces
+
+You do not need to install a Datadog-specific SDK in your application — Vortos's standard StatsD and OpenTelemetry output is all that's needed.
+
+---
+
+## What you need
+
+- A Datadog account and API key ([datadoghq.com](https://www.datadoghq.com), free trial available)
+- The Datadog Agent running on your host or as a Docker container
+- `vortos-metrics` installed for metrics
+- `vortos-tracing` + OpenTelemetry SDK for traces (optional)
+
+---
+
+## Step 1 — Get your Datadog API key
+
+1. Log in to [app.datadoghq.com](https://app.datadoghq.com)
+2. Go to **Organization Settings → API Keys**
+3. Click **New Key**, name it (e.g. `my-app`), copy the key
+
+---
+
+## Step 2 — Run the Datadog Agent
+
+**Docker:**
+
+```yaml title="docker-compose.yml"
+services:
+  datadog-agent:
+    image: gcr.io/datadoghq/agent:7
+    environment:
+      DD_API_KEY: "${DD_API_KEY}"
+      DD_SITE: "datadoghq.com"          # or datadoghq.eu for EU region
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"   # accept StatsD from other containers
+      DD_APM_ENABLED: "true"
+      DD_APM_NON_LOCAL_TRAFFIC: "true"  # accept OTLP traces from other containers
+      DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT: "0.0.0.0:4318"
+    ports:
+      - "8125:8125/udp"   # DogStatsD
+      - "4318:4318"       # OTLP HTTP
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+```
+
+```bash title=".env"
+DD_API_KEY=your-datadog-api-key
+```
+
+```bash
+docker compose up -d datadog-agent
+```
+
+---
+
+## Step 3 — Configure Vortos metrics (StatsD → DogStatsD)
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config->adapter(MetricsAdapter::StatsD)
+           ->statsDHost($_ENV['DD_AGENT_HOST'] ?? '127.0.0.1')
+           ->statsDPort(8125)
+           ->statsDSampleRate(1.0);   // send all metrics — Datadog handles aggregation
+
+    // Optionally set metric prefix (all names become {namespace}.*)
+    $config->namespace('myapp');
+};
+```
+
+```bash title=".env"
+DD_AGENT_HOST=datadog-agent   # Docker service name, or 127.0.0.1 for same-host agent
+```
+
+<Callout type="info" title="DogStatsD tag format">
+Vortos uses the DogStatsD tag extension: `|#key:value,key:value`. This is natively supported by the Datadog Agent and maps directly to Datadog metric tags — no conversion needed.
+</Callout>
+
+---
+
+## Step 4 — Verify metrics in Datadog
+
+1. Make a few requests to your application
+2. In Datadog → **Metrics → Explorer**
+3. Search for `myapp.http_requests_total` (using your configured namespace)
+4. You should see the metric with tags like `method:POST`, `route:orders.place`, `status:201`
+
+If the metric doesn't appear within 60 seconds:
+```bash
+# Check the agent is receiving StatsD traffic
+docker compose exec datadog-agent agent status | grep DogStatsD
+```
+
+---
+
+## Step 5 — Configure Vortos traces (OpenTelemetry → Datadog APM)
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp
+```
+
+```php title="config/services.php"
+use OpenTelemetry\Contrib\Otlp\OtlpHttpSpanExporter;
+use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
+use OpenTelemetry\SDK\Trace\TracerProvider;
+use Vortos\Tracing\NoOpTracer;
+use Vortos\Tracing\OpenTelemetry\OpenTelemetryTracer;
+
+$services->set(OtlpHttpSpanExporter::class)
+    ->arg('$endpoint', $_ENV['OTEL_EXPORTER_OTLP_ENDPOINT'] ?? 'http://localhost:4318/v1/traces');
+
+$services->set(BatchSpanProcessor::class)
+    ->arg('$exporter', service(OtlpHttpSpanExporter::class));
+
+$services->set(TracerProvider::class)
+    ->call('addSpanProcessor', [service(BatchSpanProcessor::class)]);
+
+$services->set('otel.tracer')
+    ->factory([service(TracerProvider::class), 'getTracer'])
+    ->arg('$name', $_ENV['OTEL_SERVICE_NAME'] ?? 'my-app');
+
+$services->set(NoOpTracer::class, OpenTelemetryTracer::class)
+    ->arg('$tracer', service('otel.tracer'))
+    ->public(false);
+```
+
+```bash title=".env"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://datadog-agent:4318/v1/traces
+OTEL_SERVICE_NAME=my-app
+DD_AGENT_HOST=datadog-agent
+```
+
+---
+
+## Step 6 — Verify traces in Datadog APM
+
+1. Make a few requests to your application
+2. In Datadog → **APM → Traces**
+3. Filter by service name (`my-app`)
+4. Click any trace to see the span waterfall
+
+Datadog maps OpenTelemetry span attributes to Datadog's own fields — `http.method`, `http.status_code`, `db.statement`, etc. all appear as first-class attributes in the trace UI.
+
+---
+
+## Step 7 — Connect metrics to traces (Datadog APM correlation)
+
+Datadog can correlate metrics with traces when both use the same service name and environment tags. In your metrics config, add resource attribute tags that match your Datadog service:
+
+```bash title=".env"
+OTEL_RESOURCE_ATTRIBUTES=service.name=my-app,deployment.environment=prod,service.version=1.2.3
+```
+
+In Datadog, navigate to a metric in a dashboard → click **View traces** to jump to traces from the same service at the same time period.
+
+---
+
+## Datadog Dashboards
+
+Datadog automatically creates a service overview dashboard when APM data arrives. For custom dashboards using Vortos metrics:
+
+1. Go to **Dashboards → New Dashboard**
+2. Add a **Timeseries** widget
+3. Search for `myapp.http_requests_total` in the metric field
+4. Group by `route` and `status`
+
+---
+
+## Logs (optional)
+
+To ship Vortos logs to Datadog:
+1. Enable **Log Management** in your Datadog account
+2. Add the log collection configuration to the Datadog Agent:
+   ```yaml
+   logs:
+     - type: file
+       path: /var/log/*.log
+       service: my-app
+       source: php
+   ```
+3. In `docker-compose.yml`, mount your `var/log/` directory into the Datadog Agent container
+
+---
+
+## Further reading
+
+- [Datadog Agent documentation](https://docs.datadoghq.com/agent/)
+- [DogStatsD documentation](https://docs.datadoghq.com/developers/dogstatsd/)
+- [Datadog OTLP ingestion](https://docs.datadoghq.com/opentelemetry/interoperability/otlp_ingest_in_the_agent/)
+- [Datadog APM](https://docs.datadoghq.com/tracing/)

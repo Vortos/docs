@@ -1,0 +1,140 @@
+---
+title: Sentry
+description: Capture PHP exceptions and error-level logs in Sentry — step-by-step setup and Vortos configuration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Sentry
+
+[Sentry](https://sentry.io) is an error tracking platform. It captures exceptions and error-level events, groups similar errors together, tracks how often they occur, and alerts you when new issues appear. Unlike raw logs, Sentry includes full stack traces, request context, user info, and a web UI for triaging issues.
+
+Vortos connects to Sentry through the logger's alerting handler. Any log record at `ERROR` level or above is automatically captured as a Sentry issue.
+
+---
+
+## What you need
+
+- A Sentry account (free tier covers most small projects — [sentry.io](https://sentry.io))
+- Your Vortos app running with `vortos-logger` installed
+
+---
+
+## Step 1 — Create a Sentry project
+
+1. Log in to [sentry.io](https://sentry.io) and go to **Projects → Create Project**
+2. Select **PHP** as the platform
+3. Give it a name that matches your app (e.g. `my-app-prod`)
+4. Click **Create Project**
+5. Copy the **DSN** shown on the next screen — it looks like:
+   ```
+   https://abc123@o123456.ingest.sentry.io/789012
+   ```
+
+---
+
+## Step 2 — Install the Sentry PHP SDK
+
+```bash
+composer require sentry/sentry-php
+```
+
+---
+
+## Step 3 — Add the DSN to your environment
+
+```bash title=".env"
+SENTRY_DSN=https://abc123@o123456.ingest.sentry.io/789012
+```
+
+Never commit this value to version control. Add `.env` to `.gitignore` and use your deployment platform's secrets management for production.
+
+---
+
+## Step 4 — Configure Vortos
+
+```php title="config/logging.php"
+use Monolog\Level;
+use Vortos\Logger\DependencyInjection\VortosLoggingConfig;
+
+return static function (VortosLoggingConfig $config): void {
+    $config->sentry(
+        dsn: $_ENV['SENTRY_DSN'] ?? '',
+        minLevel: Level::Error,   // ERROR, CRITICAL, ALERT, EMERGENCY — all captured
+    );
+};
+```
+
+If `SENTRY_DSN` is not set or is an empty string, the handler is silently skipped — no error is thrown. This means the same config file works in development (no DSN set) and production (DSN set).
+
+---
+
+## Step 5 — Verify it's working
+
+Trigger a test error. Add this temporarily to a controller:
+
+```php
+$this->logger->error('Sentry test', ['test' => true, 'timestamp' => time()]);
+```
+
+Make a request that hits that code, then open your Sentry project. Within 30 seconds you should see a new issue titled **"Sentry test"** with the context array attached.
+
+<Callout type="info" title="Only ERROR and above">
+`INFO` and `WARNING` logs are not sent to Sentry — only `ERROR`, `CRITICAL`, `ALERT`, and `EMERGENCY`. This is intentional: Sentry's value is in capturing actionable failures, not routine logs. Use Loki or a log aggregator for full log search.
+</Callout>
+
+---
+
+## Step 6 — Set up alerts in Sentry
+
+1. In your Sentry project, go to **Alerts → Create Alert**
+2. Select **Issues** as the alert type
+3. Set the condition: e.g. "A new issue is created" or "Number of events > 10 in 1 hour"
+4. Add notification actions: email, Slack, PagerDuty
+5. Save
+
+By default Sentry emails the project owner on every new issue. For production, set up a Slack or PagerDuty integration so alerts reach your on-call rotation.
+
+---
+
+## Minimum level
+
+| Level | Captured? |
+|---|---|
+| `DEBUG` | No |
+| `INFO` | No |
+| `NOTICE` | No |
+| `WARNING` | No |
+| `ERROR` | Yes (default threshold) |
+| `CRITICAL` | Yes |
+| `ALERT` | Yes |
+| `EMERGENCY` | Yes |
+
+Change the threshold by passing `minLevel`:
+
+```php
+$config->sentry(dsn: $_ENV['SENTRY_DSN'] ?? '', minLevel: Level::Critical);
+// Only CRITICAL and above — useful for very high-traffic apps
+```
+
+---
+
+## Troubleshooting
+
+**Issues not appearing in Sentry:**
+- Check that `SENTRY_DSN` is set and correct: `var_dump($_ENV['SENTRY_DSN'])`
+- Confirm `sentry/sentry-php` is installed: `composer show sentry/sentry-php`
+- Check the log level — only ERROR and above are sent
+- Check Sentry's project settings for any IP allowlisting
+
+**Too many issues (noise):**
+- Raise the threshold to `Level::Critical`
+- Use Sentry's "ignore" or "resolve" features to filter known non-actionable errors
+
+---
+
+## Further reading
+
+- [Sentry PHP SDK documentation](https://docs.sentry.io/platforms/php/)
+- [Sentry alerting and notifications](https://docs.sentry.io/product/alerts/)
+- [Monolog SentryHandler](https://github.com/getsentry/sentry-php/blob/master/src/Monolog/Handler/SentryHandler.php)

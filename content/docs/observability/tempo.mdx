@@ -1,0 +1,232 @@
+---
+title: Grafana Tempo
+description: Store and search Vortos distributed traces with Grafana Tempo — OpenTelemetry setup, Docker configuration, and Grafana integration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Grafana Tempo
+
+[Grafana Tempo](https://grafana.com/oss/tempo/) is a distributed tracing backend. It receives traces from your application via the OpenTelemetry protocol (OTLP), stores them, and exposes them for querying in Grafana. Tempo is designed to be cheap to run — it stores traces in object storage (S3, GCS, or local disk) without indexing, relying on trace IDs looked up from Prometheus or Loki to find specific traces.
+
+---
+
+## How it connects to Vortos
+
+```
+Vortos app (OpenTelemetryTracer)
+  └─ sends spans via OTLP HTTP → Tempo :4318
+      └─ Tempo stores traces
+          └─ Grafana queries Tempo by trace ID or time range
+```
+
+Trace IDs also appear in every Vortos log line (`trace_id` field), so you can jump from a log line in Loki directly to the trace in Tempo.
+
+---
+
+## What you need
+
+- `vortos-tracing` installed
+- OpenTelemetry PHP SDK installed (see Step 2)
+- Docker for running Tempo locally
+
+---
+
+## Step 1 — Run Tempo
+
+```yaml title="docker-compose.yml"
+services:
+  tempo:
+    image: grafana/tempo:2.4.0
+    ports:
+      - "4318:4318"   # OTLP HTTP — your app sends spans here
+      - "3200:3200"   # Tempo HTTP API — Grafana reads from here
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./docker/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo_data:/var/tempo
+
+volumes:
+  tempo_data:
+```
+
+```yaml title="docker/tempo.yaml"
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+compactor:
+  compaction:
+    block_retention: 48h   # keep traces for 48 hours locally
+```
+
+```bash
+docker compose up -d tempo
+```
+
+---
+
+## Step 2 — Install the OpenTelemetry PHP SDK
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp
+```
+
+---
+
+## Step 3 — Wire OpenTelemetryTracer in Vortos
+
+Vortos uses `NoOpTracer` by default. Replace it with `OpenTelemetryTracer` in `config/services.php`:
+
+```php title="config/services.php"
+use OpenTelemetry\Contrib\Otlp\OtlpHttpSpanExporter;
+use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
+use OpenTelemetry\SDK\Trace\TracerProvider;
+use Vortos\Tracing\NoOpTracer;
+use Vortos\Tracing\OpenTelemetry\OpenTelemetryTracer;
+
+// 1. Exporter — sends spans to Tempo via OTLP HTTP
+$services->set(OtlpHttpSpanExporter::class)
+    ->arg('$endpoint', $_ENV['OTEL_EXPORTER_OTLP_ENDPOINT'] ?? 'http://localhost:4318/v1/traces');
+
+// 2. Processor — batches spans before sending (reduces HTTP calls)
+$services->set(BatchSpanProcessor::class)
+    ->arg('$exporter', service(OtlpHttpSpanExporter::class));
+
+// 3. TracerProvider — creates individual tracers
+$services->set(TracerProvider::class)
+    ->call('addSpanProcessor', [service(BatchSpanProcessor::class)]);
+
+// 4. The OTel tracer instance
+$services->set('otel.tracer')
+    ->factory([service(TracerProvider::class), 'getTracer'])
+    ->arg('$name', $_ENV['OTEL_SERVICE_NAME'] ?? 'vortos');
+
+// 5. Replace NoOpTracer with OpenTelemetryTracer in the decorator chain
+$services->set(NoOpTracer::class, OpenTelemetryTracer::class)
+    ->arg('$tracer', service('otel.tracer'))
+    ->public(false);
+```
+
+---
+
+## Step 4 — Set environment variables
+
+```bash title=".env"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
+OTEL_SERVICE_NAME=my-app
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=dev,service.version=1.0.0
+```
+
+In Docker Compose, if your app and Tempo are in the same network:
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo:4318/v1/traces
+```
+
+---
+
+## Step 5 — Add Tempo as a Grafana data source
+
+In Grafana → **Connections → Data Sources → Add data source → Tempo**:
+- URL: `http://tempo:3200`
+- Click **Save & Test**
+
+Or via provisioning:
+
+```yaml title="docker/grafana/provisioning/datasources/datasources.yaml"
+- name: Tempo
+  type: tempo
+  url: http://tempo:3200
+  uid: tempo
+  jsonData:
+    tracesToLogsV2:
+      datasourceUid: loki         # links traces → Loki logs
+      filterByTraceID: true
+    serviceMap:
+      datasourceUid: prometheus   # shows service graph using metrics
+```
+
+---
+
+## Step 6 — Verify traces are appearing
+
+Make a few HTTP requests to your app. Then in Grafana → **Explore → Tempo**:
+
+1. Select **Search** tab
+2. Set time range to "Last 15 minutes"
+3. Click **Run query**
+
+You should see a list of recent traces. Click any trace to see the full span waterfall.
+
+<Callout type="info" title="No traces showing?">
+Check that spans are being sent. In your app container logs, look for OTel exporter errors. The most common issue is a wrong endpoint URL — verify `OTEL_EXPORTER_OTLP_ENDPOINT` resolves correctly from inside your app container.
+</Callout>
+
+---
+
+## Step 7 — Jump from logs to traces
+
+If Loki is also configured with the `derivedFields` pointing to Tempo (see [Loki setup](/docs/observability/loki)):
+
+1. In Grafana → Explore → Loki
+2. Find any log line with a `trace_id` field
+3. Click the **Tempo** button next to the trace ID
+4. The matching trace opens in a split panel
+
+---
+
+## Sampling in production
+
+In production you typically do not want to trace 100% of requests — the OTel SDK overhead adds up. Configure the sampler in Vortos:
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingSampler;
+use Vortos\Tracing\DependencyInjection\VortosTracingConfig;
+
+return static function (VortosTracingConfig $config): void {
+    $config->sampler(TracingSampler::Ratio, rate: 0.1);  // trace 10% of requests
+};
+```
+
+Prometheus metrics are recorded for every request regardless of sampling — you only lose the trace detail for unsampled requests.
+
+---
+
+## Production storage
+
+For production, replace local disk storage with S3 or GCS:
+
+```yaml title="docker/tempo.yaml"
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: my-tempo-bucket
+      endpoint: s3.amazonaws.com
+      region: us-east-1
+      access_key: ${AWS_ACCESS_KEY_ID}
+      secret_key: ${AWS_SECRET_ACCESS_KEY}
+```
+
+---
+
+## Further reading
+
+- [Grafana Tempo documentation](https://grafana.com/docs/tempo/latest/)
+- [OpenTelemetry PHP SDK](https://opentelemetry.io/docs/languages/php/)
+- [Vortos tracing configuration](/docs/tracing)
+- [Tracing → log correlation with Loki](/docs/observability/loki)

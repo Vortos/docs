@@ -1,0 +1,16 @@
+{
+  "title": "Integrations",
+  "pages": [
+    "index",
+    "local-stack",
+    "sentry",
+    "slack",
+    "prometheus",
+    "grafana",
+    "loki",
+    "tempo",
+    "jaeger",
+    "datadog",
+    "alertmanager"
+  ]
+}

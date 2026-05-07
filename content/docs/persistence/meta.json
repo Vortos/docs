@@ -10,6 +10,7 @@
     "mongodb",
     "optimistic-locking",
     "pagination",
-    "testing"
+    "testing",
+    "n1-detection"
   ]
 }

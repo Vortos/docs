@@ -1,13 +1,55 @@
 ---
 title: Logger
-description: Monolog-backed PSR-3 logger — LineFormatter in dev, JsonFormatter to stderr in production. Inject LoggerInterface anywhere.
+description: Named channels, correlation ID injection, log rotation, buffered writes, and alerting handlers — Monolog 3.x backed, enterprise-grade out of the box.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # Logger
 
-`vortos-logger` wires Monolog as the PSR-3 `LoggerInterface`. Dev and production have different configurations automatically — no manual setup needed.
+`vortos-logger` wires [Monolog 3](https://seldaek.github.io/monolog/) as the PSR-3 `LoggerInterface`. No setup is required for basic usage — sensible defaults cover every environment. For production-grade setups you configure named channels, alerting, and correlation ID injection via `VortosLoggingConfig`.
+
+## Core concepts
+
+If you have not worked with structured logging before, a few concepts matter before diving in.
+
+**What a logger actually is**
+
+A logger is a named pipe for log records. When you call `$logger->error('Payment failed', ['id' => $paymentId])`, you are producing a *record* that travels through a chain of *handlers*. Each handler decides where the record goes — a file, stderr, a Slack webhook, a Sentry project. Handlers can be stacked; a single record can go to multiple destinations.
+
+**Channels**
+
+A channel is just a name attached to a logger instance. `$logger->info('...')` written to the `payment` channel produces a record labelled `channel=payment`. In your log aggregator (Datadog, Loki, CloudWatch) you can filter `channel=payment` to see only payment-related logs, without sifting through cache hits and HTTP routing noise. Vortos creates one logger per channel and lets each one have its own minimum level and handlers.
+
+**Log levels**
+
+Levels are a severity scale. Higher levels indicate more serious conditions. Most frameworks default to logging everything in development and only errors in production — Vortos does the same automatically.
+
+| Level | Use when |
+|---|---|
+| `DEBUG` | Development detail — query timings, state transitions, resolved values |
+| `INFO` | Normal expected events — request received, handler dispatched, payment processed |
+| `NOTICE` | Unusual but expected — config fallback used, optional service unavailable |
+| `WARNING` | Something might go wrong — deprecated method called, retry attempt |
+| `ERROR` | Failure that needs investigation — payment declined, external API returned 500 |
+| `CRITICAL` | System-level failure — message ended up in dead letter queue, DB unreachable |
+| `ALERT` | Someone must act now — data loss, security breach |
+| `EMERGENCY` | System completely unusable |
+
+**Structured context**
+
+Always pass dynamic values as the second argument — never in the message string.
+
+```php
+// CORRECT — searchable, parseable by log aggregators
+$logger->error('Payment failed', ['payment_id' => $id, 'amount' => $amount]);
+
+// WRONG — the values are buried in text, not queryable
+$logger->error("Payment {$id} for {$amount} failed");
+```
+
+---
 
 ## Installation
 
@@ -15,141 +57,301 @@ import { Callout } from 'fumadocs-ui/components/callout';
 composer require vortos/vortos-logger
 ```
 
-## Package Registration
+## Package registration
 
 ```php title="bootstrap/app.php"
 use Vortos\Logger\DependencyInjection\LoggerPackage;
 
 $packages = [
+    new LoggerPackage(),   // order 10 — first, other packages inject LoggerInterface
     new HttpPackage(),
-    new LoggerPackage(),
+    new TracingPackage(),
     // ...
 ];
 ```
 
-## Container Parameters
+---
 
-`LoggerExtension` reads these parameters:
+## Configuration
 
-| Parameter | Default | Description |
-|---|---|---|
-| `kernel.env` | `prod` | Controls formatter and log level |
-| `kernel.log_path` | `sys_get_temp_dir()` | Directory for dev log file |
+Create `config/logging.php` in your project root. Every setting has a sensible default — you only override what you need.
 
-Set `kernel.log_path` in your bootstrap to write logs to `var/log/`:
-
-```php
-$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
+```bash
+php vortos make:config logging
 ```
 
-## Dev vs Production Behaviour
+```php title="config/logging.php"
+use Monolog\Level;
+use Vortos\Logger\Config\LogChannel;
+use Vortos\Logger\DependencyInjection\VortosLoggingConfig;
+
+return static function (VortosLoggingConfig $config): void {
+
+    // Override minimum level for a specific channel
+    $config->channel(LogChannel::Query, Level::Warning);   // only log slow/failed queries
+
+    // Disable channels that are too noisy for your app
+    $config->disableChannel(LogChannel::Cache);
+
+    // Log rotation (dev only — prod uses stderr which Docker handles)
+    $config->rotation(enabled: true, maxFiles: 14);
+
+    // Buffer writes — flush all at request end instead of per-record
+    $config->buffer(true);
+
+    // Inject trace_id into every log record (requires vortos-tracing)
+    $config->correlationId(true);
+
+    // Alerting — only triggered at or above the configured level
+    $config->sentry(dsn: $_ENV['SENTRY_DSN'] ?? '');
+    $config->slack(webhook: $_ENV['SLACK_WEBHOOK'] ?? '', minLevel: Level::Critical);
+    $config->email(to: 'ops@example.com', minLevel: Level::Error);
+};
+```
+
+Environment-specific overrides go in `config/{env}/logging.php`. For example, `config/dev/logging.php` will be merged on top of the base config when `kernel.env = dev`.
+
+---
+
+## Channels
+
+Vortos defines seven built-in channels. Framework components write to their own channel — your application code writes to `app`.
+
+| Channel | Constant | Written by | Volume |
+|---|---|---|---|
+| `app` | `LogChannel::App` | Your code | Medium |
+| `http` | `LogChannel::Http` | HTTP middleware | High |
+| `cqrs` | `LogChannel::Cqrs` | CommandBus | Medium |
+| `messaging` | `LogChannel::Messaging` | EventBus, Kafka, Outbox | High |
+| `cache` | `LogChannel::Cache` | Cache decorators | Very high |
+| `security` | `LogChannel::Security` | Auth, rate limiting | Low |
+| `query` | `LogChannel::Query` | DBAL, MongoDB | High |
+
+### Injecting a specific channel
+
+`LoggerInterface` always resolves to the `app` channel. To inject a named channel, use its service ID directly.
+
+```php title="config/services.php"
+use Psr\Log\LoggerInterface;
+use Vortos\Logger\Config\LogChannel;
+
+$services->set(PaymentService::class)
+    ->arg('$logger', service('vortos.logger.' . LogChannel::App->value));
+
+// Or reference the app channel logger which is the same as LoggerInterface
+$services->set(OrderController::class)
+    ->arg('$logger', service(LoggerInterface::class));
+```
+
+All channel loggers are registered as `vortos.logger.{channel}`. For example `vortos.logger.security`, `vortos.logger.query`, `vortos.logger.messaging`.
+
+### Disabling a channel
+
+When a channel is disabled, a `NullHandler` is registered for it — log calls still compile and run, but records are immediately discarded with zero I/O.
+
+```php
+$config->disableChannel(LogChannel::Cache, LogChannel::Query);
+```
+
+The `App` channel cannot be disabled — it is the last-resort channel for your application code and alerting handlers always attach to it.
+
+---
+
+## Dev vs production behaviour
 
 | | Dev (`kernel.env = dev`) | Production |
 |---|---|---|
 | Formatter | `LineFormatter` (human-readable) | `JsonFormatter` (structured) |
-| Level | `DEBUG` — all messages | `ERROR` — errors and above |
-| Destination | `{log_path}/dev.log` | `stderr` |
+| Destination | `{log_path}/app-{date}.log` | `stderr` |
+| Rotation | On by default, 30 files | Off — Docker/container runtime handles it |
+| Buffer | On — flushes at request end | On — flushes at request end |
+| Min level | `DEBUG` | `ERROR` (framework channels), `WARNING` (app channel) |
 
-**Dev** writes everything to a file — easy to tail during development:
-
+**Dev output:**
 ```
-[2026-04-27 14:32:01] app.DEBUG: User query executed {"query":"GetUserById","userId":"user-123"} []
-[2026-04-27 14:32:01] app.INFO: Handler dispatched {"command":"RegisterUser"} []
+[2026-05-07 14:32:01] app.DEBUG: Handler dispatched {"command":"RegisterUser","userId":"user-123"} {"trace_id":"abc123","file":"CommandBus.php","line":87}
 ```
 
-**Production** writes JSON to `stderr` — collected by Docker/container runtime and forwarded to your log aggregator (Datadog, CloudWatch, ELK):
+**Production output:**
+```json
+{"message":"Payment failed","context":{"payment_id":"pay-456","error":"Card declined"},"level":400,"level_name":"ERROR","channel":"app","datetime":"2026-05-07T14:32:01+00:00","extra":{"trace_id":"abc123"}}
+```
+
+---
+
+## BufferHandler — why buffering matters
+
+By default every `$logger->info(...)` call synchronously writes to disk or stderr. Under high request volume this creates one file write syscall per log statement — potentially hundreds per request.
+
+`BufferHandler` collects all records in memory and writes them all in a single I/O operation at the end of the request. The buffer is capped at **500 records** — if you exceed that it flushes early and resets. This prevents memory growth in long-running FrankenPHP workers.
+
+The trade-off: if PHP crashes mid-request (fatal error, OOM kill), buffered records are lost. For most applications this is acceptable. If you need guaranteed delivery on crash, disable buffering with `$config->buffer(false)`.
+
+---
+
+## Log rotation
+
+In development, `RotatingFileHandler` creates dated log files:
+```
+var/log/app-2026-05-07.log
+var/log/app-2026-05-06.log
+var/log/app-2026-05-05.log
+```
+
+Once the file count exceeds `maxFiles` (default 30), the oldest is deleted automatically. In production, log rotation is handled externally — Docker log drivers, logrotate, or your cloud provider.
+
+---
+
+## Correlation ID — linking logs to traces
+
+When `vortos-tracing` is active, every log record automatically gets a `trace_id` field in the `extra` context. This means you can look at a slow trace in Jaeger/Tempo and immediately jump to the exact logs that were produced during that request.
 
 ```json
-{"message":"Payment processing failed","context":{"paymentId":"pay-456","error":"Card declined"},"level":400,"level_name":"ERROR","channel":"app","datetime":"2026-04-27T14:32:01+00:00"}
+{"message":"Order created","channel":"app","extra":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}}
+{"message":"Payment charged","channel":"app","extra":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}}
+{"message":"Email queued","channel":"messaging","extra":{"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}}
 ```
 
-## Inject the Logger
+All three records share the same `trace_id` — filter on it and you see the complete story of that request across every channel.
 
-Inject `LoggerInterface` in any service:
+This works transparently — no code changes needed. The `CorrelationIdProcessor` reads the current span ID from `TracingInterface` and injects it. When tracing is disabled (NoOpTracer), `currentCorrelationId()` returns `null` and the processor silently skips.
+
+---
+
+## Alerting handlers
+
+Alerting handlers deliver log records above a threshold to external systems. They are added to every channel above their configured minimum level.
+
+### Sentry
+
+```bash
+composer require sentry/sentry-php
+```
+
+```php
+$config->sentry(dsn: $_ENV['SENTRY_DSN'] ?? '', minLevel: Level::Error);
+```
+
+Records at `ERROR` and above are automatically captured as Sentry issues with full context and stack traces.
+
+### Slack
+
+```php
+$config->slack(webhook: $_ENV['SLACK_WEBHOOK'] ?? '', minLevel: Level::Critical);
+```
+
+Use [Slack Incoming Webhooks](https://api.slack.com/messaging/webhooks). At `CRITICAL` and above a message is posted to the configured channel. Use sparingly — `ERROR` generates too much noise for Slack.
+
+### Email
+
+```php
+$config->email(to: 'ops@example.com', minLevel: Level::Error);
+```
+
+Uses PHP's `mail()` function. In production, point PHP's `sendmail_path` at a proper relay (Postfix, SES). This is a synchronous call — use only at `CRITICAL` and above if latency matters.
+
+<Callout type="warn" title="Empty DSN/webhook strings are silently skipped">
+All alerting handlers check for an empty string before registering. `$_ENV['SENTRY_DSN'] ?? ''` is safe — if the env var is unset, the handler is simply not registered. No error is thrown.
+</Callout>
+
+---
+
+## Implementation steps
+
+### 1. Install and register
+
+```bash
+composer require vortos/vortos-logger
+```
+
+Register `LoggerPackage` first in your bootstrap — other packages depend on `LoggerInterface` being available.
+
+### 2. Set container parameters
+
+```php title="bootstrap/app.php"
+$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
+$container->setParameter('kernel.env', $_ENV['APP_ENV'] ?? 'prod');
+```
+
+### 3. Create the config file (optional)
+
+```bash
+php vortos make:config logging
+```
+
+Edit `config/logging.php` — start with the defaults, enable Sentry when you have a DSN.
+
+### 4. Inject and use
 
 ```php
 use Psr\Log\LoggerInterface;
 
-final class PaymentService
+final class OrderService
 {
-    public function __construct(private LoggerInterface $logger) {}
+    public function __construct(private readonly LoggerInterface $logger) {}
 
-    public function charge(Payment $payment): void
+    public function place(Order $order): void
     {
-        $this->logger->info('Charging payment', [
-            'payment_id' => $payment->getId(),
-            'amount'     => $payment->getAmount(),
-        ]);
-
-        try {
-            // ... charge
-        } catch (\Exception $e) {
-            $this->logger->error('Payment charge failed', [
-                'payment_id' => $payment->getId(),
-                'error'      => $e->getMessage(),
-            ]);
-            throw $e;
-        }
+        $this->logger->info('Order placed', ['order_id' => $order->getId()]);
     }
 }
 ```
 
-## Log Levels
+---
 
-Use the appropriate level — log aggregators filter and alert by level:
+## How to verify it's working
 
-| Method | Level | When to use |
-|---|---|---|
-| `$logger->debug(...)` | DEBUG | Development detail — queries, state changes |
-| `$logger->info(...)` | INFO | Normal operation — requests, handler dispatch |
-| `$logger->notice(...)` | NOTICE | Unusual but expected — config fallbacks |
-| `$logger->warning(...)` | WARNING | Potential problem — deprecated usage, retries |
-| `$logger->error(...)` | ERROR | Error requiring investigation — failed payment |
-| `$logger->critical(...)` | CRITICAL | System failure — dead letter, DB down |
-| `$logger->alert(...)` | ALERT | Immediate action needed |
-| `$logger->emergency(...)` | EMERGENCY | System unusable |
+**Dev environment:**
+```bash
+# Watch the log file in real time
+tail -f var/log/app-$(date +%Y-%m-%d).log
 
-## IntrospectionProcessor
-
-The logger includes Monolog's `IntrospectionProcessor` automatically. It adds the calling file, line, class, and method to every log record — useful for quickly locating log sources in large codebases.
-
-## Services Registered
-
-```
-monolog.formatter.json      — JsonFormatter
-monolog.formatter.line      — LineFormatter
-monolog.processor.introspection — IntrospectionProcessor
-monolog.handler.main        — StreamHandler (dev.log or stderr)
-monolog.logger              — Logger instance (channel: app)
-LoggerInterface             — alias → monolog.logger
+# Or if var/log doesn't exist yet:
+php artisan serve  # or your dev server
+# make a request, then:
+ls var/log/
 ```
 
-## Custom Channel
-
-The default logger uses the `app` channel. For separate channels per module (useful for filtering in log aggregators):
-
-```php title="config/services.php"
-use Monolog\Logger;
-
-// Create a payment-specific logger
-$services->set('logger.payment', Logger::class)
-    ->arg('$name', 'payment')
-    ->call('pushHandler', [service('monolog.handler.main')])
-    ->public();
-
-// Inject by service ID
-$services->set(PaymentService::class)
-    ->arg('$logger', service('logger.payment'));
+**Check rotation is working:**
+```bash
+ls -la var/log/
+# Should see: app-2026-05-07.log  app-2026-05-06.log  etc.
 ```
 
-<Callout type="info" title="Structured Context Always">
-Always pass context as the second argument — never embed variables in the message string. Structured context is searchable in log aggregators.
-
-```php
-// CORRECT — searchable by user_id
-$logger->info('User logged in', ['user_id' => $userId]);
-
-// WRONG — not searchable
-$logger->info("User {$userId} logged in");
+**Check JSON format in production:**
+```bash
+APP_ENV=prod php bin/console cache:clear 2>&1 | head -5
+# Should see: {"message":"...","level_name":"INFO",...}
 ```
-</Callout>
+
+**Check trace_id is injected:**
+```bash
+grep '"trace_id"' var/log/app-$(date +%Y-%m-%d).log | head -3
+```
+
+**Check alerting handlers are registered (Sentry):**
+```bash
+# Trigger an ERROR-level log and check Sentry receives it
+$logger->error('Test Sentry alert', ['test' => true]);
+```
+
+---
+
+## Services registered
+
+```
+vortos.logger.formatter.json          — JsonFormatter (production)
+vortos.logger.formatter.line          — LineFormatter (dev)
+vortos.logger.processor.introspection — adds file/line/class to every record
+vortos.logger.processor.correlation_id — adds trace_id when TracingInterface is active
+vortos.logger.handler.file            — RotatingFileHandler or StreamHandler (dev)
+vortos.logger.handler.stderr          — StreamHandler → stderr (production)
+vortos.logger.app                     — Logger (channel: app) — public
+vortos.logger.http                    — Logger (channel: http)
+vortos.logger.cqrs                    — Logger (channel: cqrs)
+vortos.logger.messaging               — Logger (channel: messaging)
+vortos.logger.cache                   — Logger (channel: cache)
+vortos.logger.security                — Logger (channel: security)
+vortos.logger.query                   — Logger (channel: query)
+LoggerInterface                       — alias → vortos.logger.app
+```

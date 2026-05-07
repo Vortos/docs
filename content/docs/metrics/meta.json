@@ -1,0 +1,9 @@
+{
+  "title": "Metrics",
+  "pages": [
+    "index",
+    "adapters",
+    "auto-instrumentation",
+    "prometheus-endpoint"
+  ]
+}

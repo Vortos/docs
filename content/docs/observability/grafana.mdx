@@ -1,0 +1,211 @@
+---
+title: Grafana
+description: Build dashboards for Vortos metrics, logs, and traces — connecting Prometheus, Loki, and Tempo as data sources.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Grafana
+
+[Grafana](https://grafana.com) is a visualization and dashboarding platform. It connects to Prometheus (metrics), Loki (logs), and Tempo (traces) as data sources and lets you build unified dashboards that show all three in one place. You can also configure Grafana alerts that fire when metric thresholds are crossed.
+
+---
+
+## What you need
+
+- Prometheus running and scraping your app (see [Prometheus setup](/docs/observability/prometheus))
+- Optionally: Loki for logs, Tempo for traces
+- Docker or a server to run Grafana on
+
+---
+
+## Step 1 — Run Grafana
+
+**Docker:**
+
+```yaml title="docker-compose.yml"
+services:
+  grafana:
+    image: grafana/grafana-oss:10.4.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin    # change this
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+
+volumes:
+  grafana_data:
+```
+
+```bash
+docker compose up -d grafana
+open http://localhost:3000
+# Login: admin / admin
+```
+
+**Grafana Cloud (no self-hosting):**
+
+Create a free account at [grafana.com](https://grafana.com) — you get a hosted Grafana instance with Prometheus, Loki, and Tempo included. Skip Steps 1–2 and go straight to Step 3.
+
+---
+
+## Step 2 — Add Prometheus as a data source
+
+1. In Grafana, go to **Connections → Data Sources → Add data source**
+2. Select **Prometheus**
+3. Set the URL to `http://prometheus:9090` (if Grafana and Prometheus are in the same Docker network) or your Prometheus address
+4. Click **Save & Test** — you should see "Data source is working"
+
+**Auto-provisioning (recommended — avoids manual setup on every environment):**
+
+```yaml title="docker/grafana/provisioning/datasources/datasources.yaml"
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+```
+
+With this file mounted, Grafana configures the data source automatically on startup.
+
+---
+
+## Step 3 — Add Loki and Tempo (optional)
+
+If you have Loki and Tempo running, add them the same way. The provisioning file handles all three:
+
+```yaml title="docker/grafana/provisioning/datasources/datasources.yaml"
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    url: http://prometheus:9090
+    isDefault: true
+
+  - name: Loki
+    type: loki
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: '"trace_id":"(\w+)"'
+          name: TraceID
+          url: "$${__value.raw}"
+
+  - name: Tempo
+    type: tempo
+    url: http://tempo:3200
+    uid: tempo
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        filterByTraceID: true
+```
+
+The `derivedFields` in Loki makes `trace_id` values in log lines clickable — one click jumps to the matching trace in Tempo. The `tracesToLogsV2` in Tempo does the reverse — from a trace, jump to its logs.
+
+---
+
+## Step 4 — Build a dashboard
+
+1. Go to **Dashboards → New → New Dashboard**
+2. Click **Add visualization**
+3. Select **Prometheus** as the data source
+4. Enter a PromQL query:
+
+```promql
+rate(vortos_http_requests_total[1m])
+```
+
+5. Set the visualization type (Time series, Stat, Gauge, etc.)
+6. Add a panel title and click **Apply**
+
+Repeat for each metric you want to track.
+
+---
+
+## Recommended panels for Vortos
+
+**HTTP request rate:**
+```promql
+sum(rate(vortos_http_requests_total[1m])) by (route)
+```
+Visualization: Time series — shows traffic per route over time.
+
+**HTTP error rate:**
+```promql
+sum(rate(vortos_http_requests_total{status=~"5.."}[5m]))
+/ sum(rate(vortos_http_requests_total[5m])) * 100
+```
+Visualization: Stat — shows current error percentage. Alert when > 1%.
+
+**p50 / p95 / p99 response time:**
+```promql
+histogram_quantile(0.99, sum(rate(vortos_http_request_duration_ms_bucket[5m])) by (le, route))
+```
+Visualization: Time series — shows latency percentiles per route.
+
+**Command failures:**
+```promql
+rate(vortos_cqrs_command_failures_total[5m])
+```
+Visualization: Time series.
+
+**Cache hit rate:**
+```promql
+rate(vortos_cache_operations_total{operation="get",result="hit"}[5m])
+/ rate(vortos_cache_operations_total{operation="get"}[5m]) * 100
+```
+Visualization: Stat — shows current hit rate percentage.
+
+**Dead letter queue activity:**
+```promql
+increase(vortos_messaging_dead_letter_total[5m])
+```
+Visualization: Stat — should always be 0. Alert on any value > 0.
+
+---
+
+## Step 5 — Set up Grafana alerts
+
+Grafana can evaluate PromQL queries on a schedule and fire alerts when thresholds are crossed.
+
+1. Open any panel, click the **Alert** tab → **Create alert rule**
+2. Set the condition (e.g. "value > 1" for error rate)
+3. Set the evaluation interval (e.g. every 1 minute, pending for 5 minutes before firing)
+4. Add a notification policy pointing to a contact point (Slack, email, PagerDuty)
+
+**Create a contact point:**
+- Go to **Alerting → Contact Points → Add contact point**
+- Select Slack, paste your webhook URL
+- Test the contact point before saving
+
+<Callout type="info" title="Grafana alerts vs Alertmanager">
+Grafana has its own alerting built in. [Alertmanager](/docs/observability/alertmanager) is an alternative that sits in front of Prometheus. Both work — Grafana alerting is simpler for most setups. Use Alertmanager if you need multi-tenant routing, complex silencing, or you're already running it for other services.
+</Callout>
+
+---
+
+## Explore — ad-hoc queries across all data sources
+
+**Explore** (the compass icon in the sidebar) lets you query any data source without building a dashboard first. This is useful for incident investigation:
+
+1. Select **Prometheus** → query `{job="vortos-app"}` to see all metric names
+2. Select **Loki** → query `{job="vortos"} |= "ERROR"` to see recent error logs
+3. Select **Tempo** → search for traces in the last 15 minutes filtered by `status=error`
+
+---
+
+## Further reading
+
+- [Grafana documentation](https://grafana.com/docs/grafana/latest/)
+- [PromQL query examples](https://prometheus.io/docs/prometheus/latest/querying/examples/)
+- [Grafana alerting](https://grafana.com/docs/grafana/latest/alerting/)
+- [Connecting Loki and Tempo in Grafana](https://grafana.com/docs/grafana/latest/datasources/tempo/configure-tempo-data-source/)

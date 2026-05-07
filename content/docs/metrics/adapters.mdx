@@ -1,0 +1,157 @@
+---
+title: Adapters
+description: NoOp, Prometheus, and StatsD — choosing the right metrics backend, storage backends for Prometheus in multi-process environments.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Metrics Adapters
+
+`vortos-metrics` ships three adapters. You switch between them in `config/metrics.php` with a single call — all auto-instrumentation works the same regardless of which adapter is active.
+
+---
+
+## NoOp (default)
+
+The default adapter. Every call to `MetricsInterface` is a silent no-op — zero syscalls, zero allocations, zero I/O. The singleton instrument pattern means even repeated calls for the same metric don't allocate objects.
+
+Use this in:
+- Development, when you don't have a metrics backend running
+- CI/CD environments where metrics infra is not needed
+- Any environment where you want zero overhead
+
+No configuration required.
+
+---
+
+## Prometheus
+
+Prometheus is a pull-based metrics system. Your application exposes a `/metrics` endpoint that Prometheus scrapes every 15 seconds. Each scrape returns all current metric values in the Prometheus text exposition format.
+
+**Why Prometheus?**
+
+- Industry standard — Grafana, Alertmanager, and every major observability platform speak Prometheus natively
+- Counters and histograms survive process restarts (with Redis or APC storage)
+- Exemplar support — histogram samples can link to the trace that produced them (Grafana/Tempo integration)
+- Time series are stored in Prometheus itself — your app holds only current values
+
+### Enable Prometheus
+
+```bash
+composer require promphp/prometheus_client_php
+```
+
+```php title="config/metrics.php"
+$config->adapter(MetricsAdapter::Prometheus)
+       ->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+```
+
+### Storage backends
+
+Prometheus counters must persist across PHP requests. The right storage backend depends on your runtime.
+
+#### In-memory (default — dev only)
+
+```php
+$config->prometheusStorageInMemory();  // this is the default
+```
+
+Stores counters in the current PHP process's memory. Each request starts from zero — counters accumulate only within a single process lifecycle. **Not suitable for multi-process environments.** Use in development only.
+
+#### APC shared memory
+
+```php
+$config->prometheusStorageApc();
+```
+
+Stores counters in APC shared memory, which is shared across all PHP-FPM workers on the same machine. Counters persist across requests. Requires the `apcu` PHP extension.
+
+Use this with PHP-FPM (traditional process-per-request model).
+
+#### Redis
+
+```php
+$config->prometheusStorageRedis(
+    prefix:   'metrics:',
+    host:     $_ENV['REDIS_HOST'] ?? '127.0.0.1',
+    port:     6379,
+    password: $_ENV['REDIS_PASSWORD'] ?? '',
+);
+```
+
+Stores counters in Redis. All PHP workers (across machines, across processes) share the same metric values. Counters survive process restarts.
+
+**Use this with FrankenPHP worker mode.** FrankenPHP runs multiple long-lived PHP workers — in-memory storage is process-local and cannot aggregate across workers. Redis is the only safe option.
+
+<Callout type="warn" title="In-memory storage in FrankenPHP gives wrong numbers">
+If you use `prometheusStorageInMemory()` with FrankenPHP, each worker maintains its own counter independently. The `/metrics` scrape hits one worker at random — you see only a fraction of actual traffic. Use Redis storage in production with FrankenPHP.
+</Callout>
+
+### Prometheus /metrics endpoint
+
+When the Prometheus adapter is active, `vortos-metrics` registers a `GET /metrics` controller. Prometheus scrapes this endpoint to collect current metric values.
+
+See [Prometheus Endpoint](/docs/metrics/prometheus-endpoint) for security configuration and scrape setup.
+
+---
+
+## StatsD
+
+StatsD (and compatible agents like Telegraf, Datadog DogStatsD) is a push-based metrics system. Your application sends metric updates over UDP to a local agent. The agent aggregates and forwards to your metrics backend.
+
+**Why StatsD?**
+
+- Works with Datadog, Graphite, InfluxDB, and many others
+- UDP is fire-and-forget — metrics never block your application, even if the agent is down
+- No `/metrics` endpoint to secure
+- DogStatsD tag extension provides the same label filtering as Prometheus
+
+### Enable StatsD
+
+No extra packages needed — StatsD uses raw UDP sockets.
+
+```php title="config/metrics.php"
+$config->adapter(MetricsAdapter::StatsD)
+       ->statsDHost($_ENV['STATSD_HOST'] ?? '127.0.0.1')
+       ->statsDPort(8125)
+       ->statsDSampleRate(1.0);  // 1.0 = send all metrics
+```
+
+### UDP and batching
+
+StatsD sends metric updates via UDP — a connectionless protocol with no acknowledgement, no retry, no blocking. If the StatsD agent is unreachable, packets are silently dropped. This is intentional: metrics should never affect application latency.
+
+`StatsDMetrics` batches metric updates into a single UDP packet per request, capped at the UDP MTU (1400 bytes). Instead of one syscall per metric, you get one syscall per request. `StatsDFlushListener` triggers the flush on `kernel.terminate` (after the response has been sent), ensuring metrics are dispatched without adding to response latency.
+
+### Sample rate
+
+```php
+$config->statsDSampleRate(0.1);  // send 10% of metric updates
+```
+
+The sample rate is a fraction between 0 and 1. At `0.1`, only 1 in 10 metric updates is sent via UDP. The StatsD agent automatically scales the received values back up — a counter that receives 10 increments at `0.1` sample rate is reported as 100.
+
+Use sampling to reduce UDP traffic volume for very high-throughput metrics. For most applications `1.0` (send everything) is correct.
+
+### Tag format
+
+Vortos uses the Datadog DogStatsD tag extension: `|#key:value,key:value`. This format is supported by Datadog DogStatsD, Telegraf (statsd_input plugin), and most modern StatsD agents.
+
+```
+vortos.http_requests_total:1|c|#method:POST,route:orders.place,status:201
+```
+
+---
+
+## Choosing an adapter
+
+| Scenario | Recommended adapter |
+|---|---|
+| Local development | NoOp (default) |
+| Production with Grafana / Prometheus | Prometheus + Redis storage |
+| Production with Datadog | StatsD (DogStatsD) |
+| Production with Graphite | StatsD |
+| CI / testing | NoOp (default) |
+| FrankenPHP worker mode | Prometheus + Redis, or StatsD |
+
+For FrankenPHP specifically: both Prometheus+Redis and StatsD work correctly. Prometheus+Redis gives you the Grafana/Tempo exemplar integration. StatsD is simpler to set up if you already use Datadog.

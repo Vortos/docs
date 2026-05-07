@@ -1,0 +1,239 @@
+---
+title: Auto-Instrumentation
+description: What each framework module records automatically, label design, cardinality, and how to disable noisy modules.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Auto-Instrumentation
+
+When `MetricsPackage` is registered with a non-NoOp adapter, the framework automatically records metrics for HTTP, CQRS, messaging, cache, and persistence. No code changes are required.
+
+---
+
+## HTTP
+
+`HttpMetricsListener` subscribes to `kernel.response` and records two metrics per request.
+
+### `{ns}_http_requests_total` — Counter
+
+Incremented after every response is sent.
+
+| Label | Values | Example |
+|---|---|---|
+| `method` | HTTP verb | `GET`, `POST` |
+| `route` | Named route | `orders.place`, `users.show` |
+| `status` | HTTP status code | `200`, `404`, `500` |
+
+Use this metric to track:
+- Request rate by endpoint
+- Error rate (`status=5xx` / total)
+- Traffic distribution across routes
+
+### `{ns}_http_request_duration_ms` — Histogram
+
+Observed (in milliseconds) after every response.
+
+| Label | Values |
+|---|---|
+| `method` | HTTP verb |
+| `route` | Named route |
+
+Buckets: `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]` ms
+
+Use this metric to define SLAs: "p99 response time must stay under 500ms."
+
+<Callout type="info" title="Sub-requests are not recorded">
+Internal Symfony sub-requests (e.g. ESI fragments, error pages rendered internally) are silently skipped. Only the primary request is recorded.
+</Callout>
+
+---
+
+## CQRS
+
+`CqrsMetricsDecorator` wraps `CommandBusInterface` via the DI decorator pattern. All three metrics use the command class short name as the `command` label — for example `PlaceOrder`, `CancelOrder`.
+
+### `{ns}_cqrs_commands_total` — Counter
+
+Incremented on every successful command dispatch.
+
+| Label | Example |
+|---|---|
+| `command` | `PlaceOrder` |
+
+### `{ns}_cqrs_command_duration_ms` — Histogram
+
+Observed in milliseconds from dispatch to handler return.
+
+| Label | Example |
+|---|---|
+| `command` | `PlaceOrder` |
+
+Buckets: `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]` ms
+
+### `{ns}_cqrs_command_failures_total` — Counter
+
+Incremented when a command handler throws an exception.
+
+| Label | Example |
+|---|---|
+| `command` | `PlaceOrder` |
+
+Use this to build an alert: `failures_total / commands_total > 0.01` (more than 1% of commands failing) → page on-call.
+
+---
+
+## Messaging
+
+`MessagingMetricsDecorator` wraps `EventBusInterface`.
+
+### `{ns}_messaging_events_dispatched_total` — Counter
+
+Incremented every time an event is dispatched to the bus.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+
+### `{ns}_messaging_produced_total` — Counter
+
+Incremented for each event sent to a message broker (Kafka, etc.).
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+| `transport` | `kafka` |
+
+### `{ns}_messaging_consumed_total` — Counter
+
+Incremented for each event received from a broker.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+| `transport` | `kafka` |
+
+### `{ns}_messaging_consume_duration_ms` — Histogram
+
+Time from message receipt to handler completion.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+
+Buckets: `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]` ms
+
+### `{ns}_messaging_dead_letter_total` — Counter
+
+Incremented when a message is moved to the dead letter queue after all retries are exhausted.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+| `reason` | `max_retries_exceeded` |
+
+This metric should alert immediately — a dead-lettered message requires manual intervention.
+
+---
+
+## Cache
+
+`CacheMetricsDecorator` wraps the active cache adapter.
+
+### `{ns}_cache_operations_total` — Counter
+
+Incremented for every cache operation.
+
+| Label | Values |
+|---|---|
+| `operation` | `get`, `set`, `delete` |
+| `result` | `hit`, `miss` (get only) |
+
+**Derived metric:** cache hit rate = `get,hit` / (`get,hit` + `get,miss`). A sudden drop in hit rate could mean Redis restarted and the cache is cold, or TTLs are too short.
+
+<Callout type="warn" title="Cache metrics can be very high volume">
+At 1000 requests/second with 10 cache lookups each, you're recording 10,000 counter increments per second. For StatsD this is fine — increments are cheap and batched. For Prometheus with Redis storage, each increment is a Redis HINCRBY — 10,000 Redis calls per second. Consider disabling cache metrics in very high-throughput scenarios:
+
+```php
+$config->disableModule(MetricsModule::Cache);
+```
+</Callout>
+
+---
+
+## Persistence (DBAL)
+
+`PersistenceMetricsStatement` and `PersistenceMetricsMiddleware` wrap DBAL query execution via Doctrine's Middleware API.
+
+### `{ns}_db_queries_total` — Counter
+
+Incremented per statement execution.
+
+| Label | Values |
+|---|---|
+| `driver` | `dbal` |
+| `operation` | `query`, `execute`, `prepare.execute` |
+
+### `{ns}_db_query_duration_ms` — Histogram
+
+Observed in milliseconds per statement execution.
+
+| Label | Values |
+|---|---|
+| `driver` | `dbal`, `mongo` |
+
+Buckets: `[1, 5, 10, 25, 50, 100, 250, 500, 1000]` ms
+
+Use p99 query duration to detect slow query regressions. Set an alert if p99 > 100ms.
+
+---
+
+## Cardinality — the most important concept in metrics
+
+Every unique combination of label values creates a separate time series. Labels multiply — if a metric has 3 labels each with 10 possible values, you have up to 1,000 time series for that one metric.
+
+High cardinality is the most common mistake in metrics design. Every metrics system (Prometheus, Datadog, InfluxDB) has limits, and exceeding them causes performance problems or cost overruns.
+
+**Safe label values (low cardinality):**
+- HTTP method: 5 values
+- HTTP status code: ~50 values
+- Route name: ~100 values (your app's routes)
+- Currency: ~50 values
+
+**Dangerous label values (high cardinality):**
+- User ID: millions of values
+- Order ID: unbounded
+- Email address: unbounded
+- IP address: millions of values
+- Timestamp: unbounded
+
+**Never use IDs, emails, or free-text strings as label values.** If you need to query by user, use tracing (where you can attach any attribute to a single span) not metrics.
+
+The framework auto-instrumentation uses only low-cardinality values — method, route, status code, command short name, event short name. When you add custom metrics, apply the same discipline.
+
+---
+
+## Disabling modules
+
+Any auto-instrumentation module can be disabled:
+
+```php title="config/metrics.php"
+$config->disableModule(MetricsModule::Cache);
+$config->disableModule(MetricsModule::Persistence);
+$config->disableModule(MetricsModule::Http);
+$config->disableModule(MetricsModule::Cqrs);
+$config->disableModule(MetricsModule::Messaging);
+```
+
+When a module is disabled, its decorator is not registered — no wrapper, no overhead, no metrics. The underlying service is wired directly as if the metrics package wasn't installed.
+
+Common reasons to disable:
+- **Cache** — very high volume, generates many counter increments per request
+- **Persistence** — high volume, and DB query duration is often better captured by tracing spans (which include the SQL)
+- **Http** — if you have an existing metrics solution for request tracking
+
+You can disable multiple modules in a single call:
+
+```php
+$config->disableModule(MetricsModule::Cache, MetricsModule::Persistence);
+```

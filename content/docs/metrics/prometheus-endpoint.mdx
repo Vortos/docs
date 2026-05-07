@@ -1,0 +1,229 @@
+---
+title: Prometheus Endpoint
+description: Securing the /metrics scrape endpoint, Prometheus scrape configuration, and Grafana dashboard setup.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Prometheus Endpoint
+
+When the Prometheus adapter is active, `vortos-metrics` registers a `GET /metrics` endpoint. Prometheus scrapes this endpoint every 15 seconds to collect current metric values.
+
+---
+
+## Security
+
+The `/metrics` endpoint exposes internal application data — request rates, error counts, DB query durations. This data should not be publicly accessible.
+
+`MetricsExtension` enforces a safety guard at container compile time: **in production, you must configure endpoint security or the container will not build.**
+
+```
+RuntimeException: vortos-metrics: the Prometheus /metrics endpoint has no Bearer token in production.
+Call prometheusEndpointToken($_ENV['METRICS_TOKEN']) in config/metrics.php,
+or call prometheusEndpointOpenAccess() to confirm network-level protection is in place.
+```
+
+This error fires at startup — not at request time. You cannot accidentally deploy an unprotected endpoint.
+
+### Option 1 — Bearer token (recommended)
+
+```php title="config/metrics.php"
+$config->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+```
+
+Add `METRICS_TOKEN=<a secure random string>` to your `.env.prod`. The endpoint rejects any request without a matching `Authorization: Bearer <token>` header.
+
+The token comparison uses `hash_equals()` — a constant-time string comparison that prevents timing attacks. An attacker who makes millions of requests cannot determine the token by measuring response time differences.
+
+Generate a secure token:
+```bash
+openssl rand -hex 32
+```
+
+Configure Prometheus to send the token:
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: 'my-app'
+    static_configs:
+      - targets: ['your-app:80']
+    bearer_token: 'your-metrics-token'
+```
+
+### Option 2 — Network-level protection
+
+If your metrics endpoint is protected by a firewall, reverse proxy IP allowlist, or internal network segmentation that prevents external access:
+
+```php title="config/metrics.php"
+$config->prometheusEndpointOpenAccess();
+```
+
+This explicitly acknowledges that you understand the endpoint is unauthenticated and that you are relying on network-level controls. The safety guard is satisfied and the container builds.
+
+<Callout type="warn" title="Do not use prometheusEndpointOpenAccess() on public-facing services">
+Only use this option when the `/metrics` path is truly inaccessible from the public internet — for example, when your service runs in a private VPC and the metrics port is not exposed through the load balancer.
+</Callout>
+
+### Development
+
+In `dev` and `test` environments, no token is required — the safety guard only applies in production. This avoids the need to configure tokens in local environments.
+
+---
+
+## Endpoint format
+
+`GET /metrics` returns Prometheus text exposition format:
+
+```
+# HELP vortos_http_requests_total Total HTTP requests
+# TYPE vortos_http_requests_total counter
+vortos_http_requests_total{method="POST",route="orders.place",status="201"} 1423
+vortos_http_requests_total{method="GET",route="orders.show",status="200"} 8921
+vortos_http_requests_total{method="GET",route="orders.show",status="404"} 44
+
+# HELP vortos_http_request_duration_ms HTTP request duration in milliseconds
+# TYPE vortos_http_request_duration_ms histogram
+vortos_http_request_duration_ms_bucket{method="POST",route="orders.place",le="50"} 891
+vortos_http_request_duration_ms_bucket{method="POST",route="orders.place",le="100"} 1201
+vortos_http_request_duration_ms_bucket{method="POST",route="orders.place",le="+Inf"} 1423
+vortos_http_request_duration_ms_sum{method="POST",route="orders.place"} 87432.1
+vortos_http_request_duration_ms_count{method="POST",route="orders.place"} 1423
+```
+
+---
+
+## Prometheus scrape configuration
+
+For full Prometheus installation, Docker Compose setup, and scrape configuration — see the [Prometheus integration guide](/docs/observability/prometheus).
+
+The scrape config for this endpoint:
+
+```yaml title="prometheus.yml"
+scrape_configs:
+  - job_name: my-app
+    static_configs:
+      - targets: ['your-app:80']
+    bearer_token: 'your-metrics-token'
+    metrics_path: /metrics
+    scheme: https
+```
+
+<Callout type="info" title="Redis storage and horizontal scaling">
+With Redis storage, all instances share counters — scrape only one instance or a load-balancer endpoint. With in-memory storage, scrape all instances and Prometheus aggregates them automatically.
+</Callout>
+
+---
+
+## Grafana dashboards
+
+For Grafana installation and data source setup — see the [Grafana integration guide](/docs/observability/grafana).
+
+### Example PromQL queries
+
+**Request rate (per second, 1-minute window):**
+```promql
+rate(vortos_http_requests_total[1m])
+```
+
+**Error rate (5xx responses as fraction of total):**
+```promql
+rate(vortos_http_requests_total{status=~"5.."}[5m])
+/
+rate(vortos_http_requests_total[5m])
+```
+
+**p99 response time:**
+```promql
+histogram_quantile(0.99,
+  rate(vortos_http_request_duration_ms_bucket[5m])
+)
+```
+
+**Command failure rate:**
+```promql
+rate(vortos_cqrs_command_failures_total[5m])
+/
+rate(vortos_cqrs_commands_total[5m])
+```
+
+**Cache hit rate:**
+```promql
+rate(vortos_cache_operations_total{operation="get",result="hit"}[5m])
+/
+rate(vortos_cache_operations_total{operation="get"}[5m])
+```
+
+**Dead letter queue events (alert on any value > 0):**
+```promql
+increase(vortos_messaging_dead_letter_total[5m]) > 0
+```
+
+---
+
+## Alerting rules
+
+```yaml title="alerts.yml"
+groups:
+  - name: vortos
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          rate(vortos_http_requests_total{status=~"5.."}[5m])
+          /
+          rate(vortos_http_requests_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Error rate above 1% for 2 minutes"
+
+      - alert: SlowP99
+        expr: |
+          histogram_quantile(0.99,
+            rate(vortos_http_request_duration_ms_bucket[5m])
+          ) > 500
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "p99 response time above 500ms"
+
+      - alert: DeadLetterQueueActivity
+        expr: increase(vortos_messaging_dead_letter_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Messages moved to dead letter queue — manual intervention required"
+```
+
+---
+
+## How to verify the endpoint is working
+
+**Check it returns data:**
+```bash
+curl -H "Authorization: Bearer your-token" https://your-app/metrics | head -30
+```
+
+**Check a specific metric exists:**
+```bash
+curl -s -H "Authorization: Bearer your-token" https://your-app/metrics \
+  | grep vortos_http_requests_total
+```
+
+**Check the token guard rejects unauthenticated requests:**
+```bash
+curl -i https://your-app/metrics
+# Expected: HTTP 401 Unauthorized
+```
+
+**Check Prometheus is scraping:**
+
+In the Prometheus UI at `/targets`, your application should show `State: UP` and a recent `Last Scrape` time.
+
+**Check metrics appear in Grafana:**
+
+Run a PromQL query:
+```promql
+vortos_http_requests_total
+```
+Results should appear within one scrape interval (15 seconds by default).

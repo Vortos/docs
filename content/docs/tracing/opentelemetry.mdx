@@ -94,33 +94,18 @@ OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.version=1.2.3
 
 ## Supported Backends
 
-Any OTLP-compatible backend works:
+Any OTLP-compatible backend works — point `OTEL_EXPORTER_OTLP_ENDPOINT` at the collector and spans flow automatically.
 
-| Backend | OTLP Endpoint |
-|---|---|
-| Jaeger | `http://jaeger:4318/v1/traces` |
-| Grafana Tempo | `http://tempo:4318/v1/traces` |
-| Datadog Agent | `http://datadog-agent:4318/v1/traces` |
-| AWS X-Ray (via collector) | `http://otel-collector:4318/v1/traces` |
-| Google Cloud Trace | Via OpenTelemetry Collector |
+| Backend | OTLP Endpoint | Guide |
+|---|---|---|
+| Grafana Tempo | `http://tempo:4318/v1/traces` | [Tempo setup](/docs/observability/tempo) |
+| Jaeger | `http://jaeger:4318/v1/traces` | [Jaeger setup](/docs/observability/jaeger) |
+| Datadog Agent | `http://datadog-agent:4318/v1/traces` | [Datadog setup](/docs/observability/datadog) |
+| AWS X-Ray | Via OpenTelemetry Collector | [OTel Collector docs](https://opentelemetry.io/docs/collector/) |
+| Google Cloud Trace | Via OpenTelemetry Collector | [OTel Collector docs](https://opentelemetry.io/docs/collector/) |
 
-## Docker Compose (Jaeger)
+For Docker Compose configuration, backend-specific setup steps, and verification, see the integration guides linked above.
 
-```yaml title="docker-compose.yml"
-jaeger:
-  image: jaegertracing/all-in-one:latest
-  ports:
-    - "16686:16686"  # UI
-    - "4318:4318"    # OTLP HTTP
-  environment:
-    - COLLECTOR_OTLP_ENABLED=true
-```
-
-```bash
-# View traces
-open http://localhost:16686
-```
-
-<Callout type="info" title="NoOp is Always Safe">
-If `OTEL_EXPORTER_OTLP_ENDPOINT` is unreachable or OpenTelemetry is not configured, `NoOpTracer` ensures the application continues to work with zero tracing overhead. Never let a tracing failure affect application availability.
+<Callout type="info" title="NoOp is always safe">
+If `OTEL_EXPORTER_OTLP_ENDPOINT` is unreachable or OpenTelemetry is not configured, `NoOpTracer` ensures the application continues normally with zero overhead. Tracing failures never affect application availability.
 </Callout>

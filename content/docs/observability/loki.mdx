@@ -1,0 +1,244 @@
+---
+title: Loki
+description: Ship Vortos structured JSON logs to Grafana Loki — Promtail setup, LogQL queries, and trace ID linking.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Loki
+
+[Grafana Loki](https://grafana.com/oss/loki/) is a log aggregation system. Unlike Elasticsearch, Loki does not index the full content of log lines — it indexes only labels (key-value pairs) and stores the raw log text compressed. This makes it cheap to run while still enabling fast searches when you filter by label first.
+
+Vortos logs are already structured JSON, which Promtail can parse and turn into Loki labels — making queries like `{channel="payment"} |= "failed"` or `{level="ERROR"} | json | count_over_time[5m]` fast and accurate.
+
+---
+
+## How Vortos logs reach Loki
+
+```
+Vortos app
+  └─ Logger writes JSON to var/log/app-YYYY-MM-DD.log
+      └─ Promtail reads the file, parses JSON, adds labels
+          └─ Loki stores the log lines
+              └─ Grafana queries Loki via LogQL
+```
+
+In production (stderr output), Promtail scrapes the Docker container's stdout/stderr instead of files.
+
+---
+
+## What you need
+
+- Vortos running in dev mode (writes to `var/log/`) or any mode that produces log output
+- Docker for running Loki and Promtail
+
+---
+
+## Step 1 — Confirm Vortos is writing logs
+
+In dev, Vortos writes rotating log files:
+```bash
+ls var/log/
+# app-2026-05-07.log  app-2026-05-06.log
+```
+
+Each line is a JSON object:
+```json
+{"message":"Order placed","context":{"order_id":"ord-123"},"level":200,"level_name":"INFO","channel":"app","datetime":"2026-05-07T14:32:01+00:00","extra":{"trace_id":"abc123"}}
+```
+
+---
+
+## Step 2 — Run Loki
+
+```yaml title="docker-compose.yml"
+services:
+  loki:
+    image: grafana/loki:2.9.0
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+
+volumes:
+  loki_data:
+```
+
+The default `local-config.yaml` bundled in the image is fine for development. For production, see [Loki configuration](https://grafana.com/docs/loki/latest/configure/).
+
+```bash
+docker compose up -d loki
+```
+
+---
+
+## Step 3 — Run Promtail
+
+Promtail is Loki's log shipper — it reads log files and forwards them to Loki.
+
+```yaml title="docker-compose.yml"
+services:
+  promtail:
+    image: grafana/promtail:2.9.0
+    volumes:
+      - ./var/log:/var/log:ro                      # mount your log directory
+      - ./docker/promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on: [loki]
+```
+
+```yaml title="docker/promtail.yml"
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml    # tracks how far Promtail has read each file
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: vortos-logs
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: vortos
+          __path__: /var/log/*.log    # reads all .log files in the mounted directory
+
+    pipeline_stages:
+      # Parse the JSON log line
+      - json:
+          expressions:
+            level:   level_name    # "INFO", "ERROR", etc.
+            channel: channel       # "app", "query", "messaging", etc.
+            message: message
+
+      # Promote parsed fields to Loki labels (enables fast filtering)
+      - labels:
+          level:
+          channel:
+```
+
+```bash
+docker compose up -d promtail
+```
+
+---
+
+## Step 4 — Verify logs are reaching Loki
+
+```bash
+# Check Promtail is running and found the log files
+curl http://localhost:9080/metrics | grep promtail_files_active_total
+
+# Query Loki directly
+curl -G \
+  --data-urlencode 'query={job="vortos"}' \
+  --data-urlencode 'limit=5' \
+  http://localhost:3100/loki/api/v1/query_range | python3 -m json.tool
+```
+
+You should see log lines in the response.
+
+---
+
+## Step 5 — Add Loki as a Grafana data source
+
+In Grafana → **Connections → Data Sources → Add data source → Loki**:
+- URL: `http://loki:3100`
+- Click **Save & Test**
+
+Or via provisioning (see [Grafana setup](/docs/observability/grafana) for the full provisioning file).
+
+---
+
+## Step 6 — Query logs with LogQL
+
+In Grafana → **Explore → select Loki**:
+
+**All logs from the app channel:**
+```logql
+{job="vortos", channel="app"}
+```
+
+**Error and above only:**
+```logql
+{job="vortos", level=~"ERROR|CRITICAL|ALERT|EMERGENCY"}
+```
+
+**Logs containing a specific string:**
+```logql
+{job="vortos"} |= "payment failed"
+```
+
+**Parse JSON and filter by a field value:**
+```logql
+{job="vortos"} | json | order_id = "ord-123"
+```
+
+**Find all logs for a specific trace:**
+```logql
+{job="vortos"} | json | trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
+```
+
+This last query is powerful — paste a trace ID from Tempo and immediately see every log line that was produced during that request, across all channels.
+
+---
+
+## Step 7 — Link trace IDs to Tempo (optional)
+
+If you also run Tempo, configure Loki's derived fields so trace IDs in log lines become clickable links to the trace:
+
+```yaml title="docker/grafana/provisioning/datasources/datasources.yaml"
+- name: Loki
+  type: loki
+  url: http://loki:3100
+  jsonData:
+    derivedFields:
+      - datasourceUid: tempo      # must match Tempo's uid
+        matcherRegex: '"trace_id":"(\w+)"'
+        name: TraceID
+        url: "$${__value.raw}"
+```
+
+After this, any log line with a `trace_id` field shows a **Tempo** button. Clicking it opens the full trace in Tempo — without copying and pasting IDs.
+
+---
+
+## Production: scraping Docker stdout
+
+In production, Vortos writes JSON to stderr (not files). Configure Promtail to scrape Docker container logs instead:
+
+```yaml title="docker/promtail-prod.yml"
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+        filters:
+          - name: label
+            values: ["com.docker.compose.service=app"]
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        target_label: container
+    pipeline_stages:
+      - json:
+          expressions:
+            level:   level_name
+            channel: channel
+            message: message
+      - labels:
+          level:
+          channel:
+```
+
+This requires the Promtail container to have access to the Docker socket (`/var/run/docker.sock`).
+
+---
+
+## Further reading
+
+- [Grafana Loki documentation](https://grafana.com/docs/loki/latest/)
+- [LogQL query language](https://grafana.com/docs/loki/latest/query/)
+- [Promtail configuration](https://grafana.com/docs/loki/latest/send-data/promtail/configuration/)

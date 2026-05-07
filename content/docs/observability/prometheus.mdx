@@ -1,0 +1,197 @@
+---
+title: Prometheus
+description: Scrape Vortos metrics with Prometheus — installation, scrape configuration, storage, and connecting to Grafana.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Prometheus
+
+[Prometheus](https://prometheus.io) is an open-source metrics collection system. It scrapes your app's `/metrics` endpoint every 15 seconds, stores the values as time series, and makes them queryable via PromQL. Grafana connects to Prometheus to turn those queries into charts and alerts.
+
+---
+
+## What you need
+
+- Docker (recommended for local setup) or a server to install Prometheus on
+- Vortos app with `MetricsAdapter::Prometheus` configured
+- The `/metrics` endpoint accessible from where Prometheus runs
+
+---
+
+## Step 1 — Enable Prometheus in Vortos
+
+```bash
+composer require promphp/prometheus_client_php
+```
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config->adapter(MetricsAdapter::Prometheus)
+           ->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+};
+```
+
+```bash title=".env"
+METRICS_TOKEN=your-secret-token-here
+```
+
+Generate a secure token:
+```bash
+openssl rand -hex 32
+```
+
+Verify the endpoint is responding:
+```bash
+curl -H "Authorization: Bearer your-secret-token-here" http://localhost:8000/metrics
+# Should return lines starting with: # HELP vortos_http_requests_total ...
+```
+
+---
+
+## Step 2 — Install Prometheus
+
+**Option A — Docker (recommended for local development):**
+
+```yaml title="docker-compose.yml"
+services:
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+
+volumes:
+  prometheus_data:
+```
+
+**Option B — Bare metal / VM:**
+```bash
+# Download and extract
+wget https://github.com/prometheus/prometheus/releases/download/v2.51.0/prometheus-2.51.0.linux-amd64.tar.gz
+tar xvfz prometheus-*.tar.gz
+cd prometheus-*/
+
+# Run
+./prometheus --config.file=prometheus.yml
+```
+
+---
+
+## Step 3 — Configure the scrape target
+
+```yaml title="docker/prometheus.yml"
+global:
+  scrape_interval: 15s        # how often to scrape
+  evaluation_interval: 15s    # how often to evaluate alert rules
+
+scrape_configs:
+  - job_name: vortos-app
+    static_configs:
+      - targets:
+          - "host.docker.internal:8000"   # your app — adjust port
+    bearer_token: "your-secret-token-here"
+    metrics_path: /metrics
+    scheme: http   # use https in production
+```
+
+<Callout type="warn" title="host.docker.internal on Linux">
+`host.docker.internal` is automatic on Docker Desktop (Mac/Windows). On Linux, add `extra_hosts: ["host.docker.internal:host-gateway"]` to the Prometheus service definition, or use your machine's local IP address instead.
+</Callout>
+
+---
+
+## Step 4 — Start Prometheus
+
+```bash
+docker compose up -d prometheus
+```
+
+Open the Prometheus UI:
+```bash
+open http://localhost:9090
+```
+
+---
+
+## Step 5 — Verify scraping is working
+
+1. In the Prometheus UI, go to **Status → Targets**
+2. Find `vortos-app` — it should show `State: UP`
+3. If it shows `DOWN`, check the error message:
+   - `connection refused` — your app isn't running or the port is wrong
+   - `401 Unauthorized` — the bearer token in prometheus.yml doesn't match `METRICS_TOKEN`
+   - `connection timed out` — network issue, check `host.docker.internal` resolution
+
+Run a test query:
+```bash
+# In Prometheus UI → Graph → Expression
+vortos_http_requests_total
+```
+
+You should see one or more time series with label sets like `{method="GET", route="...", status="200"}`.
+
+---
+
+## Step 6 — Multi-process storage (FrankenPHP)
+
+If you run FrankenPHP with multiple workers, in-memory Prometheus storage gives incorrect values (each worker tracks its own counters independently). Use Redis:
+
+```php title="config/metrics.php"
+$config->adapter(MetricsAdapter::Prometheus)
+       ->prometheusStorageRedis(
+           prefix: 'metrics:',
+           host: $_ENV['REDIS_HOST'] ?? '127.0.0.1',
+       )
+       ->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+```
+
+---
+
+## Useful PromQL queries
+
+```promql
+# Request rate per second (1-minute window)
+rate(vortos_http_requests_total[1m])
+
+# Error rate (5xx as fraction of all requests)
+rate(vortos_http_requests_total{status=~"5.."}[5m])
+/ rate(vortos_http_requests_total[5m])
+
+# p99 response time in milliseconds
+histogram_quantile(0.99, rate(vortos_http_request_duration_ms_bucket[5m]))
+
+# Command failure rate
+rate(vortos_cqrs_command_failures_total[5m])
+
+# Cache hit rate
+rate(vortos_cache_operations_total{operation="get",result="hit"}[5m])
+/ rate(vortos_cache_operations_total{operation="get"}[5m])
+```
+
+---
+
+## Production considerations
+
+- Use HTTPS between Prometheus and your app (`scheme: https` in scrape config)
+- Store the bearer token in a secrets manager, not in plaintext config files
+- Set `--storage.tsdb.retention.time` based on your storage budget (30d is typical)
+- Run Prometheus behind a reverse proxy with authentication if the UI is network-accessible
+- For high availability, look at [Thanos](https://thanos.io) or [Mimir](https://grafana.com/oss/mimir/)
+
+---
+
+## Further reading
+
+- [Prometheus documentation](https://prometheus.io/docs/introduction/overview/)
+- [PromQL basics](https://prometheus.io/docs/prometheus/latest/querying/basics/)
+- [Vortos metrics configuration](/docs/metrics)
+- [Vortos Prometheus endpoint security](/docs/metrics/prometheus-endpoint)

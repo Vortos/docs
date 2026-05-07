@@ -1,0 +1,57 @@
+---
+title: Integrations
+description: Connect Vortos to external observability, alerting, and monitoring tools — Sentry, Grafana, Prometheus, Loki, Tempo, Jaeger, Datadog, Slack, and Alertmanager.
+---
+
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Integrations
+
+Vortos outputs to open standards — structured JSON logs, Prometheus metrics, and OpenTelemetry traces. Any tool that speaks these standards works. This section covers step-by-step setup for the most common ones.
+
+## The three pillars of observability
+
+Before picking tools, it helps to understand what each pillar is for:
+
+| Pillar | What it answers | Vortos output |
+|---|---|---|
+| **Logs** | What happened and when | Structured JSON → stderr / log files |
+| **Metrics** | How much, how fast, how often | Prometheus exposition format or StatsD UDP |
+| **Traces** | Why was this request slow | OpenTelemetry OTLP |
+
+The tools below consume one or more of these pillars. Some (Grafana, Datadog) consume all three.
+
+## Tool overview
+
+| Tool | Pillar | Use case |
+|---|---|---|
+| [Sentry](/docs/observability/sentry) | Logs | Error tracking and exception grouping |
+| [Slack](/docs/observability/slack) | Logs | Real-time critical alert notifications |
+| [Prometheus](/docs/observability/prometheus) | Metrics | Metrics collection and storage |
+| [Grafana](/docs/observability/grafana) | Metrics + Logs + Traces | Unified dashboards, charts, alerting |
+| [Loki](/docs/observability/loki) | Logs | Log aggregation and search |
+| [Tempo](/docs/observability/tempo) | Traces | Distributed trace storage and search |
+| [Jaeger](/docs/observability/jaeger) | Traces | Distributed trace storage (alternative to Tempo) |
+| [Datadog](/docs/observability/datadog) | All three | Fully managed APM platform |
+| [Alertmanager](/docs/observability/alertmanager) | Metrics | Route Prometheus alerts to Slack, email, PagerDuty |
+
+## Start here — local development stack
+
+If you want everything wired up locally in one command, start with the local stack guide. It runs Prometheus, Grafana, Loki, and Tempo together with all data sources pre-configured:
+
+<Cards>
+  <Card title="Local Stack" href="/docs/observability/local-stack" description="Docker Compose with Prometheus + Grafana + Loki + Tempo. One command, everything connected." />
+</Cards>
+
+## Framework configuration reference
+
+Integration guides in this section focus on the external tool side — installation, accounts, and connection. For the Vortos configuration that feeds these tools, see:
+
+- [Logger configuration](/docs/logger) — alerting handlers (Sentry, Slack, email), channels, log format
+- [Metrics configuration](/docs/metrics) — adapter selection, Prometheus endpoint security, StatsD host
+- [Tracing configuration](/docs/tracing) — OpenTelemetry wiring, sampling, module disable
+
+<Callout type="info" title="No lock-in">
+Vortos uses open standards throughout. Switching from Jaeger to Tempo, or from self-hosted Prometheus to Datadog, requires only a config change — no application code changes.
+</Callout>

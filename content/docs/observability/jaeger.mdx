@@ -1,0 +1,163 @@
+---
+title: Jaeger
+description: Store and visualize Vortos distributed traces with Jaeger — Docker setup, OpenTelemetry configuration, and the Jaeger UI.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Jaeger
+
+[Jaeger](https://www.jaegertracing.io) is an open-source distributed tracing platform originally built by Uber. It receives traces via OTLP, stores them, and provides its own web UI for searching and visualizing traces. Jaeger is the simplest tracing backend to run locally — a single Docker container covers everything.
+
+**Jaeger vs Tempo:** Both accept OpenTelemetry traces. Jaeger has its own built-in UI and is self-contained (no Grafana needed). Tempo integrates with Grafana and is cheaper to run at scale (object storage). For local development, Jaeger is faster to set up. For production, Tempo + Grafana gives you metrics, logs, and traces in one place.
+
+---
+
+## What you need
+
+- `vortos-tracing` installed
+- OpenTelemetry PHP SDK installed (see Step 1)
+- Docker
+
+---
+
+## Step 1 — Install the OpenTelemetry PHP SDK
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp
+```
+
+---
+
+## Step 2 — Run Jaeger
+
+The `all-in-one` image bundles the collector, storage, and UI into a single container — ideal for development:
+
+```yaml title="docker-compose.yml"
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.56
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4318:4318"     # OTLP HTTP — your app sends spans here
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+```
+
+```bash
+docker compose up -d jaeger
+open http://localhost:16686
+```
+
+---
+
+## Step 3 — Wire OpenTelemetryTracer in Vortos
+
+```php title="config/services.php"
+use OpenTelemetry\Contrib\Otlp\OtlpHttpSpanExporter;
+use OpenTelemetry\SDK\Trace\SpanProcessor\BatchSpanProcessor;
+use OpenTelemetry\SDK\Trace\TracerProvider;
+use Vortos\Tracing\NoOpTracer;
+use Vortos\Tracing\OpenTelemetry\OpenTelemetryTracer;
+
+$services->set(OtlpHttpSpanExporter::class)
+    ->arg('$endpoint', $_ENV['OTEL_EXPORTER_OTLP_ENDPOINT'] ?? 'http://localhost:4318/v1/traces');
+
+$services->set(BatchSpanProcessor::class)
+    ->arg('$exporter', service(OtlpHttpSpanExporter::class));
+
+$services->set(TracerProvider::class)
+    ->call('addSpanProcessor', [service(BatchSpanProcessor::class)]);
+
+$services->set('otel.tracer')
+    ->factory([service(TracerProvider::class), 'getTracer'])
+    ->arg('$name', $_ENV['OTEL_SERVICE_NAME'] ?? 'vortos');
+
+$services->set(NoOpTracer::class, OpenTelemetryTracer::class)
+    ->arg('$tracer', service('otel.tracer'))
+    ->public(false);
+```
+
+---
+
+## Step 4 — Set environment variables
+
+```bash title=".env"
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318/v1/traces
+OTEL_SERVICE_NAME=my-app
+```
+
+If your app runs in Docker in the same network as Jaeger:
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+```
+
+---
+
+## Step 5 — Verify traces appear in Jaeger UI
+
+1. Make a few HTTP requests to your application
+2. Open the Jaeger UI at `http://localhost:16686`
+3. In the search panel, select your service name from the **Service** dropdown
+4. Click **Find Traces**
+5. Click any trace to see the span waterfall
+
+You should see:
+- A root span `http.POST /orders` (from `TracingMiddleware`)
+- Child spans `cqrs.command.PlaceOrder`, `db.query`, `cache.get`, etc.
+
+---
+
+## Using the Jaeger UI
+
+**Search traces:**
+- Filter by service, operation name, tags, duration, or time range
+- `http.status_code=500` finds all error traces
+- `error=true` finds traces with recorded exceptions
+
+**Trace view:**
+- The horizontal waterfall shows each span's start time and duration
+- Click a span to see its attributes (SQL query, cache key, HTTP route, etc.)
+- Spans with `status=error` are highlighted red
+
+**Compare traces:**
+- Select two traces and click **Compare** to see a diff — useful for before/after performance comparisons
+
+---
+
+## Sampling
+
+```php title="config/tracing.php"
+use Vortos\Tracing\Config\TracingSampler;
+use Vortos\Tracing\DependencyInjection\VortosTracingConfig;
+
+return static function (VortosTracingConfig $config): void {
+    $config->sampler(TracingSampler::AlwaysOn);         // dev — trace everything
+    $config->sampler(TracingSampler::Ratio, rate: 0.1); // prod — trace 10%
+};
+```
+
+In dev with `AlwaysOn`, every request produces a trace. In production, use ratio sampling to reduce overhead and storage cost.
+
+---
+
+## Production considerations
+
+The `all-in-one` image uses in-memory storage — traces are lost on container restart. For persistent storage in production, use the separate Jaeger components with a proper backend:
+
+```yaml
+# Production setup uses separate collector + query + storage
+# Backends: Elasticsearch, Cassandra, Badger
+# See: https://www.jaegertracing.io/docs/latest/deployment/
+```
+
+For production at scale, Grafana Tempo with S3 storage is often cheaper and simpler to operate than Jaeger with Elasticsearch. Jaeger's OTLP endpoint means you can switch backends without changing your application code.
+
+---
+
+## Further reading
+
+- [Jaeger documentation](https://www.jaegertracing.io/docs/latest/)
+- [Jaeger deployment guide](https://www.jaegertracing.io/docs/latest/deployment/)
+- [OpenTelemetry PHP SDK](https://opentelemetry.io/docs/languages/php/)
+- [Vortos tracing configuration](/docs/tracing)

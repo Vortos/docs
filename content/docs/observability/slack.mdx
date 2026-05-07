@@ -1,0 +1,136 @@
+---
+title: Slack
+description: Send critical log alerts to a Slack channel via Incoming Webhooks — step-by-step setup and Vortos configuration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Slack
+
+Vortos can post a message to a Slack channel when a log record reaches a configured severity threshold. This gives your team real-time visibility into critical failures without anyone having to watch a log dashboard.
+
+---
+
+## What you need
+
+- A Slack workspace where you have permission to add apps
+- A Vortos app running with `vortos-logger` installed
+
+---
+
+## Step 1 — Create a Slack app and Incoming Webhook
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
+2. Choose **From scratch**, give it a name (e.g. `my-app Alerts`), select your workspace
+3. In the left sidebar, click **Incoming Webhooks**
+4. Toggle **Activate Incoming Webhooks** to On
+5. Click **Add New Webhook to Workspace**
+6. Select the channel that should receive alerts (e.g. `#production-alerts`)
+7. Click **Allow**
+8. Copy the **Webhook URL** — it looks like:
+   ```
+   https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX
+   ```
+
+---
+
+## Step 2 — Add the webhook URL to your environment
+
+```bash title=".env"
+SLACK_ALERT_WEBHOOK=https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXX
+```
+
+---
+
+## Step 3 — Configure Vortos
+
+```php title="config/logging.php"
+use Monolog\Level;
+use Vortos\Logger\DependencyInjection\VortosLoggingConfig;
+
+return static function (VortosLoggingConfig $config): void {
+    $config->slack(
+        webhook: $_ENV['SLACK_ALERT_WEBHOOK'] ?? '',
+        minLevel: Level::Critical,
+    );
+};
+```
+
+If the webhook URL is empty or unset, the handler is silently skipped — safe to deploy with or without the env var set.
+
+---
+
+## Step 4 — Choose the right threshold
+
+<Callout type="warn" title="Do not set minLevel to ERROR for Slack">
+At `ERROR` level, Slack will receive a message for every failed request, validation error, and external API timeout. This quickly becomes noise that everyone ignores. Reserve Slack for `CRITICAL` and above — conditions that require immediate human action.
+</Callout>
+
+| Level | Appropriate for Slack? | Reason |
+|---|---|---|
+| `ERROR` | No | Too frequent — every 4xx, payment decline, API error |
+| `CRITICAL` | Yes | System-level failure — dead letter queue, DB unreachable |
+| `ALERT` | Yes | Data loss, security breach |
+| `EMERGENCY` | Yes | System completely unusable |
+
+```php
+// Recommended — only wake someone up when it truly matters
+$config->slack(webhook: $_ENV['SLACK_ALERT_WEBHOOK'] ?? '', minLevel: Level::Critical);
+```
+
+---
+
+## Step 5 — Verify it's working
+
+Trigger a test critical log temporarily:
+
+```php
+$this->logger->critical('Slack test alert', ['env' => 'dev', 'test' => true]);
+```
+
+You should see a message appear in your configured Slack channel within a few seconds.
+
+---
+
+## What the message looks like
+
+Slack receives the log record formatted as a plain text message with the level, channel, message, and context included. It is not a rich embed — just a readable text block. For richer formatting or incident workflows, consider routing through PagerDuty or OpsGenie (which have native Slack integrations on their side).
+
+---
+
+## Using Sentry and Slack together
+
+A common pattern:
+- **Sentry** at `ERROR` — captures and groups all errors for investigation
+- **Slack** at `CRITICAL` — wakes someone up immediately for system failures
+
+```php
+$config->sentry(dsn: $_ENV['SENTRY_DSN'] ?? '', minLevel: Level::Error);
+$config->slack(webhook: $_ENV['SLACK_ALERT_WEBHOOK'] ?? '', minLevel: Level::Critical);
+```
+
+Both handlers are active simultaneously. A `CRITICAL` log goes to both Sentry (for context and stack trace) and Slack (for immediate visibility).
+
+---
+
+## Troubleshooting
+
+**No message in Slack:**
+- Confirm the webhook URL is correct and the env var is set
+- Test the webhook directly:
+  ```bash
+  curl -X POST -H 'Content-type: application/json' \
+    --data '{"text":"Test message"}' \
+    $SLACK_ALERT_WEBHOOK
+  ```
+- Check the log level — only the configured threshold and above are sent
+
+**Webhook URL expired or invalid:**
+- Go back to [api.slack.com/apps](https://api.slack.com/apps), find your app, regenerate the webhook
+
+---
+
+## Further reading
+
+- [Slack Incoming Webhooks documentation](https://api.slack.com/messaging/webhooks)
+- [Monolog SlackWebhookHandler](https://github.com/Seldaek/monolog/blob/main/src/Monolog/Handler/SlackWebhookHandler.php)

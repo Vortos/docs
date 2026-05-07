@@ -1,0 +1,225 @@
+---
+title: Metrics
+description: Counters, gauges, and histograms across HTTP, CQRS, messaging, cache, and persistence — NoOp by default, Prometheus or StatsD when you need real numbers.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Metrics
+
+`vortos-metrics` records runtime performance numbers across every major framework module. NoOp by default — zero overhead until you configure an adapter. When you switch to Prometheus or StatsD, counters, gauges, and histograms start flowing with no code changes required.
+
+## What are metrics and why do they matter?
+
+A **metric** is a number that changes over time — request count, response latency, cache hit rate, queue depth. Unlike logs (individual events) and traces (single request trees), metrics are aggregated: you don't record the duration of every single request individually, you record a histogram that summarises the distribution of all request durations.
+
+Metrics answer questions that logs can't:
+- *What is the 99th percentile response time over the last 5 minutes?*
+- *How many orders failed this hour compared to last hour?*
+- *Is the cache hit rate dropping as traffic increases?*
+
+These patterns only emerge from data aggregated over time — that is what metrics are for.
+
+**Three metric types:**
+
+| Type | What it measures | Example |
+|---|---|---|
+| **Counter** | A value that only goes up | Total HTTP requests, total errors |
+| **Gauge** | A value that goes up and down | Active connections, queue depth |
+| **Histogram** | Distribution of values in buckets | Response time in ms, DB query duration |
+
+A histogram is the most powerful type. Instead of just knowing the average response time (which hides outliers), a histogram tells you: 50% of requests completed in under 50ms, 95% in under 200ms, 99% in under 500ms. Those percentile breakpoints (p50, p95, p99) are what SLAs are defined on.
+
+---
+
+## Installation
+
+```bash
+composer require vortos/vortos-metrics
+```
+
+For the Prometheus adapter, also install the client library:
+
+```bash
+composer require promphp/prometheus_client_php
+```
+
+## Package registration
+
+```php title="bootstrap/app.php"
+use Vortos\Metrics\DependencyInjection\MetricsPackage;
+
+$packages = [
+    new LoggerPackage(),     // order 10
+    new TracingPackage(),    // order 50
+    new MetricsPackage(),    // order 55
+    new HttpPackage(),
+    // ...
+];
+```
+
+Register `MetricsPackage` after `TracingPackage` — metrics auto-instrumentation can optionally attach exemplar links to traces.
+
+---
+
+## Quick start
+
+### Development (NoOp — default)
+
+No configuration needed. All `MetricsInterface` calls are no-ops. Register the package and move on.
+
+### Prometheus
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config->adapter(MetricsAdapter::Prometheus)
+           ->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+};
+```
+
+Prometheus scrapes your `/metrics` endpoint every 15 seconds. Add the scrape target in your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: 'my-app'
+    static_configs:
+      - targets: ['your-app:80']
+    bearer_token: 'your-metrics-token'
+```
+
+### StatsD / Datadog DogStatsD
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config->adapter(MetricsAdapter::StatsD)
+           ->statsDHost($_ENV['STATSD_HOST'] ?? '127.0.0.1')
+           ->statsDPort(8125);
+};
+```
+
+---
+
+## Configuration reference
+
+Create the config file:
+
+```bash
+php vortos make:config metrics
+```
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\{MetricsAdapter, MetricsModule};
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+
+    // Choose adapter (default: NoOp)
+    $config->adapter(MetricsAdapter::Prometheus);
+
+    // Set the metric namespace prefix — all names become {namespace}_{name}
+    $config->namespace('myapp');   // default: 'vortos'
+
+    // Prometheus storage backend (choose one)
+    $config->prometheusStorageInMemory();  // default — single process only
+    $config->prometheusStorageApc();       // PHP-FPM multi-process safe
+    $config->prometheusStorageRedis(       // FrankenPHP multi-process safe
+        prefix: 'metrics:',
+        host: $_ENV['REDIS_HOST'] ?? '127.0.0.1',
+        port: 6379,
+        password: $_ENV['REDIS_PASSWORD'] ?? '',
+    );
+
+    // Endpoint security (production requires one of these)
+    $config->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+    // OR confirm network-level protection is in place:
+    $config->prometheusEndpointOpenAccess();
+
+    // StatsD settings
+    $config->statsDHost('127.0.0.1')
+           ->statsDPort(8125)
+           ->statsDSampleRate(0.1);   // send 10% of metrics (reduces UDP volume)
+
+    // Silence high-cardinality or high-volume modules
+    $config->disableModule(MetricsModule::Cache);
+    $config->disableModule(MetricsModule::Persistence);
+};
+```
+
+Environment-specific overrides go in `config/{env}/metrics.php`. They are merged on top of the base config.
+
+---
+
+## Inject and use `MetricsInterface`
+
+For application-level metrics — business events that matter to you specifically:
+
+```php
+use Vortos\Metrics\Contract\MetricsInterface;
+
+final class OrderService
+{
+    public function __construct(private readonly MetricsInterface $metrics) {}
+
+    public function place(Order $order): void
+    {
+        $start = hrtime(true);
+
+        try {
+            // ... place order
+            $this->metrics->counter('orders_placed_total', [
+                'currency' => $order->getCurrency(),
+                'channel'  => $order->getChannel(),
+            ])->increment();
+
+        } finally {
+            $elapsed = (hrtime(true) - $start) / 1_000_000; // nanoseconds → ms
+            $this->metrics->histogram('order_processing_duration_ms', labels: [
+                'currency' => $order->getCurrency(),
+            ])->observe($elapsed);
+        }
+    }
+}
+```
+
+Labels (the array argument) are the dimensions you can filter and group by in your dashboard. Keep them low-cardinality — use `currency` (a handful of values), not `order_id` (unbounded). See the [auto-instrumentation docs](/docs/metrics/auto-instrumentation#cardinality) for a detailed explanation.
+
+---
+
+## Framework metrics — what's recorded automatically
+
+All of these are recorded without any code changes. To see the full label set for each metric, see [Auto-instrumentation](/docs/metrics/auto-instrumentation).
+
+| Metric | Type | Module |
+|---|---|---|
+| `{ns}_http_requests_total` | Counter | HTTP |
+| `{ns}_http_request_duration_ms` | Histogram | HTTP |
+| `{ns}_cqrs_commands_total` | Counter | CQRS |
+| `{ns}_cqrs_command_duration_ms` | Histogram | CQRS |
+| `{ns}_cqrs_command_failures_total` | Counter | CQRS |
+| `{ns}_messaging_events_dispatched_total` | Counter | Messaging |
+| `{ns}_messaging_produced_total` | Counter | Messaging |
+| `{ns}_messaging_consumed_total` | Counter | Messaging |
+| `{ns}_messaging_consume_duration_ms` | Histogram | Messaging |
+| `{ns}_messaging_dead_letter_total` | Counter | Messaging |
+| `{ns}_cache_operations_total` | Counter | Cache |
+| `{ns}_db_queries_total` | Counter | Persistence |
+| `{ns}_db_query_duration_ms` | Histogram | Persistence |
+
+`{ns}` is the configured namespace (default: `vortos`).
+
+---
+
+## Module overview
+
+<Cards>
+  <Card title="Adapters" href="/docs/metrics/adapters" description="NoOp, Prometheus, StatsD — choosing the right adapter, multi-process storage for FrankenPHP." />
+  <Card title="Auto-Instrumentation" href="/docs/metrics/auto-instrumentation" description="What each module records, label design, cardinality, and how to disable noisy modules." />
+  <Card title="Prometheus Endpoint" href="/docs/metrics/prometheus-endpoint" description="Securing the /metrics endpoint, scrape configuration, and Grafana dashboards." />
+</Cards>

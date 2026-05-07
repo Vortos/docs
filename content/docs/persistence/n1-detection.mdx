@@ -1,0 +1,200 @@
+---
+title: N+1 Query Detection
+description: Automatic detection of N+1 query patterns in development — warning logs and response headers with zero production overhead.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# N+1 Query Detection
+
+Both `vortos-persistence-dbal` and `vortos-persistence-orm` automatically detect N+1 query patterns in development. When the same SQL structure executes 3 or more times in a single request, you get an instant warning — in your logs and in the HTTP response header — without touching any code.
+
+**Zero production cost.** The detector is registered exclusively in `dev` environments. The middleware, tracker, and listener are completely absent in production — no wrapper, no overhead, no memory.
+
+---
+
+## What is N+1?
+
+The N+1 problem is one of the most common and damaging performance bugs in database-backed applications. It happens when code loads a collection of records and then runs a separate query for each one — instead of loading all related data in a single query.
+
+```php
+// BROKEN — N+1 pattern
+$orders = $orderRepo->findAll();          // 1 query: SELECT * FROM orders
+
+foreach ($orders as $order) {
+    $items = $itemRepo->findByOrder($order->getId());  // N queries, one per order
+    // render $items ...
+}
+```
+
+If there are 50 orders, this code runs 51 queries (1 + 50). With 500 orders it runs 501. The damage scales linearly and is invisible until it causes a slowdown in production.
+
+The fix is to load all items in a single JOIN or WHERE IN query:
+
+```php
+// CORRECT — 2 queries total, regardless of order count
+$orders  = $orderRepo->findAll();
+$orderIds = array_column($orders, 'id');
+$items   = $itemRepo->findByOrderIds($orderIds);  // SELECT * FROM items WHERE order_id IN (...)
+```
+
+N+1 detection catches this pattern automatically in development, before it reaches production.
+
+---
+
+## How detection works
+
+Every SQL query — whether issued through the raw DBAL connection or through Doctrine ORM's `EntityManager` — is intercepted by `N1DetectorMiddleware`. Before execution, the SQL string is **normalized** to strip all literal values:
+
+```sql
+-- These three queries are all different SQL strings...
+SELECT * FROM order_items WHERE order_id = 1
+SELECT * FROM order_items WHERE order_id = 2
+SELECT * FROM order_items WHERE order_id = 3
+
+-- ...but they normalize to the same signature:
+select * from order_items where order_id = ?
+```
+
+The tracker counts how many times each normalized signature is seen per request. At the end of the request, any signature that was executed **3 or more times** is flagged as a violation.
+
+### What gets normalized
+
+| Pattern | Before | After |
+|---|---|---|
+| Integer literals | `WHERE id = 42` | `WHERE id = ?` |
+| Float literals | `WHERE price = 9.99` | `WHERE price = ?` |
+| String literals | `WHERE status = 'active'` | `WHERE status = ?` |
+| IN lists | `IN (1, 2, 3)` | `IN (?)` |
+| Whitespace | multiple spaces/tabs | single space |
+| Case | `SELECT` / `select` | always lowercase |
+
+---
+
+## Output
+
+When a violation is detected, two things happen simultaneously at the end of the request.
+
+### 1. Log warning (query channel)
+
+```
+[query.WARNING] N+1 query detected {
+    "sql": "select * from order_items where order_id = ?",
+    "count": 47,
+    "threshold": 3
+}
+```
+
+The `sql` field is the normalized signature — enough to identify which query and which table. The `count` is how many times it ran in that request.
+
+### 2. Response header
+
+```
+X-Vortos-N1: "select * from order_items where order_id = ?" called 47x
+```
+
+The header is visible immediately in browser DevTools (Network tab → response headers) or with `curl -i`. No need to watch a log stream — the N+1 jumps out in the normal development workflow.
+
+If multiple queries are flagged in the same request, the header lists the top 3 (ordered by count):
+
+```
+X-Vortos-N1: "select * from order_items where order_id = ?" called 47x; "select * from users where id = ?" called 12x
+```
+
+---
+
+## No configuration required
+
+N+1 detection activates automatically depending on which persistence package you use:
+
+| Package | Activates when |
+|---|---|
+| `DbalPersistencePackage` | `kernel.env = dev` |
+| `PersistenceOrmPackage` | `kernel.env = dev` |
+
+There is no config file, no flag to set. In production (`kernel.env != dev`) the `N1DetectionCompilerPass` exits immediately — nothing is registered, no overhead anywhere. The two packages share the same detector implementation; whichever one is active picks it up automatically.
+
+---
+
+## Threshold
+
+The default threshold is **3 executions of the same query**. This means two identical queries (which can sometimes be legitimate — a lookup you need to repeat twice) don't trigger a warning. Three or more is a reliable signal of a loop-driven query pattern.
+
+The threshold is set in `N1DetectionCompilerPass::THRESHOLD`. If you need to adjust it for a specific project, edit that constant — but the default catches virtually all real N+1 bugs without false positives.
+
+---
+
+## Prepared statements
+
+N+1 detection tracks at **execute time**, not prepare time. A prepared statement prepared once but executed 50 times counts as 50 executions — which is correct, because each execute is a real round-trip to the database.
+
+```php
+$stmt = $conn->prepare("SELECT * FROM items WHERE order_id = ?");
+
+foreach ($orderIds as $id) {
+    $stmt->bindValue(1, $id);
+    $stmt->execute();  // each execute() is tracked separately
+}
+```
+
+This is the most common form of N+1 with raw DBAL — the detection catches it correctly. With Doctrine ORM, the same applies: ORM-generated queries go through DBAL prepared statements internally, so `execute()` calls are tracked the same way.
+
+---
+
+## Worker mode (FrankenPHP)
+
+In FrankenPHP worker mode, PHP processes are long-lived across many requests. The tracker is reset at the start of every main request (`kernel.request` event), so state never bleeds between requests. Each request gets a fresh count.
+
+Sub-requests (Symfony internal fragments, error rendering) are silently skipped — only the main request is tracked and reported.
+
+---
+
+## How to verify it's working
+
+Make a request that you know has an N+1 (or temporarily add one):
+
+```php
+// DBAL — add this to any controller action
+$conn = $this->connection;
+for ($i = 1; $i <= 5; $i++) {
+    $conn->executeQuery("SELECT * FROM orders WHERE id = {$i}")->fetchAllAssociative();
+}
+
+// ORM — same effect via EntityManager
+for ($i = 1; $i <= 5; $i++) {
+    $this->em->find(Order::class, $i);
+}
+```
+
+Then:
+
+```bash
+curl -i http://localhost/your-route
+```
+
+You should see in the response headers:
+
+```
+X-Vortos-N1: "select * from orders where id = ?" called 5x
+```
+
+And in your log file:
+
+```bash
+tail -f var/log/app-$(date +%Y-%m-%d).log | grep "N+1"
+```
+
+---
+
+## What it does not detect
+
+- **MongoDB queries** — only DBAL (SQL) is instrumented
+- **HTTP client calls** — repeated outbound API calls are not tracked
+- **Cache lookups** — repeated cache reads are not tracked
+- **Queries across different requests** — each request is tracked independently
+
+For cross-request patterns (a background job that runs the same query in a loop), use query-level metrics (`vortos_db_queries_total`) to spot anomalies.
+
+<Callout type="info" title="N+1 in production">
+If you suspect an N+1 reached production, look for a route where `vortos_db_queries_total` spikes relative to `vortos_http_requests_total`. A route that runs 50 queries per request will have a 50:1 ratio — clearly visible in Grafana.
+</Callout>

@@ -1,0 +1,272 @@
+---
+title: Alertmanager
+description: Route Prometheus alerts from Vortos metrics to Slack, email, and PagerDuty using Prometheus Alertmanager.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Alertmanager
+
+[Prometheus Alertmanager](https://prometheus.io/docs/alerting/latest/alertmanager/) receives firing alerts from Prometheus and routes them to the right notification channel — Slack, email, PagerDuty, OpsGenie, or any webhook. It also handles deduplication (so you get one alert, not hundreds), silencing (suppress alerts during maintenance), and grouping (bundle related alerts into one message).
+
+Alertmanager sits between Prometheus (which evaluates alert rules) and your notification channels (which receive the messages).
+
+---
+
+## When to use Alertmanager vs Grafana alerts
+
+- **Grafana alerts** — simpler, built-in, good when you already use Grafana for dashboards. Covers most use cases.
+- **Alertmanager** — better when you need multi-team routing (different alerts go to different teams), complex silencing logic, or you already run Prometheus in production infrastructure.
+
+For most Vortos applications, Grafana alerting is sufficient. Use Alertmanager when your operations team already uses it or when you need routing that Grafana can't express.
+
+---
+
+## What you need
+
+- Prometheus running and scraping your app (see [Prometheus setup](/docs/observability/prometheus))
+- Alert rules defined (see Step 1)
+- A Slack webhook or email server for notifications
+
+---
+
+## Step 1 — Write alert rules for Vortos metrics
+
+Create an alert rules file:
+
+```yaml title="docker/prometheus-alerts.yml"
+groups:
+  - name: vortos
+    rules:
+
+      - alert: HighErrorRate
+        expr: |
+          rate(vortos_http_requests_total{status=~"5.."}[5m])
+          / rate(vortos_http_requests_total[5m]) > 0.01
+        for: 2m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High HTTP error rate on {{ $labels.route }}"
+          description: "Error rate is {{ $value | humanizePercentage }} over the last 5 minutes."
+
+      - alert: SlowP99
+        expr: |
+          histogram_quantile(0.99,
+            rate(vortos_http_request_duration_ms_bucket[5m])
+          ) > 500
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "p99 response time above 500ms"
+          description: "99th percentile response time is {{ $value | humanize }}ms."
+
+      - alert: DeadLetterQueue
+        expr: increase(vortos_messaging_dead_letter_total[5m]) > 0
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Messages moved to dead letter queue"
+          description: "{{ $value }} message(s) dead-lettered in the last 5 minutes. Manual intervention required."
+
+      - alert: CommandFailureRate
+        expr: |
+          rate(vortos_cqrs_command_failures_total[5m])
+          / rate(vortos_cqrs_commands_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High command failure rate ({{ $labels.command }})"
+          description: "{{ $value | humanizePercentage }} of {{ $labels.command }} commands are failing."
+
+      - alert: CacheHitRateLow
+        expr: |
+          rate(vortos_cache_operations_total{operation="get",result="hit"}[10m])
+          / rate(vortos_cache_operations_total{operation="get"}[10m]) < 0.5
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Cache hit rate below 50%"
+          description: "Cache hit rate is {{ $value | humanizePercentage }}. Cache may be cold or TTLs too short."
+```
+
+---
+
+## Step 2 — Load alert rules in Prometheus
+
+```yaml title="docker/prometheus.yml"
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s    # how often to evaluate alert rules
+
+rule_files:
+  - /etc/prometheus/alerts.yml    # mount this file in docker-compose
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: vortos-app
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+    bearer_token: "your-metrics-token"
+```
+
+Add the rules file to the Prometheus Docker volume:
+
+```yaml title="docker-compose.yml"
+services:
+  prometheus:
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus-alerts.yml:/etc/prometheus/alerts.yml:ro
+```
+
+---
+
+## Step 3 — Run Alertmanager
+
+```yaml title="docker-compose.yml"
+services:
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./docker/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+```
+
+---
+
+## Step 4 — Configure Alertmanager routing and receivers
+
+```yaml title="docker/alertmanager.yml"
+global:
+  resolve_timeout: 5m
+  slack_api_url: "${SLACK_ALERT_WEBHOOK}"   # fallback webhook for all Slack receivers
+
+route:
+  # Default receiver for all alerts
+  receiver: slack-warnings
+  group_by: [alertname, team]
+  group_wait: 30s         # wait 30s before sending the first notification (allows grouping)
+  group_interval: 5m      # wait 5m before sending a new notification for an ongoing alert
+  repeat_interval: 4h     # re-send if alert is still firing after 4 hours
+
+  # Route critical alerts to a separate receiver
+  routes:
+    - match:
+        severity: critical
+      receiver: slack-critical
+      repeat_interval: 30m    # re-send critical alerts every 30 minutes
+
+receivers:
+  - name: slack-warnings
+    slack_configs:
+      - channel: "#backend-alerts"
+        title: "{{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        send_resolved: true
+
+  - name: slack-critical
+    slack_configs:
+      - channel: "#production-incidents"
+        title: ":rotating_light: CRITICAL: {{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        send_resolved: true
+```
+
+---
+
+## Step 5 — Start everything
+
+```bash
+docker compose up -d prometheus alertmanager
+```
+
+---
+
+## Step 6 — Verify alert rules are loaded
+
+Open the Prometheus UI:
+```bash
+open http://localhost:9090/alerts
+```
+
+You should see all rules listed. Rules in "inactive" state are healthy (threshold not crossed). Rules in "firing" state mean the condition is currently true.
+
+Open the Alertmanager UI:
+```bash
+open http://localhost:9093
+```
+
+Here you can see active alerts, silence ongoing alerts during maintenance, and view routing configuration.
+
+---
+
+## Step 7 — Test an alert
+
+Temporarily lower a threshold to trigger a firing alert:
+
+```yaml
+# In prometheus-alerts.yml — trigger immediately for testing
+- alert: HighErrorRate
+  expr: rate(vortos_http_requests_total[1m]) > 0   # fires on any traffic
+  for: 10s
+```
+
+Reload Prometheus config:
+```bash
+curl -X POST http://localhost:9090/-/reload
+```
+
+Within 30 seconds the alert should appear as "firing" in Prometheus and a message should arrive in your Slack channel. Revert the rule when done.
+
+---
+
+## Adding PagerDuty
+
+```yaml title="docker/alertmanager.yml"
+receivers:
+  - name: pagerduty-critical
+    pagerduty_configs:
+      - routing_key: "${PAGERDUTY_INTEGRATION_KEY}"
+        description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.description }}"
+        severity: "{{ .GroupLabels.severity }}"
+```
+
+Get the integration key from PagerDuty → Services → your service → Integrations → Add integration → Prometheus.
+
+---
+
+## Silencing alerts during maintenance
+
+In the Alertmanager UI at `http://localhost:9093`:
+1. Click **New Silence**
+2. Set the matchers (e.g. `alertname="SlowP99"`)
+3. Set the duration (e.g. 2 hours for a planned deployment)
+4. Add a comment explaining why
+
+Active silences suppress matching alerts — they still appear in Prometheus as "firing" but Alertmanager does not send notifications.
+
+---
+
+## Further reading
+
+- [Alertmanager documentation](https://prometheus.io/docs/alerting/latest/alertmanager/)
+- [Alertmanager configuration reference](https://prometheus.io/docs/alerting/latest/configuration/)
+- [Prometheus alert rules](https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/)
+- [PagerDuty Prometheus integration](https://www.pagerduty.com/docs/guides/prometheus-integration-guide/)
