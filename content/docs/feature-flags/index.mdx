@@ -97,6 +97,28 @@ $variant = $this->flags->variant('cta-button', $context);
 // returns 'control' | 'blue' | 'green'
 ```
 
+## Built-in Frontend Endpoint
+
+The module registers `GET /api/flags` automatically. No controller code needed.
+
+The endpoint evaluates flags for the current request using the registered `FlagContextResolver` and returns every enabled flag name plus every active variant in a single response:
+
+```json
+{
+  "flags": ["new-dashboard", "dark-mode"],
+  "variants": {
+    "checkout-layout": "variant-b",
+    "cta-button": "blue"
+  }
+}
+```
+
+`flags` lists every flag that evaluated to `true` for this request. `variants` maps flag names to their assigned variant string — only flags that have active variants appear here.
+
+The frontend SDK reads this endpoint and makes flag state available locally through React context. See [Frontend Integration](/docs/feature-flags/frontend) for setup.
+
+For patterns on when to use this endpoint vs. inline handler checks vs. a filtered custom endpoint, see [Usage Patterns](/docs/feature-flags/patterns).
+
 ## `#[RequiresFlag]` on Controllers
 
 Annotate a controller to gate the entire route behind a flag. Returns 404 if the flag is off — no extra code in the action:

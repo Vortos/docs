@@ -1,4 +1,4 @@
 {
   "title": "Feature Flags",
-  "pages": ["index", "managing-flags", "targeting", "frontend"]
+  "pages": ["index", "managing-flags", "targeting", "frontend", "patterns"]
 }

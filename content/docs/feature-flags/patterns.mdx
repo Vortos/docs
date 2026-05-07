@@ -1,0 +1,286 @@
+---
+title: Usage Patterns
+description: When to use the built-in endpoint, where variant logic belongs, and how to filter flags for the frontend.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Usage Patterns
+
+Three situations come up repeatedly when working with feature flags. Each has a clear right answer.
+
+| Situation | Pattern |
+|---|---|
+| Frontend shows or hides UI based on a flag | Built-in `/api/flags` endpoint — no backend code needed |
+| Backend runs different business logic per variant | Check `variant()` inside the query or command handler |
+| Frontend needs data that depends on a variant | Return it from the query handler — not from a flags endpoint |
+| You need to hide internal flags from the browser | Filtered wrapper around `allForContext()` |
+
+---
+
+## Pattern 1 — Frontend feature gating
+
+**Situation:** A React component should render only when a flag is on, or should render a different UI depending on a variant.
+
+**Solution:** Use the built-in `/api/flags` endpoint. No custom backend code is required. The endpoint evaluates the flag for the current user and returns enabled flags and active variants:
+
+```
+GET /api/flags
+```
+```json
+{
+  "flags": ["new-dashboard", "dark-mode"],
+  "variants": {
+    "checkout-layout": "variant-b",
+    "cta-button": "blue"
+  }
+}
+```
+
+**Step 1 — Set up the backend context resolver** so the endpoint knows who is making the request. Without this, every request is evaluated as anonymous and percentage rollout will not work.
+
+```php title="src/Shared/Infrastructure/Flags/UserFlagContextResolver.php"
+use Vortos\FeatureFlags\FlagContext;
+use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
+use Symfony\Component\HttpFoundation\Request;
+
+final class UserFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly CurrentUserProvider $auth) {}
+
+    public function resolve(Request $request): FlagContext
+    {
+        $user = $this->auth->current();
+
+        if (!$user->isAuthenticated()) {
+            return new FlagContext(); // anonymous — percentage rules won't match
+        }
+
+        return new FlagContext(
+            userId: (string) $user->getId(),
+            attributes: ['plan' => $user->plan, 'role' => $user->role],
+        );
+    }
+}
+```
+
+```php title="config/services.php"
+$services->alias(FlagContextResolverInterface::class, UserFlagContextResolver::class);
+```
+
+Register once. The built-in endpoint, `#[RequiresFlag]`, and any call to `FlagRegistry::isEnabled()` or `FlagRegistry::variant()` without an explicit context all use this resolver.
+
+**Step 2 — Use the flag in React** via the frontend SDK:
+
+```tsx title="src/App.tsx"
+import { FeatureFlagProvider } from '@vortos/flags';
+
+export function App() {
+  return (
+    <FeatureFlagProvider
+      endpoint="/api/flags"
+      headers={{ Authorization: `Bearer ${token}` }}
+      context={{ userId, plan }}
+    >
+      <Router />
+    </FeatureFlagProvider>
+  );
+}
+```
+
+```tsx title="src/features/Dashboard.tsx"
+import { useFlag, useVariant } from '@vortos/flags';
+
+export function DashboardNav() {
+  const newDashboard = useFlag('new-dashboard');
+  const layout = useVariant('dashboard-layout', 'standard'); // 'standard' is the default
+
+  if (!newDashboard) return <LegacyNav />;
+
+  return <NewNav layout={layout} />;
+}
+```
+
+The frontend reads flag state from local React context — zero network calls per component. The provider fetches once and keeps state fresh with optional polling.
+
+---
+
+## Pattern 2 — Backend variant behaviour
+
+**Situation:** Different variants of a flag should run different server-side business logic — for example, a checkout flow that has a fast two-step variant and a detailed five-step variant.
+
+**The wrong approach** is to put the variant logic in a controller:
+
+```php
+// ❌ Wrong — controller interprets the variant and returns different response shapes
+public function __invoke(): JsonResponse
+{
+    $variant = $this->flags->variant('checkout_flow', $context);
+
+    $config = match ($variant) {
+        'fast'     => ['steps' => 2, 'flow' => 'fast'],
+        'detailed' => ['steps' => 5, 'flow' => 'detailed'],
+        default    => ['steps' => 3, 'flow' => 'standard'],
+    };
+
+    return new JsonResponse($config);
+}
+```
+
+This is wrong because the controller is now doing application logic. It also means the frontend gets different response shapes from the same route, which breaks the contract between the API and its consumers.
+
+**The right approach** is for the controller to stay dumb and for the query handler to check the variant:
+
+```php title="src/Checkout/Representation/Controller/CheckoutConfigController.php"
+// ✅ Controller is a thin adapter — one route, one stable response shape
+#[ApiController]
+#[Route('/api/checkout/config', methods: ['GET'])]
+#[RequiresAuth]
+final class CheckoutConfigController
+{
+    public function __construct(private readonly QueryBus $queryBus) {}
+
+    public function __invoke(): JsonResponse
+    {
+        $result = $this->queryBus->dispatch(new GetCheckoutConfigQuery());
+        return new JsonResponse($result->toArray());
+    }
+}
+```
+
+```php title="src/Checkout/Application/Query/GetCheckoutConfig/GetCheckoutConfigQueryHandler.php"
+// ✅ Handler owns the variant decision — this is application logic
+final class GetCheckoutConfigQueryHandler
+{
+    public function __construct(
+        private readonly FlagRegistry $flags,
+        private readonly FlagContextResolverInterface $contextResolver,
+        private readonly RequestStack $requestStack,
+    ) {}
+
+    public function __invoke(GetCheckoutConfigQuery $query): CheckoutConfig
+    {
+        $request = $this->requestStack->getCurrentRequest();
+        $context = $request ? $this->contextResolver->resolve($request) : new FlagContext();
+
+        return match ($this->flags->variant('checkout_flow', $context)) {
+            'fast'     => CheckoutConfig::fast(),     // 2 steps
+            'detailed' => CheckoutConfig::detailed(), // 5 steps
+            default    => CheckoutConfig::standard(), // 3 steps
+        };
+    }
+}
+```
+
+The frontend calls `GET /api/checkout/config` and receives `{ "steps": 2, "flow": "fast" }`. It does not know which flag variant produced that result — it just uses the data. The flag name and variant string stay on the backend.
+
+<Callout type="info" title="Why this matters">
+Keeping variant logic in handlers means you can change rollout percentages, rename variants, or kill a flag without touching the controller or the frontend API contract. The controller always returns the same shape — only the values change.
+</Callout>
+
+---
+
+## Pattern 3 — Frontend needs variant-driven data
+
+**Situation:** A flag variant determines some configuration the frontend needs to render correctly — for example, a content block with a different headline, CTA text, and image depending on the variant.
+
+This is a combination of patterns 1 and 2. The backend query handler picks the right content based on the variant and returns it. The frontend just renders what it receives.
+
+```php title="src/Marketing/Application/Query/GetHeroBanner/GetHeroBannerQueryHandler.php"
+final class GetHeroBannerQueryHandler
+{
+    public function __construct(
+        private readonly FlagRegistry $flags,
+        private readonly HeroBannerRepository $banners,
+    ) {}
+
+    public function __invoke(GetHeroBannerQuery $query): HeroBanner
+    {
+        $context = new FlagContext(userId: $query->userId);
+        $variant = $this->flags->variant('hero_banner_test', $context);
+        // 'control' | 'summer' | 'promo'
+
+        return $this->banners->forVariant($variant);
+    }
+}
+```
+
+The React component receives a `HeroBanner` object — headline, image URL, CTA text — and renders it. It does not call `/api/flags` for this. The flag evaluation happened on the backend during the API call.
+
+```tsx title="src/features/HeroBanner.tsx"
+// ✅ Component has no knowledge of flags — it just renders what the API returned
+export function HeroBanner({ headline, imageUrl, ctaText }: HeroBannerProps) {
+  return (
+    <section>
+      <h1>{headline}</h1>
+      <img src={imageUrl} alt="" />
+      <a href="/shop">{ctaText}</a>
+    </section>
+  );
+}
+```
+
+---
+
+## Pattern 4 — Filtering flags for the frontend
+
+**Situation:** Your application has internal flags (`kill-switch-payments`, `maintenance-mode`) that should never be visible to the browser, alongside UI flags (`ui_new-dashboard`, `ui_dark-mode`) that the frontend SDK needs.
+
+The built-in `/api/flags` returns all flags. Write a filtering wrapper to expose only the ones the frontend should know about:
+
+```php title="src/Shared/Representation/Controller/FrontendFlagsController.php"
+#[ApiController]
+#[Route('/api/flags', name: 'app.flags', methods: ['GET'])]
+final class FrontendFlagsController
+{
+    public function __construct(
+        private readonly FlagRegistry $flags,
+        private readonly FlagContextResolverInterface $resolver,
+    ) {}
+
+    public function __invoke(Request $request): JsonResponse
+    {
+        $all = $this->flags->allForContext($this->resolver->resolve($request));
+
+        // Only expose flags and variants prefixed with 'ui_'
+        $flags = array_values(
+            array_filter($all['flags'], fn(string $f) => str_starts_with($f, 'ui_'))
+        );
+        $variants = array_filter(
+            $all['variants'],
+            fn(string $k) => str_starts_with($k, 'ui_'),
+            ARRAY_FILTER_USE_KEY,
+        );
+
+        return new JsonResponse(['flags' => $flags, 'variants' => $variants]);
+    }
+}
+```
+
+<Callout type="info" title="Override the built-in route">
+This controller uses the same path (`/api/flags`) as the built-in one. Register it in your application and it will take precedence — the built-in controller is only active if no application controller claims the same route.
+</Callout>
+
+Use a naming convention from the start: prefix every UI-facing flag with `ui_`. Backend-only flags have no prefix. The filter then requires no maintenance as you add new flags.
+
+---
+
+## Decision guide
+
+```
+Need to show/hide UI?
+  → useFlag('flag-name') from /api/flags
+  → No custom backend code needed
+
+Need different server logic per variant?
+  → flags->variant() inside the query/command handler
+  → Controller stays dumb, response shape stays stable
+
+Need variant-driven data on the frontend?
+  → Handler picks the right data, returns it through the query result
+  → Frontend renders what it receives, never touches /api/flags for this
+
+Need to hide internal flags from the browser?
+  → Write a filtering FrontendFlagsController wrapping allForContext()
+  → Use a 'ui_' prefix convention so the filter never needs updating
+```
