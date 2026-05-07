@@ -67,7 +67,7 @@ Choose `Customize` to walk through each setup category before setup writes files
 | Category | Current choices |
 |---|---|
 | Runtime | FrankenPHP Docker, PHP-FPM Docker, Local PHP |
-| Write database | PostgreSQL |
+| Write database | PostgreSQL (DBAL), PostgreSQL (Doctrine ORM) |
 | Read database | None, MongoDB |
 | Cache | Redis, in-memory cache |
 | Messaging | Kafka, in-memory messaging |
@@ -75,6 +75,20 @@ Choose `Customize` to walk through each setup category before setup writes files
 Some categories have only one supported option today. They are still part of the custom flow so future packages can add more choices without changing how setup works.
 
 Setup choices are registered as capabilities, not hardcoded in the setup command. The command reads capabilities by category and renders whatever is available.
+
+## Automatic Package Installation
+
+When you choose a stack option that requires a package not yet installed, setup automatically runs `composer require` for the missing packages before finishing.
+
+In `--dry-run` mode, setup prints the composer command instead of running it — useful for verifying what would be installed without making changes.
+
+Example: choosing "PostgreSQL (Doctrine ORM)" automatically installs `vortos/vortos-persistence-orm` if it is not already present in your `vendor/` directory.
+
+If composer install fails for any reason, setup prints the manual command to run so you can complete the step yourself:
+
+```bash
+composer require vortos/vortos-persistence-orm
+```
 
 ## Adding Setup Options From Modules
 
@@ -112,6 +126,8 @@ $container->register('vortos.mysql.setup_capability', StaticSetupCapability::cla
 ```
 
 That makes the option appear in the matching `Customize` step. The module still needs to provide the actual implementation behind the choice: services, config defaults, environment mapping, Docker support if needed, migrations if needed, and tests.
+
+For a complete step-by-step guide covering all integration points — including the `BUILT_IN_CAPABILITIES` constant, the `SetupCapabilityRegistry`, key naming rules, load order, and `ResetInterface` requirements — see [Adding Optional Modules](/docs/setup/adding-optional-modules).
 
 ## Presets
 

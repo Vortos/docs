@@ -3,6 +3,8 @@ title: Running Migrations
 description: Run pending migrations safely with preflight checks, advisory locking, dry runs, and production flags.
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 # Running Migrations
 
 Run all pending migrations:
@@ -58,3 +60,33 @@ Another migration process is already running.
 ```
 
 `--no-lock` exists for unusual local/debug workflows. Do not use it in production.
+
+---
+
+## ORM and Framework Migrations Together
+
+`vortos:migrate` runs all pending migrations in a single command, regardless of their source:
+
+- **Framework module tables** come from SQL stubs published via `vortos:migrate:publish`
+- **ORM entity tables** come from diffs generated via `vortos:orm:diff`
+
+Both land in the same `migrations/` directory and are run together by `vortos:migrate`. There is no separate ORM migration runner — one command covers everything.
+
+Standard workflow when using Doctrine ORM:
+
+```bash
+# 1. Publish any new framework module migrations
+php vortos migrate:publish
+
+# 2. Generate an ORM diff for entity changes
+php vortos vortos:orm:diff
+
+# 3. Run everything — both framework tables and ORM entity tables
+php vortos migrate
+```
+
+Review the generated migration file in `migrations/` before running step 3. The diff command generates plain SQL — it does not execute anything.
+
+<Callout type="info" title="One migrations/ directory">
+Framework table migrations and ORM entity migrations are indistinguishable to `vortos:migrate` — it runs them in timestamp order. Keep generated migration files in version control alongside hand-written ones.
+</Callout>

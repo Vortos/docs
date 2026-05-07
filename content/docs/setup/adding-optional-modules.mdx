@@ -1,0 +1,310 @@
+---
+title: Adding Optional Modules
+description: How to add a new optional package to the Vortos framework so it appears in the setup wizard and is automatically installed when selected.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Adding Optional Modules
+
+Optional packages are registered as capabilities in the setup wizard. When a developer runs `php vortos setup` and selects a capability, setup automatically runs `composer require` for any missing packages before finishing. The capability system drives this end-to-end — there is no hardcoded package list in the setup command itself.
+
+This guide covers every step required to add a new optional package — for example, `vortos-persistence-mysql` — so it appears in the wizard, installs automatically, and integrates correctly with the rest of the framework.
+
+## What "Optional" Means Here
+
+The framework meta-package (`vortos/vortos-framework`) lists truly required packages in `require`. Optional packages that are mutually exclusive choices live in `suggest`. The setup wizard installs them on demand via `composer require`. If a package is in `require`, every project installs it even when that option is never chosen — avoid this for infrastructure packages.
+
+---
+
+## Step 1: Register the Capability
+
+There are two places that must both be updated. They define the same capability for different execution paths:
+
+- `SetupExtension::BUILT_IN_CAPABILITIES` — used by the DI-wired production path (the `SetupCommand` service wired by Symfony DI)
+- `SetupCapabilityRegistry::builtIn()` — used by tests and any non-DI context (the static factory that creates a registry without a container)
+
+If these two diverge, the DI-wired setup command and the test/fallback path will behave differently. Keep them in sync at all times.
+
+### 1a. `SetupExtension::BUILT_IN_CAPABILITIES`
+
+**File**: `packages/Vortos/src/Setup/DependencyInjection/SetupExtension.php`
+
+The capability key format is `category.option_name`. Supported categories:
+
+| Category | Purpose | Example keys |
+|---|---|---|
+| `runtime` | PHP runtime and process model | `runtime.roadrunner` |
+| `write_db` | Primary write database | `write_db.mysql` |
+| `read_db` | Optional read/projection database | `read_db.postgres` |
+| `cache` | Cache driver | `cache.memcached` |
+| `messaging` | Message broker or in-process driver | `messaging.rabbitmq` |
+
+Add your capability to the `BUILT_IN_CAPABILITIES` constant array:
+
+```php
+'vortos.setup_capability.write_db.mysql' => [
+    'key'      => 'write_db.mysql',
+    'label'    => 'MySQL (DBAL)',
+    'category' => 'write_db',
+    'packages' => ['vortos/vortos-persistence-mysql'],
+],
+```
+
+### 1b. `SetupCapabilityRegistry::builtIn()`
+
+**File**: `packages/Vortos/src/Setup/Capability/SetupCapabilityRegistry.php`
+
+Add the matching entry to the `builtIn()` static factory:
+
+```php
+new StaticSetupCapability('write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql']),
+```
+
+### Why the Key Suffix Matters
+
+`SetupCommand::installMissingPackages()` derives the capability key from the config database value at runtime. The derivation:
+
+1. Strip the `docker-` or `local-` prefix from the database config value
+2. Replace hyphens with underscores
+3. Prepend `write_db.` (or the relevant category prefix)
+
+So if a developer chooses `write_db.mysql`, the setup config stores `'database' => 'docker-mysql'` or `'local-mysql'`. When `installMissingPackages()` runs, it derives `'write_db.mysql'` back from that stored value and looks it up in the capability registry to find the packages to install.
+
+**The key suffix must be a single word or an underscore-separated string with no hyphens.** Hyphens in the suffix break the round-trip because they are indistinguishable from the `docker-`/`local-` prefix that gets stripped.
+
+| Key | Valid? |
+|---|---|
+| `write_db.mysql` | Yes |
+| `write_db.mysql_innodb` | Yes |
+| `write_db.mysqldb` | Yes |
+| `write_db.mysql-8` | No — hyphen in suffix breaks round-trip |
+
+---
+
+## Step 2: Add to `composer.json` suggest
+
+**File**: `packages/Vortos/composer.json`
+
+Add the package to the `suggest` block:
+
+```json
+"vortos/vortos-persistence-mysql": "MySQL write repository — choose this or persistence-dbal/persistence-orm"
+```
+
+Do not add it to `require`. Optional packages that are mutually exclusive choices must live in `suggest`. The setup wizard installs them on demand. If you put it in `require`, every project installs it even when MySQL is never chosen.
+
+---
+
+## Step 3: Update the Migration Module Docblock
+
+**File**: `packages/Vortos/src/Migration/DependencyInjection/MigrationExtension.php`
+
+If the new module registers `Connection::class` — which all write-side persistence modules must do (see Step 4a below) — update the connection dependency comment in `MigrationExtension` to mention it as an additional provider:
+
+```
+DependencyFactoryProvider requires Connection::class, which is registered by
+either DbalPersistenceExtension (order 70), PersistenceOrmExtension (order 65),
+or MysqlPersistenceExtension (order 65). MigrationExtension loads at order 75.
+```
+
+`MigrationExtension` declares a dependency on `Connection::class` and loads at order 75. It must load after whichever persistence module is active. Keeping this comment accurate makes it clear to future contributors which modules satisfy the dependency.
+
+---
+
+## Step 4: Implement the Module Package
+
+The setup wizard installs the package — but the package must exist and do real work. For a write-side persistence module, the implementation must follow these contracts.
+
+### 4a. Register `Connection::class`
+
+All write-side persistence modules must register `Doctrine\DBAL\Connection::class` as a shared service. The Migration module depends on `Connection::class` at compile time. Without it, `MigrationExtension` will fail to compile when your module is the active persistence backend.
+
+### 4b. Register `UnitOfWorkInterface::class`
+
+Alias it to your module's `UnitOfWork` implementation:
+
+```php
+$container->setAlias(UnitOfWorkInterface::class, YourUnitOfWork::class);
+```
+
+### 4c. Implement `ResetInterface` on Your `UnitOfWork`
+
+`ResettableServicesPass` discovers `ResetInterface` implementations at compile time and registers them with `ServicesResetter`. Between FrankenPHP worker requests, `ServicesResetter` calls `reset()` on all registered services automatically.
+
+Without `ResetInterface`, connection state and identity-map state leak across requests in worker mode — causing subtle data consistency bugs that only appear under sustained load.
+
+```php
+use Symfony\Contracts\Service\ResetInterface;
+
+final class MysqlUnitOfWork implements UnitOfWorkInterface, ResetInterface
+{
+    public function reset(): void
+    {
+        $this->connection->close();
+        // or $em->clear() for ORM-based implementations
+    }
+}
+```
+
+No manual tagging is needed — the compiler pass discovers it.
+
+### 4d. Add Connection Resilience
+
+Implement `ensureConnection()` in your `UnitOfWork` and call it at the start of any transaction boundary. Ping the database with a lightweight query, catch any `Throwable`, and call `close()` on failure. DBAL reconnects automatically after `close()` on the next query.
+
+This prevents dead connection errors in long-running worker processes that have been idle long enough for the database server to close the TCP connection on its side.
+
+```php
+private function ensureConnection(): void
+{
+    try {
+        $this->connection->executeQuery('SELECT 1');
+    } catch (\Throwable) {
+        $this->connection->close();
+    }
+}
+```
+
+### 4e. Read `kernel.env` From the Container
+
+Never read `$_ENV['APP_ENV']` inside a `ContainerExtension::load()` method. The `$_ENV` superglobal is not reliable in all execution contexts (worker processes, CLI, test bootstraps). Use the container parameter instead:
+
+```php
+$env = $container->getParameter('kernel.env');
+
+if ($env === 'prod') {
+    // register metadata cache, compiled proxies, etc.
+}
+```
+
+### 4f. Load Order
+
+Set your extension's load order so it runs after `PersistenceExtension` (order 60, which sets `vortos.persistence.write_dsn`) and before `MigrationExtension` (order 75, which depends on `Connection::class`). Order 65 is the standard slot for write-side persistence modules.
+
+Register your package before `MigrationPackage` in `bootstrap/app.php`:
+
+```php
+$packages = [
+    new PersistencePackage(),       // order 60 — sets vortos.persistence.write_dsn
+    new MysqlPersistencePackage(),  // order 65 — registers Connection::class
+    new MigrationPackage(),         // order 75 — depends on Connection::class
+];
+```
+
+---
+
+## Verification Checklist
+
+After completing all four steps, verify the following:
+
+- [ ] `php vortos setup --profile=custom` — the new option appears in the "Choose write database" step
+- [ ] `php vortos setup --preset=... --dry-run` — dry run prints the `composer require` command for the missing package
+- [ ] `php vortos setup --preset=...` — setup actually installs the package via composer
+- [ ] After installation, the module registers its services correctly: `php vortos vortos:debug:container --filter=mysql`
+- [ ] `php vortos migrate` works with the new module's connection
+- [ ] `php vortos migrate:fresh` drops and recreates tables
+- [ ] Worker mode: the `UnitOfWork` appears in reset services — verify with `php vortos debug:container --tag=kernel.reset` or confirm `ResettableServicesPass` discovers it
+- [ ] Tests pass: `./vendor/bin/phpunit packages/Vortos/Tests/Setup/ --bootstrap vendor/autoload.php`
+
+---
+
+## Full Example: `vortos-persistence-mysql`
+
+The following shows all four steps filled in for a hypothetical MySQL DBAL module.
+
+### Step 1a — `SetupExtension::BUILT_IN_CAPABILITIES`
+
+```php
+'vortos.setup_capability.write_db.mysql' => [
+    'key'      => 'write_db.mysql',
+    'label'    => 'MySQL (DBAL)',
+    'category' => 'write_db',
+    'packages' => ['vortos/vortos-persistence-mysql'],
+],
+```
+
+### Step 1b — `SetupCapabilityRegistry::builtIn()`
+
+```php
+new StaticSetupCapability('write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql']),
+```
+
+### Step 2 — `packages/Vortos/composer.json`
+
+```json
+"suggest": {
+    "vortos/vortos-persistence-dbal": "PostgreSQL write repository — choose this or persistence-orm",
+    "vortos/vortos-persistence-orm":  "Doctrine ORM write repository — choose this or persistence-dbal",
+    "vortos/vortos-persistence-mysql": "MySQL write repository — choose this or persistence-dbal/persistence-orm"
+}
+```
+
+### Step 3 — `MigrationExtension.php` docblock
+
+```
+DependencyFactoryProvider requires Connection::class, which is registered by
+either DbalPersistenceExtension (order 70), PersistenceOrmExtension (order 65),
+or MysqlPersistenceExtension (order 65). MigrationExtension loads at order 75.
+```
+
+### Step 4 — Module implementation sketch
+
+```php title="packages/VortosPersistenceMysql/src/DependencyInjection/MysqlPersistenceExtension.php"
+final class MysqlPersistenceExtension extends Extension implements PrependExtensionInterface
+{
+    public function getOrder(): int
+    {
+        return 65;
+    }
+
+    public function load(array $configs, ContainerBuilder $container): void
+    {
+        $dsn = $container->getParameter('vortos.persistence.write_dsn');
+        $env = $container->getParameter('kernel.env');
+
+        // Register Connection::class
+        $container->register(Connection::class, Connection::class)
+            ->setFactory([ConnectionFactory::class, 'fromDsn'])
+            ->setArguments([$dsn])
+            ->setShared(true);
+
+        // Register UnitOfWork with ResetInterface
+        $container->register(MysqlUnitOfWork::class, MysqlUnitOfWork::class)
+            ->setArguments([new Reference(Connection::class)])
+            ->setShared(true);
+
+        $container->setAlias(UnitOfWorkInterface::class, MysqlUnitOfWork::class);
+    }
+}
+```
+
+```php title="packages/VortosPersistenceMysql/src/Transaction/MysqlUnitOfWork.php"
+use Symfony\Contracts\Service\ResetInterface;
+use Vortos\Persistence\Transaction\UnitOfWorkInterface;
+
+final class MysqlUnitOfWork implements UnitOfWorkInterface, ResetInterface
+{
+    public function __construct(private readonly Connection $connection) {}
+
+    public function run(callable $work): void
+    {
+        $this->ensureConnection();
+        $this->connection->transactional($work);
+    }
+
+    public function reset(): void
+    {
+        $this->connection->close();
+    }
+
+    private function ensureConnection(): void
+    {
+        try {
+            $this->connection->executeQuery('SELECT 1');
+        } catch (\Throwable) {
+            $this->connection->close();
+        }
+    }
+}
+```

@@ -1,13 +1,13 @@
 ---
 title: Doctrine ORM
-description: Zero-SQL aggregate persistence via Doctrine ORM — OrmAggregateRoot, OrmWriteRepository, OrmUnitOfWork, and automatic schema generation.
+description: Zero-SQL aggregate persistence via Doctrine ORM — AggregateRoot, OrmWriteRepository, OrmUnitOfWork, metadata caching, and schema management.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Doctrine ORM
 
-`vortos/vortos-persistence-orm` is an optional module that adds Doctrine ORM support to the write side. Extend `OrmAggregateRoot` and `OrmWriteRepository` — SQL, `toRow()`, and `fromRow()` disappear entirely.
+`vortos/vortos-persistence-orm` is an optional module that adds Doctrine ORM support to the write side. Domain aggregates extend `Vortos\PersistenceOrm\Aggregate\AggregateRoot` — ORM annotations live directly on the aggregate class. `toRow()`, `fromRow()`, and hand-written SQL disappear entirely.
 
 ## When to Use ORM vs DBAL
 
@@ -24,7 +24,7 @@ Both modules implement the same `WriteRepositoryInterface` and `UnitOfWorkInterf
 | Use when | Entity model fits cleanly, no heavy bulk writes | Full SQL control, bulk operations, complex projections |
 
 <Callout type="info" title="Domain AggregateRoot Is Untouched">
-`Vortos\Domain\Aggregate\AggregateRoot` has no Doctrine dependency. `OrmAggregateRoot` extends it — your domain model stays infrastructure-free.
+`Vortos\Domain\Aggregate\AggregateRoot` has no Doctrine dependency. `Vortos\PersistenceOrm\Aggregate\AggregateRoot` extends it — your domain model stays infrastructure-free at the interface level.
 </Callout>
 
 ## Installation
@@ -35,17 +35,21 @@ composer require vortos/vortos-persistence-orm
 
 The package is auto-discovered. No manual registration is required.
 
+<Callout type="info" title="Setup Wizard">
+`vortos/vortos-persistence-orm` is listed in `suggest` in the framework meta-package — it is not installed by default. The setup wizard installs it automatically when you choose "PostgreSQL (Doctrine ORM)" during `php vortos setup`.
+</Callout>
+
 <Callout type="warn" title="Do Not Use Both ORM and DBAL on the Write Side">
-Do not install both `vortos-persistence-dbal` and `vortos-persistence-orm` in the same application. Both register `UnitOfWorkInterface` — the last registered package wins and the other's unit of work becomes unreachable.
+Do not install both `vortos-persistence-dbal` and `vortos-persistence-orm` in the same application. Both register `UnitOfWorkInterface` and `Connection::class` — the last registered package wins and the other's unit of work becomes unreachable.
 </Callout>
 
 ## Environment Variables
 
 ```bash
-DATABASE_URL=pgsql://postgres:secret@write_db:5432/myapp
+VORTOS_WRITE_DB_DSN=pgsql://postgres:secret@write_db:5432/myapp
 ```
 
-Same `DATABASE_URL` as the DBAL module — `PersistenceOrmExtension` reads `vortos.persistence.write_dsn` which is set from `DATABASE_URL` by the core persistence module.
+`PersistenceOrmExtension` reads `vortos.persistence.write_dsn`, which is set from `VORTOS_WRITE_DB_DSN` by the core persistence module.
 
 ## Services Registered
 
@@ -54,25 +58,33 @@ EntityManager::class          — shared, lazy
 EntityManagerInterface::class — aliased to EntityManager
 Connection::class             — DBAL connection extracted from EntityManager
                                 (shared with OutboxWriter for atomic writes)
-OrmUnitOfWork::class          — transaction boundary
+OrmUnitOfWork::class          — transaction boundary and worker-request isolation
 UnitOfWorkInterface::class    — aliased to OrmUnitOfWork
+OrmMetadataCache::class       — PSR-6 metadata cache pool (registered when Cache module is loaded)
+OrmClearCacheCommand::class   — vortos:orm:clear-cache (registered when Cache module is loaded)
 ```
 
 ---
 
-## OrmAggregateRoot
+## AggregateRoot
 
-Extend `OrmAggregateRoot` instead of `AggregateRoot` for any aggregate persisted via Doctrine.
+Extend `Vortos\PersistenceOrm\Aggregate\AggregateRoot` for any aggregate persisted via Doctrine.
 
-`OrmAggregateRoot` is a `#[MappedSuperclass]` that adds a single `#[ORM\Version]` column — `ormVersion`. Doctrine increments this column automatically on every `flush()` and detects concurrent modifications via `UPDATE ... WHERE ormVersion = :expected`. The behaviour is identical to the DBAL module's optimistic locking, but fully managed by Doctrine.
+```php
+use Vortos\PersistenceOrm\Aggregate\AggregateRoot;
+```
+
+`AggregateRoot` is a `#[MappedSuperclass]` that adds a single field: `private int $ormVersion = 0`, annotated with `#[ORM\Version]`. Doctrine increments this column automatically on every `flush()` and detects concurrent modifications via `UPDATE ... WHERE ormVersion = :expected`.
+
+**Why a separate property?** The domain `AggregateRoot::$version` field is private — Doctrine cannot access or manage it through reflection. `$ormVersion` solves this: it is managed by Doctrine via `#[ORM\Version]`, and `AggregateRoot` overrides `getVersion()`, `incrementVersion()`, and `restoreVersion()` so that the framework's optimistic locking and Doctrine always read and write the same number. Your application code never touches `$ormVersion` directly.
 
 ```php title="src/User/Domain/Entity/User.php"
 use Doctrine\ORM\Mapping as ORM;
-use Vortos\PersistenceOrm\Aggregate\OrmAggregateRoot;
+use Vortos\PersistenceOrm\Aggregate\AggregateRoot;
 
 #[ORM\Entity]
 #[ORM\Table(name: 'users')]
-final class User extends OrmAggregateRoot
+final class User extends AggregateRoot
 {
     #[ORM\Id]
     #[ORM\Column(type: 'string', length: 36)]
@@ -90,6 +102,7 @@ final class User extends OrmAggregateRoot
     public static function register(UserId $id, string $email): self
     {
         $instance = new self($id, $email);
+        $instance->incrementVersion();
         $instance->recordEvent(new UserRegistered((string) $id, $email));
         return $instance;
     }
@@ -99,13 +112,15 @@ final class User extends OrmAggregateRoot
 }
 ```
 
-Do not declare an `ormVersion` column in your entity — it is inherited from `OrmAggregateRoot`.
+Do not declare `ormVersion` in your entity — it is inherited from `AggregateRoot`.
+
+Call `$this->incrementVersion()` inside your `create()` or factory method. Doctrine initialises `ormVersion` at `0` and increments it on the first `UPDATE`. Calling `incrementVersion()` on creation sets the version to `1` on first persist, keeping the framework's version tracking consistent from the moment the aggregate is created.
 
 ---
 
 ## OrmWriteRepository
 
-Extend `OrmWriteRepository` and implement one method: `entityClass()`. `findById()`, `save()`, and `delete()` are provided for free.
+Extend `OrmWriteRepository` and implement one method: `entityClass()`. `findById()`, `save()`, and `delete()` are provided.
 
 ```php title="src/User/Infrastructure/Repository/UserRepository.php"
 use Vortos\PersistenceOrm\Write\OrmWriteRepository;
@@ -121,19 +136,28 @@ final class UserRepository extends OrmWriteRepository implements UserRepositoryI
 
 No `toRow()`, no `fromRow()`, no column map. Doctrine handles serialisation from the entity's `#[ORM\Column]` annotations.
 
+### How save() and delete() Work
+
+`save()` uses `$em->contains()` to detect whether the aggregate is already managed by Doctrine's identity map:
+
+- If the aggregate is **not managed** (new entity): `persist()` + `flush()`. Doctrine issues an `INSERT`.
+- If the aggregate **is managed** (retrieved in the same unit of work): `flush()` only. Doctrine's change tracking detects dirty fields and issues an `UPDATE` automatically.
+
+`delete()` also checks `$em->contains()` first. If the aggregate is not managed (for example, if it was constructed outside Doctrine), it calls `find()` to load a managed copy before calling `remove()`.
+
+Both `save()` and `delete()` catch Doctrine's `OptimisticLockException` and rethrow it as `Vortos\Domain\Repository\Exception\OptimisticLockException` — the same exception your application code already handles from the DBAL module.
+
 ### Built-In Operations
 
 | Method | Behaviour |
 |---|---|
 | `findById(AggregateId $id)` | `EntityManager::find()` — returns `null` if not found |
-| `save(AggregateRoot $aggregate)` | `persist()` + `flush()` — Doctrine throws on version conflict |
-| `delete(AggregateRoot $aggregate)` | `remove()` + `flush()` |
-
-Both `save()` and `delete()` catch Doctrine's `OptimisticLockException` and rethrow it as `Vortos\Domain\Repository\Exception\OptimisticLockException` — the same exception your application code already handles from the DBAL module.
+| `save(AggregateRoot $aggregate)` | Detects new vs managed via `contains()`, persist + flush or flush only |
+| `delete(AggregateRoot $aggregate)` | Detects managed via `contains()`, falls back to `find()` if unmanaged, then `remove()` + `flush()` |
 
 ### Custom Queries
 
-For queries beyond `findById()`, use the protected `em()` accessor:
+For queries beyond `findById()`, use the protected `em()` accessor, which returns `EntityManagerInterface`:
 
 ```php
 final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
@@ -186,6 +210,44 @@ final class RegisterUserHandler
 The `CommandBus` wraps every handler in `UnitOfWork::run()` automatically via `TransactionalMiddleware`. Inject `UnitOfWorkInterface` directly only when you need explicit transaction boundaries outside of a command handler.
 </Callout>
 
+### Worker Mode Isolation
+
+`OrmUnitOfWork` implements `ResetInterface`. In FrankenPHP worker mode, `ServicesResetter` calls `reset()` between requests. `reset()` calls `$em->clear()`, which detaches all entities from Doctrine's identity map.
+
+This means no aggregate state leaks across requests — each request starts with a clean identity map. This happens automatically: `ResettableServicesPass` discovers `ResetInterface` implementations at compile time. No manual tagging or configuration is required.
+
+### Connection Resilience
+
+`OrmUnitOfWork` includes an `ensureConnection()` method that runs before beginning a transaction. It pings the database with a lightweight `SELECT 1`. If the ping fails — for example after a database restart or a long idle period in a worker process — it calls `close()` on the DBAL connection. DBAL reconnects automatically on the next query.
+
+This prevents dead connection errors that would otherwise surface as fatal errors in long-running FrankenPHP workers after periods of inactivity.
+
+---
+
+## Metadata Cache
+
+In production with the Cache module loaded, `OrmMetadataCache` is registered automatically. It is a PSR-6 `CacheItemPoolInterface` adapter backed by Vortos `TaggedCacheInterface`. All ORM metadata entries are tagged with `'orm_metadata'`.
+
+`PersistenceOrmExtension` reads `kernel.env` from the container to decide which path to take:
+
+**Dev mode** (`kernel.env = dev`): The metadata cache is bypassed entirely. Doctrine re-reads entity attributes on every request. Mapping changes are visible immediately without clearing any cache.
+
+**Prod mode** (`kernel.env = prod`): Metadata is read once on first boot, stored in Redis via `OrmMetadataCache`, and served from Redis on all subsequent requests. Zero PHP attribute reflection occurs per-request — Doctrine reads the cached mapping data directly.
+
+### Clearing ORM Metadata
+
+```bash
+php vortos vortos:orm:clear-cache
+```
+
+This command surgically invalidates only the `orm_metadata` tag. It does not touch flag cache, auth tokens, read models, or any other cache entries. Run it after changing entity mappings in a deployment.
+
+`vortos:cache:clear` also invalidates ORM metadata (it clears everything tagged in the cache), but `vortos:orm:clear-cache` is preferable when only entity mappings changed and you want to avoid cache-warming cost on other entries.
+
+<Callout type="info" title="Cache Module Required">
+`OrmMetadataCache` and `vortos:orm:clear-cache` are only registered when `TaggedCacheInterface` is available (i.e. the Cache module is loaded). In environments without the Cache module, Doctrine falls back to its default in-memory metadata handling.
+</Callout>
+
 ---
 
 ## Schema Management
@@ -206,19 +268,29 @@ php vortos vortos:orm:schema --dump-sql --drop
 php vortos vortos:orm:schema --drop --force
 ```
 
-### Typical Workflow
-
-```bash
-# 1. Add a new entity or column, then preview
-php vortos vortos:orm:schema --dump-sql
-
-# 2. Apply
-php vortos vortos:orm:schema --force
-```
-
 <Callout type="warn" title="--drop --force Is Destructive">
 `--drop --force` drops all tables mapped by Doctrine in one operation. Always run `--dump-sql --drop` first to see exactly what will be dropped before running against any environment with real data.
 </Callout>
+
+### Migration-Based Workflow
+
+For production deployments, schema changes should go through `vortos:migrate` rather than `vortos:orm:schema --force`. `vortos:orm:schema --force` is useful during active development but bypasses the migration history — it cannot be rolled back and leaves no audit trail.
+
+```bash
+# 1. Make your entity changes
+
+# 2. Generate a migration from the diff
+php vortos vortos:orm:diff
+
+# 3. Review the generated migration file in migrations/
+
+# 4. Run all pending migrations (ORM diff + framework module migrations in one command)
+php vortos vortos:migrate
+```
+
+Both framework table migrations (published via `vortos:migrate:publish`) and ORM entity migrations (generated via `vortos:orm:diff`) land in the same `migrations/` directory and are run together by `vortos:migrate`. One command covers everything.
+
+See [Running Migrations](/docs/migrations/running) for the full workflow including preflight checks, advisory locking, and dry-run mode.
 
 ---
 
@@ -227,7 +299,7 @@ php vortos vortos:orm:schema --force
 `vortos:make:entity` and `vortos:make:write-repository` auto-detect whether `vortos-persistence-orm` is installed and generate the correct base class — no flags needed.
 
 ```bash
-# Generates User extending OrmAggregateRoot (with #[ORM\Entity], #[ORM\Table], #[ORM\Id])
+# Generates User extending AggregateRoot (with #[ORM\Entity], #[ORM\Table], #[ORM\Id])
 php vortos vortos:make:entity User --context=User
 
 # Generates UserRepository extending OrmWriteRepository (with entityClass() only)

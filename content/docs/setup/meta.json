@@ -1,6 +1,7 @@
 {
   "title": "Setup",
   "pages": [
-    "index"
+    "index",
+    "adding-optional-modules"
   ]
 }

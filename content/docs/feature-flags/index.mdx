@@ -115,6 +115,10 @@ final class NewDashboardController
 }
 ```
 
+<Callout type="info" title="Compile-Time Resolution">
+`#[RequiresFlag]` is resolved at container compile time by `FeatureFlagsCompilerPass` — not at request time. The compiler pass reads all `#[RequiresFlag]` attributes from your controllers at build time and injects a static lookup map into `FeatureFlagMiddleware`. This means zero reflection happens per-request — the middleware does a single array lookup. The map is rebuilt automatically whenever the container is recompiled.
+</Callout>
+
 <Callout type="info" title="Context in attribute checks">
 `#[RequiresFlag]` uses the registered `FlagContextResolver` to build the context automatically. Wire up a resolver to make targeting work here too — see below.
 </Callout>
