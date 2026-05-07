@@ -9,7 +9,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 `@vortos/permissions` gives React applications a local, observable copy of the current user's permissions. The backend still decides what the user is allowed to do; the package only helps the frontend render the correct UI without fetching permissions in every component.
 
-```txt
+```text
 Backend decides.
 Frontend remembers.
 Components ask locally.
@@ -282,7 +282,7 @@ Retries are optional:
 
 The retry schedule is linear:
 
-```txt
+```text
 try immediately
 retry after 500ms
 retry after 1000ms
@@ -305,7 +305,7 @@ Use session cache to speed up app boot while a fresh request runs:
 
 Always include user and tenant identity in the cache key:
 
-```txt
+```text
 permissions:${userId}:${tenantId}
 ```
 

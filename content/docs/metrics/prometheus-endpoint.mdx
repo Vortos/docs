@@ -120,40 +120,40 @@ For Grafana installation and data source setup — see the [Grafana integration 
 ### Example PromQL queries
 
 **Request rate (per second, 1-minute window):**
-```promql
+```text
 rate(vortos_http_requests_total[1m])
 ```
 
 **Error rate (5xx responses as fraction of total):**
-```promql
+```text
 rate(vortos_http_requests_total{status=~"5.."}[5m])
 /
 rate(vortos_http_requests_total[5m])
 ```
 
 **p99 response time:**
-```promql
+```text
 histogram_quantile(0.99,
   rate(vortos_http_request_duration_ms_bucket[5m])
 )
 ```
 
 **Command failure rate:**
-```promql
+```text
 rate(vortos_cqrs_command_failures_total[5m])
 /
 rate(vortos_cqrs_commands_total[5m])
 ```
 
 **Cache hit rate:**
-```promql
+```text
 rate(vortos_cache_operations_total{operation="get",result="hit"}[5m])
 /
 rate(vortos_cache_operations_total{operation="get"}[5m])
 ```
 
 **Dead letter queue events (alert on any value > 0):**
-```promql
+```text
 increase(vortos_messaging_dead_letter_total[5m]) > 0
 ```
 
@@ -223,7 +223,7 @@ In the Prometheus UI at `/targets`, your application should show `State: UP` and
 **Check metrics appear in Grafana:**
 
 Run a PromQL query:
-```promql
+```text
 vortos_http_requests_total
 ```
 Results should appear within one scrape interval (15 seconds by default).

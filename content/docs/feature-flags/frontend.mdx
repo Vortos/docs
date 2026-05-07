@@ -9,7 +9,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 `@vortos/flags` gives React applications a local, observable copy of the current user's feature flag state. The backend evaluates rollout rules; the frontend reads the result from React context.
 
-```txt
+```text
 Backend evaluates.
 Frontend remembers.
 Components ask locally.
@@ -352,7 +352,7 @@ Retries are optional:
 
 The retry schedule is linear:
 
-```txt
+```text
 try immediately
 retry after 500ms
 retry after 1000ms
@@ -375,7 +375,7 @@ Use session cache to speed up app boot while a fresh request runs:
 
 Always include identity and tenant information in the cache key:
 
-```txt
+```text
 flags:${userId}:${tenantId}
 ```
 

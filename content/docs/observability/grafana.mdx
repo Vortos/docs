@@ -120,7 +120,7 @@ The `derivedFields` in Loki makes `trace_id` values in log lines clickable — o
 3. Select **Prometheus** as the data source
 4. Enter a PromQL query:
 
-```promql
+```text
 rate(vortos_http_requests_total[1m])
 ```
 
@@ -134,39 +134,39 @@ Repeat for each metric you want to track.
 ## Recommended panels for Vortos
 
 **HTTP request rate:**
-```promql
+```text
 sum(rate(vortos_http_requests_total[1m])) by (route)
 ```
 Visualization: Time series — shows traffic per route over time.
 
 **HTTP error rate:**
-```promql
+```text
 sum(rate(vortos_http_requests_total{status=~"5.."}[5m]))
 / sum(rate(vortos_http_requests_total[5m])) * 100
 ```
 Visualization: Stat — shows current error percentage. Alert when > 1%.
 
 **p50 / p95 / p99 response time:**
-```promql
+```text
 histogram_quantile(0.99, sum(rate(vortos_http_request_duration_ms_bucket[5m])) by (le, route))
 ```
 Visualization: Time series — shows latency percentiles per route.
 
 **Command failures:**
-```promql
+```text
 rate(vortos_cqrs_command_failures_total[5m])
 ```
 Visualization: Time series.
 
 **Cache hit rate:**
-```promql
+```text
 rate(vortos_cache_operations_total{operation="get",result="hit"}[5m])
 / rate(vortos_cache_operations_total{operation="get"}[5m]) * 100
 ```
 Visualization: Stat — shows current hit rate percentage.
 
 **Dead letter queue activity:**
-```promql
+```text
 increase(vortos_messaging_dead_letter_total[5m])
 ```
 Visualization: Stat — should always be 0. Alert on any value > 0.
