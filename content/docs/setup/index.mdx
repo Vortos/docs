@@ -153,7 +153,7 @@ Setup writes machine-specific values to `.env.local` and leaves `.env` as the ba
 
 Commit `.env` when it contains shared, non-secret project defaults. Do not commit `.env.local`, `.env.*.local`, `.vortos-setup.json`, or generated backup files such as `*.bak.*`.
 
-Docker development files load `.env` first and `.env.local` second. Generated Docker passwords and service URLs should stay in `.env.local`; do not copy them into `.env`.
+Docker development files load `.env` first and `.env.local` second. Generated secrets and service URLs stay in `.env.local`. `APP_NAME` is the exception — setup writes it to `.env` because it is not a secret and should be the same for all developers on the project.
 
 Setup does not rewrite `config/*.php` files. Those files are override points for application-specific changes. The framework modules provide env-driven defaults first: setup writes `VORTOS_*` driver choices and DSNs to `.env.local`, then the module config objects use those env values unless a project config file overrides them. Without an env choice, local-safe in-memory drivers are used where possible.
 
@@ -171,7 +171,7 @@ Framework modules read Vortos env names, not vendor-specific container env names
 | Messaging driver | `VORTOS_MESSAGING_DRIVER` |
 | Messaging DSN | `VORTOS_MESSAGING_DSN` |
 
-Docker images can still require vendor-specific env such as `POSTGRES_PASSWORD` or `MONGO_INITDB_ROOT_PASSWORD`. Setup generates those for service bootstrap, but framework modules do not read them.
+Docker services require vendor-specific env names (`POSTGRES_PASSWORD`, `MONGO_INITDB_ROOT_USERNAME`, etc.). Setup writes agnostic equivalents (`VORTOS_WRITE_DB_PASSWORD`, `VORTOS_READ_DB_USER`, etc.) to `.env.local`. The published `docker-compose.yaml` maps these to vendor-specific names via `environment:` blocks — vendor names never appear in your env files.
 
 Use the files this way:
 
@@ -182,28 +182,37 @@ Use the files this way:
 | `.env.local` | No | Local machine overrides, generated secrets, service hosts, driver choices |
 | `.vortos-setup.json` | No | Local setup state used by repeat setup runs |
 
-Generated values include:
+Generated values — written to `.env` (non-secrets) and `.env.local` (secrets and machine-specific):
 
 ```bash
+# .env  — committed
 APP_NAME=my_app
+
+# .env.local  — not committed
 APP_ENV=dev
 APP_DEBUG=true
 JWT_SECRET=...
 HEALTH_DETAILS=debug
 HEALTH_TOKEN=...
-VORTOS_CACHE_DRIVER=redis
-VORTOS_CACHE_DSN=redis://redis:6379
-VORTOS_CACHE_PREFIX=dev_my_app_
-VORTOS_MESSAGING_DRIVER=kafka
-VORTOS_MESSAGING_DSN=kafka://kafka:9092
 VORTOS_WRITE_DB_DRIVER=postgres
 VORTOS_WRITE_DB_DSN=pgsql://postgres:...@write_db:5432/my_app
 VORTOS_READ_DB_DRIVER=mongo
 VORTOS_READ_DB_DSN=mongodb://root:...@read_db:27017
 VORTOS_READ_DB_NAME=my_app
+VORTOS_CACHE_DRIVER=redis
+VORTOS_CACHE_DSN=redis://redis:6379
+VORTOS_CACHE_PREFIX=dev_my_app_
+VORTOS_MESSAGING_DRIVER=kafka
+VORTOS_MESSAGING_DSN=kafka://kafka:9092
+# Docker service credentials (agnostic — compose maps these to POSTGRES_*/MONGO_* internally)
+VORTOS_WRITE_DB_USER=postgres
+VORTOS_WRITE_DB_PASSWORD=...
+VORTOS_WRITE_DB_NAME=my_app
+VORTOS_READ_DB_USER=root
+VORTOS_READ_DB_PASSWORD=...
 ```
 
-For Docker-managed services, setup generates local passwords and stores them in `.env.local`. It does not ask for credentials during normal first-run setup. Existing secrets are preserved on rerun unless you pass `--regenerate-secrets`.
+Setup generates passwords and stores them in `.env.local`. It does not ask for credentials during normal first-run setup. Existing secrets are preserved on rerun unless you pass `--regenerate-secrets`.
 
 For Docker presets, setup publishes Docker files for the selected runtime. For local presets, setup configures in-memory cache and messaging so the framework can boot without Redis or Kafka.
 

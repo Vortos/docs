@@ -55,11 +55,20 @@ Add your capability to the `BUILT_IN_CAPABILITIES` constant array:
 
 **File**: `packages/Vortos/src/Setup/Capability/SetupCapabilityRegistry.php`
 
-Add the matching entry to the `builtIn()` static factory:
+Add the matching entry to the `builtIn()` static factory. If the service needs Docker credentials, supply a `dockerEnvFactory` closure returning the agnostic env vars for that service. The published `docker-compose.yaml` for your runtime maps these to vendor-specific names (`MYSQL_ROOT_PASSWORD`, etc.):
 
 ```php
-new StaticSetupCapability('write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql']),
+new StaticSetupCapability(
+    'write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql'],
+    dockerEnvFactory: static fn(string $project, string $pwd) => [
+        'VORTOS_WRITE_DB_USER'     => 'app',
+        'VORTOS_WRITE_DB_PASSWORD' => $pwd,
+        'VORTOS_WRITE_DB_NAME'     => $project,
+    ],
+),
 ```
+
+Capabilities that need no Docker service (e.g. an in-memory adapter) omit `dockerEnvFactory`.
 
 ### Why the Key Suffix Matters
 
@@ -227,7 +236,14 @@ The following shows all four steps filled in for a hypothetical MySQL DBAL modul
 ### Step 1b — `SetupCapabilityRegistry::builtIn()`
 
 ```php
-new StaticSetupCapability('write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql']),
+new StaticSetupCapability(
+    'write_db.mysql', 'MySQL (DBAL)', 'write_db', ['vortos/vortos-persistence-mysql'],
+    dockerEnvFactory: static fn(string $project, string $pwd) => [
+        'VORTOS_WRITE_DB_USER'     => 'app',
+        'VORTOS_WRITE_DB_PASSWORD' => $pwd,
+        'VORTOS_WRITE_DB_NAME'     => $project,
+    ],
+),
 ```
 
 ### Step 2 — `packages/Vortos/composer.json`
