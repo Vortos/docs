@@ -37,11 +37,21 @@ After installation, Vortos runs the setup wizard. Choose Docker or local develop
 php vortos setup
 ```
 
+The default Docker profile configures FrankenPHP, PostgreSQL, MongoDB, Redis, Kafka, and the optional MCP server. The minimal profile uses local PHP with in-memory cache and messaging.
+
 For non-interactive setup:
 
 ```bash
 php vortos setup --profile=docker --no-interaction
 php vortos setup --profile=minimal --no-interaction
+```
+
+Setup writes generated local values to `.env`, publishes module config stubs into `config/`, and publishes Docker files when a Docker profile is selected. Do not commit `.env`; commit `.env.example` as the template.
+
+If MCP is selected, interactive setup can wire a supported AI client immediately. You can also run it later:
+
+```bash
+php bin/console vortos:mcp:install
 ```
 
 Start the application with Docker:

@@ -170,9 +170,15 @@ php bin/console vortos:dlq:replay --event-class="App\\User\\Domain\\Event\\UserC
 
 # replay a single specific message by ID
 php bin/console vortos:dlq:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
+
+# process the most recently failed messages first (default: oldest first)
+php bin/console vortos:dlq:replay --latest
+
+# combine flags freely
+php bin/console vortos:dlq:replay --latest --limit=10 --transport=user.events --dry-run
 ```
 
-Filters can be combined — for example, `--transport=user.events --event-class="..."` replays only matching messages within that transport. `--id` always selects exactly one row regardless of other filters.
+Filters can be combined — for example, `--transport=user.events --event-class="..."` replays only matching messages within that transport. `--id` always selects exactly one row regardless of other filters. `--latest` only affects ordering and works with all other flags.
 
 <Callout type="info" title="Concurrent Replay Safety">
 `vortos:dlq:replay` uses `SELECT ... FOR UPDATE SKIP LOCKED` when fetching failed messages. Running the command twice simultaneously is safe — each invocation locks a non-overlapping batch of rows. No message is ever replayed by two concurrent processes.

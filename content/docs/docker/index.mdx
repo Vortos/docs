@@ -7,7 +7,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 # Docker
 
-`vortos-docker` provides a single console command that publishes production-ready Docker infrastructure files into your project. Choose between FrankenPHP (recommended) or PHP-FPM + Nginx.
+`vortos-docker` provides Docker infrastructure files for Vortos projects. Most applications get these files through `php vortos setup`, which publishes compose files for the selected runtime and removes optional services that were not selected. You can also publish the raw runtime stubs manually with `vortos:docker:publish`.
 
 ## Installation
 
@@ -39,6 +39,12 @@ php bin/console vortos:docker:publish -r phpfpm
 ```
 
 Files are copied from the package's `stubs/` directory into your project root. Changed existing files are backed up before replacement.
+
+<Callout type="info" title="Setup Publishes Capability-Aware Compose Files">
+When Docker files are published by `php vortos setup`, the compose file is filtered for the chosen stack. For example, choosing no read database removes the MongoDB service, choosing in-memory cache removes Redis, and choosing in-memory messaging removes Kafka and the worker service.
+
+The standalone `vortos:docker:publish` command publishes the runtime stub directly. Use setup when you want compose files matched to selected capabilities.
+</Callout>
 
 Useful options:
 
@@ -80,8 +86,9 @@ write_db   — PostgreSQL (write side)
 read_db    — MongoDB (read side)
 redis      — Cache + idempotency + rate limiting
 kafka      — Message broker
-zookeeper  — Kafka coordination
 ```
+
+`worker`, `read_db`, `redis`, and `kafka` are optional in setup-generated compose files. They appear only when the selected setup capabilities need them.
 
 ### Worker Mode
 
@@ -129,17 +136,18 @@ write_db   — PostgreSQL
 read_db    — MongoDB
 redis      — Cache
 kafka      — Message broker
-zookeeper  — Kafka coordination
 ```
+
+`worker`, `read_db`, `redis`, and `kafka` are optional in setup-generated compose files. They appear only when the selected setup capabilities need them.
 
 ## Development Workflow
 
 ```bash
-# 1. Publish Docker files
-php bin/console vortos:docker:publish
+# 1. Configure the project and publish Docker files
+php vortos setup --profile=docker
 
 # 2. Start all services
-docker compose up -d
+php vortos up
 
 # 3. Run migrations / setup
 docker compose exec backend php bin/console vortos:setup:persistence
@@ -150,6 +158,8 @@ docker compose exec backend php bin/console vortos:cache:warmup
 docker compose logs -f backend
 docker compose logs -f worker
 ```
+
+The generated `.env` contains agnostic Vortos variables such as `VORTOS_WRITE_DB_PASSWORD` and `VORTOS_READ_DB_USER`. Compose maps those values to service-specific variables like `POSTGRES_PASSWORD` and `MONGO_INITDB_ROOT_USERNAME`.
 
 ## Production
 

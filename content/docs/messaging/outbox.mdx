@@ -215,11 +215,23 @@ php bin/console vortos:outbox:replay --dry-run
 # replay all failed rows
 php bin/console vortos:outbox:replay
 
-# replay up to 50 rows (default: all)
+# replay up to 50 rows (default: 50)
 php bin/console vortos:outbox:replay --limit=50
 
 # replay only rows for a specific transport
 php bin/console vortos:outbox:replay --transport=user.events
+
+# replay only a specific event class
+php bin/console vortos:outbox:replay --event-class="App\\User\\Domain\\Event\\UserCreatedEvent"
+
+# replay a single specific row by ID
+php bin/console vortos:outbox:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
+
+# process the most recently failed rows first (default: oldest first)
+php bin/console vortos:outbox:replay --latest
+
+# combine flags freely
+php bin/console vortos:outbox:replay --latest --limit=10 --transport=user.events --dry-run
 ```
 
 ```

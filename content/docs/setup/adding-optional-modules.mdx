@@ -39,6 +39,7 @@ The capability key format is `category.option_name`. Supported categories:
 | `read_db` | Optional read/projection database | `read_db.postgres` |
 | `cache` | Cache driver | `cache.memcached` |
 | `messaging` | Message broker or in-process driver | `messaging.rabbitmq` |
+| `mcp` | AI client MCP integration | `mcp.enabled` |
 
 Add your capability to the `BUILT_IN_CAPABILITIES` constant array:
 
@@ -48,14 +49,26 @@ Add your capability to the `BUILT_IN_CAPABILITIES` constant array:
     'label'    => 'MySQL (DBAL)',
     'category' => 'write_db',
     'packages' => ['vortos/vortos-persistence-mysql'],
+    'docker_env' => [
+        'VORTOS_WRITE_DB_USER' => 'app',
+        'VORTOS_WRITE_DB_PASSWORD' => '{password}',
+        'VORTOS_WRITE_DB_NAME' => '{project}',
+    ],
 ],
 ```
+
+`docker_env` is optional. Use it when the capability needs Docker service credentials or database names written to `.env`. The placeholders are replaced by setup:
+
+| Placeholder | Value |
+|---|---|
+| `{project}` | Resolved project name |
+| `{password}` | Generated service password |
 
 ### 1b. `SetupCapabilityRegistry::builtIn()`
 
 **File**: `packages/Vortos/src/Setup/Capability/SetupCapabilityRegistry.php`
 
-Add the matching entry to the `builtIn()` static factory. If the service needs Docker credentials, supply a `dockerEnvFactory` closure returning the agnostic env vars for that service. The published `docker-compose.yaml` for your runtime maps these to vendor-specific names (`MYSQL_ROOT_PASSWORD`, etc.):
+Add the matching entry to the `builtIn()` static factory. If the service needs Docker credentials, supply a `dockerEnvFactory` closure returning the same agnostic env vars for that service. The published `docker-compose.yaml` for your runtime maps these to vendor-specific names (`MYSQL_ROOT_PASSWORD`, etc.):
 
 ```php
 new StaticSetupCapability(
@@ -69,6 +82,10 @@ new StaticSetupCapability(
 ```
 
 Capabilities that need no Docker service (e.g. an in-memory adapter) omit `dockerEnvFactory`.
+
+<Callout type="warn" title="Keep DI and Static Capabilities Equivalent">
+The DI path uses `SetupExtension::BUILT_IN_CAPABILITIES`. The static fallback uses `SetupCapabilityRegistry::builtIn()`. Package names, labels, categories, and Docker env values must stay equivalent in both places.
+</Callout>
 
 ### Why the Key Suffix Matters
 
@@ -103,13 +120,26 @@ Add the package to the `suggest` block:
 
 Do not add it to `require`. Optional packages that are mutually exclusive choices must live in `suggest`. The setup wizard installs them on demand. If you put it in `require`, every project installs it even when MySQL is never chosen.
 
+## Step 3: Add Docker Service Support If Needed
+
+If the capability needs a Docker service, add the service to the runtime compose stubs:
+
+```text
+packages/Vortos/src/Docker/stubs/frankenphp/docker-compose.yaml
+packages/Vortos/src/Docker/stubs/frankenphp/docker-compose.prod.yaml
+packages/Vortos/src/Docker/stubs/phpfpm/docker-compose.yaml
+packages/Vortos/src/Docker/stubs/phpfpm/docker-compose.prod.yaml
+```
+
+Setup publishes Docker files with selected-service options. Optional services are removed from the generated compose file when their capability is not selected. If you add a new optional service, update `SetupCommand::dockerPublishOptions()` and the Docker publisher tests so the service is included only when selected.
+
 ---
 
-## Step 3: Update the Migration Module Docblock
+## Step 4: Update the Migration Module Docblock
 
 **File**: `packages/Vortos/src/Migration/DependencyInjection/MigrationExtension.php`
 
-If the new module registers `Connection::class` — which all write-side persistence modules must do (see Step 4a below) — update the connection dependency comment in `MigrationExtension` to mention it as an additional provider:
+If the new module registers `Connection::class` — which all write-side persistence modules must do (see Step 5a below) — update the connection dependency comment in `MigrationExtension` to mention it as an additional provider:
 
 ```
 DependencyFactoryProvider requires Connection::class, which is registered by
@@ -121,15 +151,15 @@ or MysqlPersistenceExtension (order 65). MigrationExtension loads at order 75.
 
 ---
 
-## Step 4: Implement the Module Package
+## Step 5: Implement the Module Package
 
 The setup wizard installs the package — but the package must exist and do real work. For a write-side persistence module, the implementation must follow these contracts.
 
-### 4a. Register `Connection::class`
+### 5a. Register `Connection::class`
 
 All write-side persistence modules must register `Doctrine\DBAL\Connection::class` as a shared service. The Migration module depends on `Connection::class` at compile time. Without it, `MigrationExtension` will fail to compile when your module is the active persistence backend.
 
-### 4b. Register `UnitOfWorkInterface::class`
+### 5b. Register `UnitOfWorkInterface::class`
 
 Alias it to your module's `UnitOfWork` implementation:
 
@@ -137,7 +167,7 @@ Alias it to your module's `UnitOfWork` implementation:
 $container->setAlias(UnitOfWorkInterface::class, YourUnitOfWork::class);
 ```
 
-### 4c. Implement `ResetInterface` on Your `UnitOfWork`
+### 5c. Implement `ResetInterface` on Your `UnitOfWork`
 
 `ResettableServicesPass` discovers `ResetInterface` implementations at compile time and registers them with `ServicesResetter`. Between FrankenPHP worker requests, `ServicesResetter` calls `reset()` on all registered services automatically.
 
@@ -158,7 +188,7 @@ final class MysqlUnitOfWork implements UnitOfWorkInterface, ResetInterface
 
 No manual tagging is needed — the compiler pass discovers it.
 
-### 4d. Add Connection Resilience
+### 5d. Add Connection Resilience
 
 Implement `ensureConnection()` in your `UnitOfWork` and call it at the start of any transaction boundary. Ping the database with a lightweight query, catch any `Throwable`, and call `close()` on failure. DBAL reconnects automatically after `close()` on the next query.
 
@@ -175,7 +205,7 @@ private function ensureConnection(): void
 }
 ```
 
-### 4e. Read `kernel.env` From the Container
+### 5e. Read `kernel.env` From the Container
 
 Never read `$_ENV['APP_ENV']` inside a `ContainerExtension::load()` method. The `$_ENV` superglobal is not reliable in all execution contexts (worker processes, CLI, test bootstraps). Use the container parameter instead:
 
@@ -187,7 +217,7 @@ if ($env === 'prod') {
 }
 ```
 
-### 4f. Load Order
+### 5f. Load Order
 
 Set your extension's load order so it runs after `PersistenceExtension` (order 60, which sets `vortos.persistence.write_dsn`) and before `MigrationExtension` (order 75, which depends on `Connection::class`). Order 65 is the standard slot for write-side persistence modules.
 
@@ -205,7 +235,7 @@ $packages = [
 
 ## Verification Checklist
 
-After completing all four steps, verify the following:
+After completing these steps, verify the following:
 
 - [ ] `php vortos setup --profile=custom` — the new option appears in the "Choose write database" step
 - [ ] `php vortos setup --preset=... --dry-run` — dry run prints the `composer require` command for the missing package
@@ -220,7 +250,7 @@ After completing all four steps, verify the following:
 
 ## Full Example: `vortos-persistence-mysql`
 
-The following shows all four steps filled in for a hypothetical MySQL DBAL module.
+The following shows the key framework changes for a hypothetical MySQL DBAL module.
 
 ### Step 1a — `SetupExtension::BUILT_IN_CAPABILITIES`
 
@@ -230,6 +260,11 @@ The following shows all four steps filled in for a hypothetical MySQL DBAL modul
     'label'    => 'MySQL (DBAL)',
     'category' => 'write_db',
     'packages' => ['vortos/vortos-persistence-mysql'],
+    'docker_env' => [
+        'VORTOS_WRITE_DB_USER' => 'app',
+        'VORTOS_WRITE_DB_PASSWORD' => '{password}',
+        'VORTOS_WRITE_DB_NAME' => '{project}',
+    ],
 ],
 ```
 
@@ -256,7 +291,11 @@ new StaticSetupCapability(
 }
 ```
 
-### Step 3 — `MigrationExtension.php` docblock
+### Step 3 — Docker compose stubs
+
+Add a `write_db` service variant or a MySQL service template to the runtime compose stubs, map the agnostic `VORTOS_WRITE_DB_*` values to MySQL-specific env names, and update `SetupCommand::dockerPublishOptions()` if the service is optional.
+
+### Step 4 — `MigrationExtension.php` docblock
 
 ```
 DependencyFactoryProvider requires Connection::class, which is registered by
@@ -264,7 +303,7 @@ either DbalPersistenceExtension (order 70), PersistenceOrmExtension (order 65),
 or MysqlPersistenceExtension (order 65). MigrationExtension loads at order 75.
 ```
 
-### Step 4 — Module implementation sketch
+### Step 5 — Module implementation sketch
 
 ```php title="packages/VortosPersistenceMysql/src/DependencyInjection/MysqlPersistenceExtension.php"
 final class MysqlPersistenceExtension extends Extension implements PrependExtensionInterface
