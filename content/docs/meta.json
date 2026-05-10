@@ -17,6 +17,7 @@
     "health-checks",
     "docker",
     "debug",
-    "feature-flags"
+    "feature-flags",
+    "contributing"
   ]
 }

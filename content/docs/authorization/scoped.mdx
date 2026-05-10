@@ -173,6 +173,8 @@ scoped_perm:team:team-789:user-456:reports.view     → "1" (no TTL)
 scoped_perm:org:org-123:user-456:reports.export     → "1" TTL 7776000s
 ```
 
+`revokeAll()` uses Redis `SCAN` with a cursor to find and delete matching keys in batches of 100 — it never uses `KEYS`, which would block Redis on large keyspaces.
+
 <Callout type="warn" title="Redis Restart and Scoped Permissions">
 Scoped permissions are security-critical data. A Redis restart will clear all scoped permissions — users will lose access until permissions are re-granted.
 

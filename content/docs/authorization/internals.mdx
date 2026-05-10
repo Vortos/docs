@@ -51,7 +51,7 @@ Ownership has its own compiler pass:
 OwnershipCompilerPass
 ```
 
-It builds the route map and policy map for ownership middleware.
+It scans controllers for `#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` at both class level and method level, and builds the route map and policy map for `OwnershipMiddleware`. Method-level keys use the `ControllerClass::method` format; class-level keys use just `ControllerClass`. Method-level takes precedence at runtime.
 
 ## Controller permission map
 
@@ -83,17 +83,28 @@ At runtime, `AuthorizationMiddleware` only looks up the current controller in `C
 
 ## Request order
 
-Important event priorities:
+Full kernel.request priority chain (higher number fires first):
 
 ```text
-RouterListener              priority 8
-AuthMiddleware              priority 6
-AuthorizationMiddleware     priority 5
-OwnershipMiddleware         priority 45 in code, intended between authorization and feature access
-ControllerResolver          priority 0
+RouterListener              priority 32  — Symfony default
+RateLimitIpGlobal           priority 7   — IP/Global scopes, before auth
+AuthMiddleware              priority 6   — JWT decode, identity resolution
+TwoFactorMiddleware         priority 5   — 2FA gate
+RateLimitUser               priority 4   — User scope, after identity is set
+AuthorizationMiddleware     priority 3   — permission checks
+OwnershipMiddleware         priority 2   — resource ownership checks
+FeatureAccessMiddleware     priority 1   — plan/feature gates
+QuotaMiddleware             priority 0   — usage quota enforcement
+ControllerResolver          priority -10 — Symfony default
 ```
 
-The authorization middleware expects routing and auth identity to already be available.
+kernel.response:
+
+```text
+AuditMiddleware             priority 0   — records request + response status
+```
+
+All authorization-aware middleware fire after routing (so `_controller` is set) and after auth (so identity is available).
 
 ## Policy engine decision order
 

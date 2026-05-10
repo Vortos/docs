@@ -38,11 +38,11 @@ The driver is configured via the env-based config override system. Create `confi
 
 ```php
 <?php
-use Fortizan\Tekton\Messaging\DependencyInjection\TektonMessagingConfig;
-use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryProducer;
-use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryConsumer;
+use Vortos\Messaging\DependencyInjection\VortosMessagingConfig;
+use Vortos\Messaging\Driver\InMemory\Runtime\InMemoryProducer;
+use Vortos\Messaging\Driver\InMemory\Runtime\InMemoryConsumer;
 
-return static function(TektonMessagingConfig $config): void {
+return static function(VortosMessagingConfig $config): void {
     $config->driver()
         ->producer(InMemoryProducer::class)
         ->consumer(InMemoryConsumer::class);
@@ -60,7 +60,7 @@ Your application code stays identical. Everything that injects `EventBusInterfac
 In tests or diagnostic controllers, inject `InMemoryBroker` to inspect or assert on messages:
 
 ```php
-use Fortizan\Tekton\Messaging\Driver\InMemory\Runtime\InMemoryBroker;
+use Vortos\Messaging\Driver\InMemory\Runtime\InMemoryBroker;
 
 final class TestController
 {
@@ -93,7 +93,7 @@ final class TestController
 | Delivery guarantee | At-least-once | In-process only |
 | Offset tracking | Full Kafka consumer group | Not applicable |
 | Multiple consumers | Partition-distributed | Single process |
-| Outbox support | Full (via `tekton_outbox`) | Bypassed — direct enqueue |
+| Outbox support | Full (via `vortos_outbox`) | Bypassed — direct enqueue |
 | SASL/SSL | Configurable | Not applicable |
 
 <Callout type="warn" title="Outbox Behavior">

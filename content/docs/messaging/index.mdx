@@ -1,15 +1,15 @@
 ---
 title: Messaging
-description: Enterprise-grade event-driven messaging for Tekton — Kafka, outbox pattern, retry, dead letter, and more.
+description: Enterprise-grade event-driven messaging for Vortos — Kafka, outbox pattern, retry, dead letter, and more.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 import { Card, Cards } from 'fumadocs-ui/components/card';
 import { Step, Steps } from 'fumadocs-ui/components/steps';
 
-# Tekton Messaging
+# Vortos Messaging
 
-The Tekton Messaging module is a production-ready, broker-agnostic event-driven messaging layer built directly into the framework. It provides everything you need to publish, consume, and reliably process domain events across services — with zero manual wiring.
+The Vortos Messaging module is a production-ready, broker-agnostic event-driven messaging layer built directly into the framework. It provides everything you need to publish, consume, and reliably process domain events across services — with zero manual wiring.
 
 <Callout type="info" title="Design Philosophy">
 Your domain code calls one method: `$eventBus->dispatch($event)`. Everything else — Kafka transport, serialization, middleware, retries, dead letters, tracing — happens automatically behind the scenes.
@@ -44,8 +44,8 @@ Worker Process (supervisord)
     │
     ▼
 ConsumerRunner
+    ├── Resolve handlers from HandlerRegistry  ← validates event class is known
     ├── Deserialize payload → DomainEvent
-    ├── Resolve handlers from HandlerRegistry
     └── For each handler:
             │
             ▼
@@ -88,13 +88,13 @@ ConsumerRunner
 Create a config class in your bounded context:
 
 ```php title="src/User/Infrastructure/UserMessagingConfig.php"
-use Fortizan\Tekton\Messaging\Attribute\MessagingConfig;
-use Fortizan\Tekton\Messaging\Attribute\RegisterTransport;
-use Fortizan\Tekton\Messaging\Attribute\RegisterProducer;
-use Fortizan\Tekton\Messaging\Attribute\RegisterConsumer;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaConsumerDefinition;
+use Vortos\Messaging\Attribute\MessagingConfig;
+use Vortos\Messaging\Attribute\RegisterTransport;
+use Vortos\Messaging\Attribute\RegisterProducer;
+use Vortos\Messaging\Attribute\RegisterConsumer;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaConsumerDefinition;
 
 #[MessagingConfig]
 final class UserMessagingConfig
@@ -137,7 +137,7 @@ final class UserMessagingConfig
 ### Dispatch an Event
 
 ```php title="src/User/Application/RegisterUserHandler.php"
-use Fortizan\Tekton\Messaging\Contract\EventBusInterface;
+use Vortos\Messaging\Contract\EventBusInterface;
 
 final class RegisterUserHandler
 {
@@ -162,7 +162,7 @@ final class RegisterUserHandler
 ### Write a Handler
 
 ```php title="src/User/Application/EventHandler/SendWelcomeEmailHandler.php"
-use Fortizan\Tekton\Messaging\Attribute\AsEventHandler;
+use Vortos\Messaging\Attribute\AsEventHandler;
 
 #[AsEventHandler(handlerId: 'user.created.welcome-email', consumer: 'user.events')]
 final class SendWelcomeEmailHandler
@@ -184,7 +184,7 @@ Add your consumer to `docker/worker/supervisord.conf`:
 
 ```ini
 [program:consumer-user-events]
-command=php /var/www/html/bin/console tekton:consume user.events
+command=php /var/www/html/bin/console vortos:consume user.events
 autostart=true
 autorestart=true
 stdout_logfile=/var/log/supervisor/user-events.out.log
@@ -201,8 +201,9 @@ The framework ships with built-in console commands for operating and inspecting 
 
 | Command | Description |
 |---|---|
-| `tekton:consume <name>` | Start a consumer worker for the named pipeline |
-| `tekton:transports:list` | List all registered transports and producers |
-| `tekton:consumers:list` | List all registered consumers and their handlers |
-| `tekton:outbox:relay` | Start the outbox relay worker |
-| `tekton:dlq:replay` | Replay messages from the dead letter store |
+| `vortos:consume <name>` | Start a consumer worker for the named pipeline |
+| `vortos:transports:list` | List all registered transports and producers |
+| `vortos:consumers:list` | List all registered consumers and their handlers |
+| `vortos:outbox:relay` | Start the outbox relay worker |
+| `vortos:outbox:replay` | Reset failed outbox rows to pending so the relay retries them |
+| `vortos:dlq:replay` | Replay consumer failed messages from `vortos_failed_messages` back to Kafka |

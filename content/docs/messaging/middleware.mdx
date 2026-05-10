@@ -8,7 +8,7 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 
 # Middleware
 
-The middleware pipeline wraps every handler execution on the consumer side. Middleware runs before and after the handler, in a defined order, and can intercept exceptions. Tekton ships four built-in middleware layers and supports unlimited user-defined middleware via the `#[AsMiddleware]` attribute.
+The middleware pipeline wraps every handler execution on the consumer side. Middleware runs before and after the handler, in a defined order, and can intercept exceptions. Vortos ships four built-in middleware layers and supports unlimited user-defined middleware via the `#[AsMiddleware]` attribute.
 
 ## How the Pipeline Works
 
@@ -90,8 +90,8 @@ When your handler writes to the database AND publishes another event (via `Event
 Implement `MiddlewareInterface` and mark the class with `#[AsMiddleware]`:
 
 ```php
-use Fortizan\Tekton\Messaging\Attribute\AsMiddleware;
-use Fortizan\Tekton\Messaging\Middleware\MiddlewareInterface;
+use Vortos\Messaging\Attribute\AsMiddleware;
+use Vortos\Messaging\Middleware\MiddlewareInterface;
 use Symfony\Component\Messenger\Envelope;
 
 #[AsMiddleware(priority: 500)]
@@ -118,7 +118,7 @@ final class TenantContextMiddleware implements MiddlewareInterface
 }
 ```
 
-That is all. Tekton's `MiddlewareCompilerPass` discovers any class implementing `MiddlewareInterface` with `#[AsMiddleware]` and inserts it into the stack at the correct position based on priority.
+That is all. Vortos' `MiddlewareCompilerPass` discovers any class implementing `MiddlewareInterface` with `#[AsMiddleware]` and inserts it into the stack at the correct position based on priority.
 
 ## Priority System
 
@@ -159,8 +159,8 @@ interface MiddlewareInterface
 The `Envelope` carries the domain event and all stamps. You can read stamps in middleware:
 
 ```php
-use Fortizan\Tekton\Messaging\Bus\Stamp\CorrelationIdStamp;
-use Fortizan\Tekton\Messaging\Bus\Stamp\EventIdStamp;
+use Vortos\Messaging\Bus\Stamp\CorrelationIdStamp;
+use Vortos\Messaging\Bus\Stamp\EventIdStamp;
 
 public function handle(Envelope $envelope, callable $next): Envelope
 {

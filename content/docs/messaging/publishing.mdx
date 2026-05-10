@@ -1,6 +1,6 @@
 ---
 title: Publishing Events
-description: Dispatch domain events through the Tekton EventBus — automatic stamping, routing, outbox, and direct Kafka production.
+description: Dispatch domain events through the Vortos EventBus — automatic stamping, routing, outbox, and direct Kafka production.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -23,7 +23,7 @@ interface EventBusInterface
 Inject it anywhere in your application layer:
 
 ```php
-use Fortizan\Tekton\Messaging\Contract\EventBusInterface;
+use Vortos\Messaging\Contract\EventBusInterface;
 
 final class RegisterUserHandler
 {
@@ -57,9 +57,9 @@ When you call `$eventBus->dispatch($event)`, the following happens in order:
 
 The event is wrapped in a Symfony Messenger `Envelope` and stamped with:
 
-- `EventIdStamp` — a unique hex ID (`bin2hex(random_bytes(16))`) identifying this specific dispatch
+- `EventIdStamp` — a UuidV7 RFC 4122 string identifying this specific dispatch (time-ordered, database-index friendly, consistent with outbox and dead letter IDs)
 - `TimestampStamp` — the current `DateTimeImmutable`
-- `CorrelationIdStamp` — pulled from the current trace context if a distributed trace is active, or freshly generated
+- `CorrelationIdStamp` — pulled from the current trace context if a distributed trace is active, or a freshly generated UuidV7
 
 **2. Hook execution**
 
@@ -67,13 +67,13 @@ The event is wrapped in a Symfony Messenger `Envelope` and stamped with:
 
 **3. Internal handler check**
 
-The `HandlerRegistry` is checked for handlers registered to any consumer that handles this event class. If handlers exist and the consumer has no external transport, the event is dispatched in-process via Symfony Messenger.
+A precomputed index of in-process event classes is consulted. This index is built once at container construction from the `HandlerRegistry` and `ConsumerRegistry` — the check at dispatch time is a single array key lookup with no iteration. If the event class is in the index, the event is dispatched in-process via Symfony Messenger.
 
 **4. Producer routing**
 
 The `eventProducerMap` (built at compile time from your `#[RegisterProducer]` definitions) is checked for a producer registered for this event class. If found:
 
-- **Outbox enabled** → `OutboxInterface::store()` is called, writing the event to the `tekton_outbox` database table inside your current transaction. The `OutboxRelayWorker` picks it up asynchronously and produces to Kafka.
+- **Outbox enabled** → `OutboxInterface::store()` is called, writing the event to the `vortos_outbox` database table inside your current transaction. The `OutboxRelayWorker` picks it up asynchronously and produces to Kafka.
 - **Outbox disabled** → `ProducerInterface::produce()` is called directly, sending the event to Kafka immediately.
 
 **5. Warning**
@@ -89,8 +89,8 @@ If no handlers and no producer are found, a warning is logged. This is almost al
 Producers are defined in your `#[MessagingConfig]` class:
 
 ```php
-use Fortizan\Tekton\Messaging\Attribute\RegisterProducer;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
+use Vortos\Messaging\Attribute\RegisterProducer;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
 
 #[RegisterProducer]
 public function userProducer(): KafkaProducerDefinition
@@ -128,7 +128,7 @@ Compression algorithm: `'snappy'`, `'lz4'`, `'gzip'`, `'zstd'`. Reduces network 
 Domain events are plain PHP objects. The only requirement is that they implement `DomainEventInterface`:
 
 ```php
-use Fortizan\Tekton\Messaging\Contract\DomainEventInterface;
+use Vortos\Messaging\Contract\DomainEventInterface;
 use Symfony\Component\Uid\UuidV7;
 
 final readonly class UserRegisteredEvent implements DomainEventInterface
@@ -142,7 +142,7 @@ final readonly class UserRegisteredEvent implements DomainEventInterface
 ```
 
 <Callout type="warn" title="UuidV7 Serialization">
-If your event contains value objects (like `UuidV7`), make sure they implement `Stringable` or have a `fromString()` static factory. Tekton's `JsonSerializer` automatically handles `Stringable` objects by calling `(string) $value` during serialization and `ClassName::fromString($value)` during deserialization.
+If your event contains value objects (like `UuidV7`), make sure they implement `Stringable` or have a `fromString()` static factory. Vortos' `JsonSerializer` automatically handles `Stringable` objects by calling `(string) $value` during serialization and `ClassName::fromString($value)` during deserialization.
 </Callout>
 
 ## Dispatching a Batch
@@ -180,8 +180,8 @@ Every message published to Kafka includes these headers:
 
 | Header | Value |
 |---|---|
-| `event_id` | Unique hex ID for this dispatch |
-| `correlation_id` | Trace correlation ID |
+| `event_id` | UuidV7 RFC 4122 string — unique, time-ordered, consistent with outbox and dead letter IDs |
+| `correlation_id` | UuidV7 or trace correlation ID from the active distributed trace |
 | `event_class` | Fully qualified PHP class name |
 | `timestamp` | ISO 8601 dispatch timestamp |
 

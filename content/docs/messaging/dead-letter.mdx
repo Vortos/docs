@@ -8,7 +8,16 @@ import { Step, Steps } from 'fumadocs-ui/components/steps';
 
 # Dead Letter
 
-When a handler fails and exhausts all retry attempts, the message is written to the dead letter store — a `tekton_failed_messages` database table. It is removed from the active processing queue and requires manual intervention to replay.
+When a **consumer handler** fails and exhausts all retry attempts, the message is written to the dead letter store — a `vortos_failed_messages` database table. It is removed from the active processing queue and requires manual intervention to replay.
+
+<Callout type="info" title="Two Separate Failure Stores">
+The messaging module has two distinct failure paths:
+
+- **Consumer dead letter** (`vortos_failed_messages`) — handler failures after retry exhaustion. This page covers this path. Managed with `vortos:dlq:replay`.
+- **Outbox relay failures** (`vortos_outbox`, `status = 'failed'`) — relay failures when the outbox worker cannot produce to Kafka. Managed with `vortos:outbox:replay`.
+
+These are independent — a consumer failure does not touch the outbox table and vice versa.
+</Callout>
 
 ## Why Dead Letter Exists
 
@@ -21,7 +30,7 @@ Handler fails
     └── Retry 1 → fails
     └── Retry 2 → fails
     └── Retry 3 → fails (maxAttempts exhausted)
-        └── DeadLetterWriter::write() → persisted to tekton_failed_messages
+        └── DeadLetterWriter::write() → persisted to vortos_failed_messages
         └── Consumer::reject() → Kafka offset committed
         └── CRITICAL log entry fired → alert your team
         └── Processing continues for other messages
@@ -34,7 +43,7 @@ The message is safe — stored in Postgres with full payload, headers, and failu
 Create the table before using the messaging module:
 
 ```sql
-CREATE TABLE tekton_failed_messages (
+CREATE TABLE vortos_failed_messages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transport_name  VARCHAR(255) NOT NULL,
     event_class     VARCHAR(512) NOT NULL,
@@ -93,7 +102,7 @@ Once the root cause is fixed and deployed:
 ### Inspect what will be replayed
 
 ```bash
-php bin/console tekton:dlq:replay --dry-run
+php bin/console vortos:dlq:replay --dry-run
 ```
 
 ```
@@ -113,7 +122,7 @@ Dry run complete. No messages replayed.
 ### Replay all failed messages
 
 ```bash
-php bin/console tekton:dlq:replay
+php bin/console vortos:dlq:replay
 ```
 
 ```
@@ -134,7 +143,7 @@ Done. Replayed: 3  Failed: 0
 
 ```sql
 SELECT id, status, replayed_at
-FROM tekton_failed_messages
+FROM vortos_failed_messages
 ORDER BY failed_at DESC;
 ```
 
@@ -148,18 +157,33 @@ Status changes from `failed` to `replayed` with a `replayed_at` timestamp.
 
 ```bash
 # replay up to 100 messages (default: 50)
-php bin/console tekton:dlq:replay --limit=100
+php bin/console vortos:dlq:replay --limit=100
 
 # dry run — inspect without replaying
-php bin/console tekton:dlq:replay --dry-run
+php bin/console vortos:dlq:replay --dry-run
+
+# replay only messages from a specific transport
+php bin/console vortos:dlq:replay --transport=user.events
+
+# replay only a specific event class
+php bin/console vortos:dlq:replay --event-class="App\\User\\Domain\\Event\\UserCreatedEvent"
+
+# replay a single specific message by ID
+php bin/console vortos:dlq:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
 ```
+
+Filters can be combined — for example, `--transport=user.events --event-class="..."` replays only matching messages within that transport. `--id` always selects exactly one row regardless of other filters.
+
+<Callout type="info" title="Concurrent Replay Safety">
+`vortos:dlq:replay` uses `SELECT ... FOR UPDATE SKIP LOCKED` when fetching failed messages. Running the command twice simultaneously is safe — each invocation locks a non-overlapping batch of rows. No message is ever replayed by two concurrent processes.
+</Callout>
 
 ## What Replay Does
 
 Replay re-produces the original message payload directly to Kafka — it does not re-dispatch through `EventBus`. The message goes back into the Kafka topic and is consumed by the worker as a fresh message, running through the full pipeline: deserialization, handler, middleware, retry.
 
 ```
-tekton_failed_messages (status: failed)
+vortos_failed_messages (status: failed)
     │
     ▼
 ReplayDeadLetterCommand
@@ -176,6 +200,41 @@ Worker picks up from Kafka
 Replayed messages have new Kafka offsets but carry the **original** `event_id` header. If your handlers use idempotency (`idempotent: false`, the default), and the original message was successfully processed before it was dead-lettered (unlikely but possible), the handler will be skipped. If you need to force re-execution, temporarily mark your handler `idempotent: true` before replaying.
 </Callout>
 
+## Global Configuration
+
+The DLQ table name is configured globally in your bootstrap via `VortosMessagingConfig`:
+
+```php
+use Vortos\Messaging\DependencyInjection\VortosMessagingConfig;
+
+$config = new VortosMessagingConfig();
+
+$config->dlq()
+    ->table('vortos_failed_messages');  // default — must match the table in your migration
+```
+
+## DLQ Routing from Consumers
+
+When a consumer exhausts retries, it writes to `vortos_failed_messages` **and** optionally produces the message back to a dedicated Kafka DLQ topic — so downstream services or alerting pipelines can react in real time. Configure the DLQ transport on the consumer definition:
+
+```php
+#[RegisterConsumer]
+public function userConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('user.events')
+        ->groupId('user-service')
+        ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500))
+        ->dlq('user.events.dlq');  // transport name to produce failed messages to
+}
+```
+
+The `user.events.dlq` value must reference a registered transport. After retry exhaustion the consumer:
+
+1. Writes the message to `vortos_failed_messages` (for manual inspection and replay)
+2. Produces the original payload to the `user.events.dlq` Kafka topic (for real-time alerting or automated pipelines)
+
+Both happen together. If the Kafka DLQ produce fails, the failure is logged at `ERROR` level — the write to `vortos_failed_messages` is not rolled back.
+
 ## This Command is Manual — By Design
 
 The replay command is not run by supervisord automatically. Dead letter is an intentional stop requiring human intervention. The workflow is:
@@ -183,7 +242,7 @@ The replay command is not run by supervisord automatically. Dead letter is an in
 1. Alert fires on `CRITICAL` log
 2. Engineer investigates root cause
 3. Fix is deployed
-4. Engineer runs `tekton:dlq:replay`
+4. Engineer runs `vortos:dlq:replay`
 5. Messages process successfully
 
 Automatic replay would create an infinite loop for persistently broken messages. Human judgment is required.

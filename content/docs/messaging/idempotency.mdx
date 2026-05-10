@@ -11,18 +11,30 @@ In an at-least-once delivery system, the same message can be delivered more than
 
 ## How It Works
 
-Every message published by `EventBus` carries a unique `event_id` header. When `ConsumerRunner` processes a message, it checks a Redis cache before invoking the handler:
+Every message published by `EventBus` carries a unique `event_id` header (a UuidV7 UUID). When `ConsumerRunner` processes a message, it checks a Redis cache before invoking each handler. Whether the check skips the handler depends on the handler's `idempotent` flag:
 
 ```
-Message arrives with event_id: "abc123"
+Message arrives with event_id: "019d3806-3b1c-7c2b-..."
     │
     ▼
-cache.has("tekton_idempotency_{handlerId}_{eventId}")
-    ├── YES → skip handler, return success (already processed)
-    └── NO  → run handler
-                │
-            SUCCESS → cache.set(key, true, 86400s)
-            FAILURE → do NOT cache → message will retry
+Build cache key: "vortos_idempotency_{handlerId}_{eventId}"
+    │
+    ├── handler has idempotent: false (default)?
+    │       │
+    │       ▼
+    │   cache.has(key)?
+    │       ├── YES → SKIP handler (already processed, protect from duplicate side-effects)
+    │       └── NO  → run handler
+    │                       │
+    │                   SUCCESS → cache.set(key, true, 86400s)
+    │                   FAILURE → do NOT cache → message will retry
+    │
+    └── handler has idempotent: true?
+            │
+            ▼
+        Always run handler — cache is never checked
+        SUCCESS → cache.set(key, true, 86400s)  ← written but never read
+        FAILURE → do NOT cache → message will retry
 ```
 
 The cache key includes both the `handlerId` and `event_id` — so the same event can be handled by multiple handlers, each with independent idempotency tracking.
@@ -33,13 +45,13 @@ Idempotency keys expire after 24 hours (86400 seconds) by default. After expiry,
 
 ## Cache Backend
 
-Tekton uses Redis as the idempotency cache via PSR-16 (`Psr\SimpleCache\CacheInterface`). Redis is the correct choice for production — it persists across worker restarts and is shared across multiple worker processes.
+Vortos uses Redis as the idempotency cache via PSR-16 (`Psr\SimpleCache\CacheInterface`). Redis is the correct choice for production — it persists across worker restarts and is shared across multiple worker processes.
 
 The binding is registered automatically in `MessagingExtension` using Symfony Cache's `RedisAdapter` wrapped in `Psr16Cache`:
 
 ```
 Redis (redis:6379)
-    └── RedisAdapter (namespace: tekton_messaging)
+    └── RedisAdapter (namespace: vortos_messaging)
             └── Psr16Cache
                     └── CacheInterface binding
                             └── ConsumerRunner injects it
@@ -56,50 +68,83 @@ $container->setAlias(CacheInterface::class, 'your.custom.cache.service');
 
 ## Marking a Handler as Idempotent
 
-By default, all handlers participate in idempotency checking — duplicate messages are skipped. If a handler is **safe to run multiple times** (truly idempotent by nature), mark it with `idempotent: true` to bypass the cache check:
+By default (`idempotent: false`), all handlers participate in deduplication — if the cache key for an `(eventId, handlerId)` pair already exists, the handler is skipped and the message is treated as already processed. This protects handlers with side effects (sending emails, charging cards, creating records) from running twice when Kafka redelivers a message.
+
+If a handler is **truly idempotent by design** — it always produces the same result no matter how many times it runs — mark it with `idempotent: true`. The cache check is bypassed and the handler runs on every delivery, including duplicates:
 
 ```php
 #[AsEventHandler(
     handlerId: 'user.registered.sync-read-model',
     consumer: 'user.events',
-    idempotent: true,  // safe to run multiple times — always produces the same result
+    idempotent: true,  // upsert — running twice produces identical state, so skip dedup
 )]
 final class SyncUserReadModelHandler
 {
     public function __invoke(UserRegisteredEvent $event): void
     {
-        // upsert into read model — running twice produces the same result
+        // INSERT INTO read_model ... ON CONFLICT DO UPDATE SET ...
+        // Idempotent: running this twice leaves the database in the same state
     }
 }
 ```
 
 <Callout type="warn" title="Default is Safe">
-By default `idempotent: false` — the cache check runs and duplicates are skipped. Only set `idempotent: true` when you are certain running the handler twice produces identical results with no side effects.
+The default (`idempotent: false`) is the safer choice. Non-idempotent handlers are protected from duplicate execution automatically. Only opt out with `idempotent: true` when you are certain running the handler twice produces no additional side effects — same database state, no duplicate emails, no duplicate charges.
 </Callout>
 
 ## Testing Idempotency
 
-To verify idempotency works, publish the same `event_id` twice. The easiest way is to temporarily hardcode the event ID in `EventBus::dispatch()`:
+To verify idempotency works, publish two messages with the same `event_id`. The cleanest way is to set a fixed `event_id` header when producing a test message directly to Kafka, or to produce the same message twice using the `InMemory` driver in tests:
 
 ```php
-// temporary — for testing only
-$eventId = 'test-fixed-event-id';
+// In a test using the InMemory driver, publish the same event twice
+// with the same event_id header to simulate Kafka redelivery
+$headers = ['event_id' => '019d3806-3b1c-7c2b-ac39-1be1b02ac8e1', 'event_class' => UserCreatedEvent::class];
+
+$this->producer->produce('user.events', new UserCreatedEvent('user-1', 'test@example.com'), $headers);
+$this->producer->produce('user.events', new UserCreatedEvent('user-1', 'test@example.com'), $headers);
 ```
 
-Hit your publish endpoint twice. Check logs:
+Check logs after processing both:
 
 ```
 First message:
 app.INFO: UserCreatedHandler executed {...}
 app.DEBUG: Event dispatched {...}
 
-Second message (same event_id):
+Second message (same event_id, handler has idempotent: false):
 app.DEBUG: Skipping duplicate handler execution
 app.DEBUG: Event dispatched {...}
 ```
 
-The handler log line does not appear the second time — the handler was skipped.
+The handler log line does not appear the second time — the handler was skipped by the idempotency cache.
 
 ## Idempotency TTL
 
-The default TTL is 86400 seconds (24 hours). To change it, the `ConsumerRunner` constructor accepts `$idempotencyTtl` as a parameter. Override it in your container configuration if needed.
+The default TTL is 86400 seconds (24 hours). There are two ways to change it.
+
+**Global default** — set in your bootstrap via `VortosMessagingConfig`. Applies to all consumers that do not override it:
+
+```php
+use Vortos\Messaging\DependencyInjection\VortosMessagingConfig;
+
+$config = new VortosMessagingConfig();
+
+$config->consumerDefaults()
+    ->idempotencyTtl(43200);  // 12 hours for all consumers
+```
+
+**Per-consumer override** — set on the consumer definition. Takes precedence over the global default for that consumer only:
+
+```php
+#[RegisterConsumer]
+public function paymentConsumer(): KafkaConsumerDefinition
+{
+    return KafkaConsumerDefinition::create('payment.events')
+        ->groupId('payment-service')
+        ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500))
+        ->idempotencyTtl(604800);  // 7-day dedup window for payment events
+}
+```
+
+Use a longer TTL for critical consumers where duplicate execution has high cost (payments, inventory). Use a shorter TTL for high-volume consumers where Redis memory is a concern.

@@ -7,7 +7,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 # Resource Ownership
 
-Ownership middleware enforces that a user owns the resource they are trying to access. It runs at priority 4.5 — after authorization, before feature access.
+Ownership middleware enforces that a user owns the resource they are trying to access. It runs at priority 2 — after authorization (3), before feature access (1).
 
 <Callout type="info" title="Compile-Time Map">
 All `#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` attributes are scanned at compile time. Runtime middleware does a single array lookup — zero reflection.
@@ -149,13 +149,46 @@ public function getResourceIdFrom(Request $request): string
 When `isOwner()` returns false because the resource doesn't exist, the middleware returns 403, not 404. This is intentional — it does not leak information about whether a resource exists to users who should not see it. The controller should handle the 404 case for authorized users.
 </Callout>
 
+## Method-Level Attributes
+
+`#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` can be placed on individual methods, not just the whole controller class:
+
+```php
+#[ApiController]
+#[Route('/documents')]
+final class DocumentController
+{
+    // No ownership check on list
+    #[Route('/', methods: ['GET'])]
+    public function list(): Response { ... }
+
+    // Only the author can update
+    #[Route('/{id}', methods: ['PUT'])]
+    #[RequiresOwnership(DocumentOwnershipPolicy::class)]
+    public function update(string $id): Response { ... }
+
+    // Author can delete, or someone with documents.delete.any
+    #[Route('/{id}', methods: ['DELETE'])]
+    #[RequiresOwnershipOrPermission(
+        policy: DocumentOwnershipPolicy::class,
+        override: 'documents.delete.any',
+    )]
+    public function delete(string $id): Response { ... }
+}
+```
+
+Method-level takes precedence over class-level when both are present.
+
 ## Middleware Priority
 
 ```
 priority 6: AuthMiddleware            — authenticate
-priority 5: AuthorizationMiddleware   — check permissions
-priority 4.5: OwnershipMiddleware     — check ownership ← here
-priority 4: FeatureAccessMiddleware   — check feature plan
+priority 5: TwoFactorMiddleware       — 2FA gate
+priority 4: RateLimitUser             — per-user rate limits
+priority 3: AuthorizationMiddleware   — check permissions
+priority 2: OwnershipMiddleware       — check ownership ← here
+priority 1: FeatureAccessMiddleware   — check feature plan
+priority 0: QuotaMiddleware           — usage quotas
 ```
 
 Ownership runs after permission checks — so a user must first pass `#[RequiresPermission]` (if present) before ownership is evaluated.

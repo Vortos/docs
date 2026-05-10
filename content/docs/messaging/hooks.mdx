@@ -22,7 +22,7 @@ Lifecycle hooks let you intercept specific moments in the event processing pipel
 
 ## How Discovery Works
 
-At container compile time, `HookDiscoveryCompilerPass` scans all services tagged `tekton.hook`. The tag is applied automatically by `MessagingExtension` to any class with a hook attribute. The pass builds an array of hook descriptors keyed by hook type, stores them in the `tekton.hooks` container parameter, and populates `tekton.hook_locator` with the actual service references.
+At container compile time, `HookDiscoveryCompilerPass` scans all services tagged `vortos.hook`. The tag is applied automatically by `MessagingExtension` to any class with a hook attribute. The pass builds an array of hook descriptors keyed by hook type, stores them in the `vortos.hooks` container parameter, and populates `vortos.hook_locator` with the actual service references.
 
 At runtime, `HookRegistry` reconstructs typed `HookDescriptor` objects from the stored arrays. `HookRunner` reads from the registry and invokes hooks at the correct moment.
 
@@ -35,8 +35,8 @@ All discovery and wiring happens at compile time. At runtime, `HookRunner` just 
 A hook is a class with one or more hook attributes and an `__invoke` method:
 
 ```php
-use Fortizan\Tekton\Messaging\Contract\DomainEventInterface;
-use Fortizan\Tekton\Messaging\Hook\Attribute\BeforeDispatch;
+use Vortos\Messaging\Contract\DomainEventInterface;
+use Vortos\Messaging\Hook\Attribute\BeforeDispatch;
 use Psr\Log\LoggerInterface;
 
 #[BeforeDispatch]
@@ -55,7 +55,7 @@ final class AuditDispatchHook
 }
 ```
 
-No registration needed. Tekton discovers it automatically.
+No registration needed. Vortos discovers it automatically.
 
 ## Hook Signatures
 

@@ -1,0 +1,146 @@
+---
+title: Config Stubs
+description: How to ship an annotated config stub with a Vortos module so developers get a pre-generated config file when they run vortos:config:publish.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Config Stubs
+
+`vortos:config:publish` generates annotated `config/*.php` files for every installed module. Each module owns and ships its own stub — the `Config` module collects them at runtime via the DI container tag `vortos.config_stub`.
+
+This page explains how to add a config stub to a new or existing Vortos module.
+
+## How It Works
+
+Each module's `Extension` registers a `ConfigStub` service tagged `vortos.config_stub`. The `ConfigFilePublisher` in `vortos/vortos-config` collects all tagged stubs via `TaggedIteratorArgument` and copies them to the developer's `config/` directory when they run:
+
+```bash
+php vortos vortos:config:publish
+```
+
+If the module is not installed, its stub is never registered — so `config:publish` only generates files for modules the developer has actually installed.
+
+## Adding a Stub to Your Module
+
+### 1. Create the stub file
+
+Place the stub inside your module's `stubs/` directory. The filename becomes the output filename in the developer's `config/` directory.
+
+```
+src/YourModule/stubs/your-module.php
+```
+
+The stub must return a closure that accepts the module's config object:
+
+```php title="src/YourModule/stubs/your-module.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\YourModule\DependencyInjection\VortosYourModuleConfig;
+
+// Brief description of what ENV controls vs what this file controls.
+// Mention env-override file: config/{env}/your-module.php
+
+return static function (VortosYourModuleConfig $config): void {
+    $config
+        // Explain what this option does and when to change it.
+        ->someOption('default-value')
+    ;
+
+    // Options that are off by default — show them commented out with explanations.
+    //
+    // $config->optionalFeature(true);
+};
+```
+
+**Stub writing rules:**
+
+- Every active option must have a comment explaining what it does and when to change it.
+- Options that are off by default must be shown commented out, not omitted — developers need to know they exist.
+- Note which options are already driven by ENV vars so developers know not to duplicate them.
+- Mention the env-override pattern (`config/{env}/your-module.php`) at the top if the module's Extension supports it.
+- Do not include options that are internal or not intended for developer configuration.
+
+### 2. Register the stub in your Extension
+
+In your module's `Extension::load()` method, register a `ConfigStub` service tagged `vortos.config_stub`:
+
+```php title="src/YourModule/DependencyInjection/YourModuleExtension.php"
+use Vortos\Config\DependencyInjection\ConfigExtension;
+use Vortos\Config\Stub\ConfigStub;
+
+final class YourModuleExtension extends Extension
+{
+    public function load(array $configs, ContainerBuilder $container): void
+    {
+        // ... your existing service registrations ...
+
+        $container->register('vortos.config_stub.your-module', ConfigStub::class)
+            ->setArguments(['your-module', __DIR__ . '/../stubs/your-module.php'])
+            ->addTag(ConfigExtension::STUB_TAG)
+            ->setPublic(false);
+    }
+}
+```
+
+The first argument to `ConfigStub` is the **module name** — this becomes the output filename (`config/your-module.php`). Use lowercase with hyphens, matching the convention of other modules.
+
+<Callout type="warn" title="ConfigExtension order">
+`vortos/vortos-config` must be loaded before your module attempts to reference `ConfigExtension::STUB_TAG`. The Config module is registered at order `115` — set your module's order above that in `composer.json` if needed.
+</Callout>
+
+### 3. Verify
+
+Run `vortos:config:publish` from a project that has your module installed:
+
+```bash
+php vortos vortos:config:publish --dry-run
+```
+
+Your module's config file should appear in the preview output. Run without `--dry-run` to write it.
+
+To publish only your module's stub during development:
+
+```bash
+php vortos vortos:config:publish --module=your-module
+```
+
+## Reference: Existing Stubs
+
+The built-in modules are good references for stub style and content:
+
+| Module | Stub location |
+|---|---|
+| Auth | `src/Auth/stubs/auth.php` |
+| Authorization | `src/Authorization/stubs/authorization.php` |
+| Cache | `src/Cache/stubs/cache.php` |
+| CQRS | `src/Cqrs/stubs/cqrs.php` |
+| Logger | `src/Logger/stubs/logging.php` |
+| Messaging | `src/Messaging/stubs/messaging.php` |
+| Metrics | `src/Metrics/stubs/metrics.php` |
+| Persistence | `src/Persistence/stubs/persistence.php` |
+| Tracing | `src/Tracing/stubs/tracing.php` |
+
+## Reference: ConfigStub
+
+```php
+namespace Vortos\Config\Stub;
+
+final readonly class ConfigStub
+{
+    public function __construct(
+        public string $module, // output filename without .php extension
+        public string $path,   // absolute path to the stub file
+    ) {}
+}
+```
+
+## Reference: ConfigExtension::STUB_TAG
+
+```php
+ConfigExtension::STUB_TAG // = 'vortos.config_stub'
+```
+
+Use the constant rather than the raw string so a rename is caught at compile time.

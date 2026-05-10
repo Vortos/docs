@@ -8,18 +8,18 @@ import { Step, Steps } from 'fumadocs-ui/components/steps';
 
 # Worker Setup
 
-Tekton consumers run as long-lived PHP CLI processes managed by supervisord. Each consumer pipeline gets its own process. Supervisord handles automatic restarts on crash and graceful shutdown on `SIGTERM`.
+Vortos consumers run as long-lived PHP CLI processes managed by supervisord. Each consumer pipeline gets its own process. Supervisord handles automatic restarts on crash and graceful shutdown on `SIGTERM`.
 
 ## Architecture
 
 ```
-Docker container (tekton-worker)
+Docker container (vortos-worker)
     │
     └── supervisord (PID 1)
-            ├── consumer-user-events    → php bin/console tekton:consume user.events
-            ├── consumer-order-events   → php bin/console tekton:consume order.events
-            ├── consumer-payment-events → php bin/console tekton:consume payment.events
-            └── outbox-relay            → php bin/console tekton:outbox:relay
+            ├── consumer-user-events    → php bin/console vortos:consume user.events
+            ├── consumer-order-events   → php bin/console vortos:consume order.events
+            ├── consumer-payment-events → php bin/console vortos:consume payment.events
+            └── outbox-relay            → php bin/console vortos:outbox:relay
 ```
 
 Docker Compose manages the container lifecycle. Supervisord manages the process lifecycle inside the container. You never need to touch `docker-compose.yml` to add a new consumer.
@@ -71,7 +71,7 @@ serverurl=unix:///var/run/supervisor.sock
 ; ─── Consumers ───────────────────────────────────────────────
 
 [program:consumer-user-events]
-command=php /var/www/html/bin/console tekton:consume user.events
+command=php /var/www/html/bin/console vortos:consume user.events
 autostart=true
 autorestart=true
 startsecs=3
@@ -80,7 +80,7 @@ stdout_logfile=/var/log/supervisor/user-events.out.log
 stderr_logfile=/var/log/supervisor/user-events.err.log
 
 [program:consumer-order-events]
-command=php /var/www/html/bin/console tekton:consume order.events
+command=php /var/www/html/bin/console vortos:consume order.events
 autostart=true
 autorestart=true
 startsecs=3
@@ -91,7 +91,7 @@ stderr_logfile=/var/log/supervisor/order-events.err.log
 ; ─── Outbox Relay ────────────────────────────────────────────
 
 [program:outbox-relay]
-command=php /var/www/html/bin/console tekton:outbox:relay
+command=php /var/www/html/bin/console vortos:outbox:relay
 autostart=true
 autorestart=true
 startsecs=3
@@ -99,6 +99,15 @@ stopwaitsecs=10
 stdout_logfile=/var/log/supervisor/outbox-relay.out.log
 stderr_logfile=/var/log/supervisor/outbox-relay.err.log
 ```
+
+### Command options
+
+| Command | Option | Description |
+|---|---|---|
+| `vortos:consume <name>` | `--max-messages=N` | Exit after processing N messages. Useful for cron-driven or batch runs. |
+| `vortos:outbox:relay` | `--dry-run` | List pending outbox rows without producing to Kafka. |
+| `vortos:outbox:relay` | `--batch-size=N` | Number of rows to fetch per poll cycle (default: 100). |
+| `vortos:outbox:relay` | `--sleep-ms=N` | Milliseconds to sleep between poll cycles when the queue is empty. |
 
 ### Key Settings
 
@@ -124,7 +133,7 @@ worker:
     - write_db
     - redis
   networks:
-    - tekton-net
+    - vortos-net
 ```
 
 No `command:` override — the Dockerfile `CMD` runs supervisord. `restart: always` ensures the container restarts if it ever exits (e.g. on server reboot).
@@ -155,7 +164,7 @@ public function paymentConsumer(): KafkaConsumerDefinition
 
 ```ini
 [program:consumer-payment-events]
-command=php /var/www/html/bin/console tekton:consume payment.events
+command=php /var/www/html/bin/console vortos:consume payment.events
 autostart=true
 autorestart=true
 startsecs=3
@@ -198,7 +207,7 @@ outbox-relay              RUNNING   pid 10, uptime 0:12:43
 
 ## Graceful Shutdown
 
-The `tekton:consume` command installs signal handlers for `SIGTERM` and `SIGINT`:
+The `vortos:consume` command installs signal handlers for `SIGTERM` and `SIGINT`:
 
 ```
 supervisord sends SIGTERM to consumer process
@@ -245,13 +254,13 @@ To run multiple worker processes for the same consumer (for higher throughput), 
 
 ```ini
 [program:consumer-order-events-1]
-command=php /var/www/html/bin/console tekton:consume order.events
+command=php /var/www/html/bin/console vortos:consume order.events
 
 [program:consumer-order-events-2]
-command=php /var/www/html/bin/console tekton:consume order.events
+command=php /var/www/html/bin/console vortos:consume order.events
 
 [program:consumer-order-events-3]
-command=php /var/www/html/bin/console tekton:consume order.events
+command=php /var/www/html/bin/console vortos:consume order.events
 ```
 
 All three processes use the same `groupId` — Kafka distributes partitions across them automatically.
@@ -260,7 +269,7 @@ All three processes use the same `groupId` — Kafka distributes partitions acro
 
 ```ini
 [program:consumer-order-events]
-command=php /var/www/html/bin/console tekton:consume order.events
+command=php /var/www/html/bin/console vortos:consume order.events
 numprocs=3
 process_name=%(program_name)s_%(process_num)02d
 ```

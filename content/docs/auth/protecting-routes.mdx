@@ -59,7 +59,7 @@ final class GetCurrentUserController
 
 ## How `#[RequiresAuth]` works
 
-`AuthMiddleware` checks the matched controller class for the `#[RequiresAuth]` attribute. If present and no valid token is in the `Authorization` header, it returns 401. If the token is valid, `UserIdentity` is stored in the request-scoped `ArrayAdapter` and the controller runs.
+`AuthCompilerPass` scans all controllers at compile time and builds a list of protected controller classes. At runtime, `AuthMiddleware` does a single array lookup — zero reflection. If the controller is in the protected list and no valid token is in the `Authorization` header, it returns 401. If the token is valid, `UserIdentity` is stored in the request-scoped `ArrayAdapter` and the controller runs.
 
 ## Login controller example
 

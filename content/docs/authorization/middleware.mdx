@@ -1,13 +1,13 @@
 ---
 title: Middleware
-description: How AuthorizationMiddleware enforces #[RequiresPermission] on controllers at priority 5 — route map, resource loading, and response shapes.
+description: How AuthorizationMiddleware enforces #[RequiresPermission] on controllers at priority 3 — compile-time route map, resource loading, and response shapes.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Authorization Middleware
 
-`AuthorizationMiddleware` enforces `#[RequiresPermission]` on controllers. It runs at priority 5 — after `AuthMiddleware` has validated the token and set the identity.
+`AuthorizationMiddleware` enforces `#[RequiresPermission]` on controllers. It runs at priority 3 — after `AuthMiddleware` (6), `TwoFactorMiddleware` (5), and `RateLimitUser` (4) have all completed.
 
 ## #[RequiresPermission]
 
@@ -120,4 +120,6 @@ The middleware checks `$event->isMainRequest()` first. Subrequests (forward, ren
 
 ## Compile-Time Behaviour
 
-`AuthorizationMiddleware` currently uses reflection to read `#[RequiresPermission]` attributes at runtime. This is on the roadmap to be moved to a compile-time map (like `RateLimitMiddleware`). The reflection call is cached by PHP's opcode cache in production — the performance impact is negligible for most applications.
+`PermissionRegistryPass` scans all `#[RequiresPermission]` attributes at container compile time and builds `ControllerPermissionMap` — a plain array keyed by `ControllerClass` or `ControllerClass::method`. At runtime, `AuthorizationMiddleware` does a single array lookup — zero reflection, O(1) cost.
+
+Unknown permissions used in `#[RequiresPermission]` are caught at compile time with a `\LogicException`, so misconfigured routes are a build-time error rather than a silent runtime 403.

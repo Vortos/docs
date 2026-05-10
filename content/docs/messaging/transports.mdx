@@ -1,6 +1,6 @@
 ---
 title: Transports
-description: Define Kafka topics, connection settings, and security configuration using Tekton's fluent transport API.
+description: Define Kafka topics, connection settings, and security configuration using Vortos' fluent transport API.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -13,7 +13,7 @@ A **transport** is the connection between your application and a Kafka broker. I
 
 ## How It Works
 
-At container compile time, Tekton scans your codebase for classes marked with `#[MessagingConfig]`. Inside those classes, any method marked with `#[RegisterTransport]` is called via reflection, and the returned definition is registered in the `TransportRegistry`. By the time your application boots, every transport is fully resolved and available.
+At container compile time, Vortos scans your codebase for classes marked with `#[MessagingConfig]`. Inside those classes, any method marked with `#[RegisterTransport]` is called via reflection, and the returned definition is registered in the `TransportRegistry`. By the time your application boots, every transport is fully resolved and available.
 
 ```
 Container compile time
@@ -32,7 +32,7 @@ KafkaProducerFactory / KafkaConsumerFactory
 ```
 
 <Callout type="info" title="Compile-time Validation">
-Tekton validates all transport references at container compile time. If a producer references a transport that doesn't exist, or a consumer references a transport that has no matching definition, the application will **refuse to boot** with a clear error message. Misconfiguration is caught before any code runs.
+Vortos validates all transport references at container compile time. If a producer references a transport that doesn't exist, or a consumer references a transport that has no matching definition, the application will **refuse to boot** with a clear error message. Misconfiguration is caught before any code runs.
 </Callout>
 
 ## Defining a Transport
@@ -40,9 +40,9 @@ Tekton validates all transport references at container compile time. If a produc
 Create a class anywhere in your `src/` directory, mark it with `#[MessagingConfig]`, and add a method returning a `KafkaTransportDefinition`:
 
 ```php
-use Fortizan\Tekton\Messaging\Attribute\MessagingConfig;
-use Fortizan\Tekton\Messaging\Attribute\RegisterTransport;
-use Fortizan\Tekton\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
+use Vortos\Messaging\Attribute\MessagingConfig;
+use Vortos\Messaging\Attribute\RegisterTransport;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
 
 #[MessagingConfig]
 final class OrderMessagingConfig
@@ -102,13 +102,20 @@ Wire format for serializing events on this transport. Defaults to `'json'`. Othe
 
 ## Security Configuration
 
-For production Kafka clusters that require authentication, use SASL and SSL:
+For production Kafka clusters that require authentication, use SASL and SSL.
+
+<Callout type="info" title="Startup Validation">
+Security configuration is validated eagerly when the consumer or producer is first created — before any connection to Kafka is attempted:
+
+- **SASL**: empty `username` or `password` throws `\InvalidArgumentException` immediately. Misconfigured credentials are caught at process startup, not silently passed to the broker.
+- **SSL**: each cert/key file path is checked with `is_readable()` before being handed to RdKafka. A missing or unreadable cert file throws `\InvalidArgumentException` with the exact path, rather than producing a cryptic C-level TLS error later.
+</Callout>
 
 <Tabs items={['SASL Plain', 'SASL SCRAM', 'SSL + SASL']}>
 
 <Tab value="SASL Plain">
 ```php
-use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+use Vortos\Messaging\Driver\Kafka\ValueObject\SaslConfig;
 
 #[RegisterTransport]
 public function ordersTransport(): KafkaTransportDefinition
@@ -123,7 +130,7 @@ public function ordersTransport(): KafkaTransportDefinition
 
 <Tab value="SASL SCRAM">
 ```php
-use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+use Vortos\Messaging\Driver\Kafka\ValueObject\SaslConfig;
 
 #[RegisterTransport]
 public function ordersTransport(): KafkaTransportDefinition
@@ -139,8 +146,8 @@ public function ordersTransport(): KafkaTransportDefinition
 
 <Tab value="SSL + SASL">
 ```php
-use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SaslConfig;
-use Fortizan\Tekton\Messaging\Driver\Kafka\ValueObject\SslConfig;
+use Vortos\Messaging\Driver\Kafka\ValueObject\SaslConfig;
+use Vortos\Messaging\Driver\Kafka\ValueObject\SslConfig;
 
 #[RegisterTransport]
 public function ordersTransport(): KafkaTransportDefinition
@@ -195,7 +202,7 @@ final class OrderMessagingConfig
 To inspect what transports are registered in your running application:
 
 ```bash
-php bin/console tekton:transports:list
+php bin/console vortos:transports:list
 ```
 
 Example output:

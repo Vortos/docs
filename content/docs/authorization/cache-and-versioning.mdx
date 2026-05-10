@@ -44,10 +44,11 @@ Current behavior:
 
 | Setting | Value |
 |---|---|
-| TTL | 60 seconds |
-| Rebuild lock TTL | 500 ms |
-| Lock behavior | First request rebuilds, concurrent requests wait briefly |
-| Payload | `ResolvedPermissions::toArray()` plus role generation hash |
+| TTL | 60 seconds (configurable via `$ttlSeconds` constructor arg) |
+| Rebuild lock TTL | 3000 ms |
+| Lock retry | Up to 5 retries with 60–300 ms backoff; falls back to direct DB resolve |
+| Payload | JSON-encoded `ResolvedPermissions::toArray()` plus role generation hash |
+| Serialization | JSON only — no `serialize()`/`unserialize()` to eliminate PHP object injection risk |
 
 Cache keys never include raw user IDs.
 
@@ -55,17 +56,21 @@ Cache keys never include raw user IDs.
 
 When Redis is available, role permission storage is wrapped by `GenerationalRolePermissionStore`.
 
-When a role's permissions change, its generation changes. Cached user permissions include a hash of the expanded role generations. If any role generation changed, the cache entry is stale even before the TTL expires.
+When a role's permissions change (grant or revoke), its generation counter is always incremented — atomically via a Lua script. Cached user permissions include a hash of the expanded role generations. If any role generation changed, the cache entry is stale even before the TTL expires.
 
 This prevents users from keeping old role permissions after a role-level grant or revoke.
+
+Generation counters are stored as individual Redis keys (`authorization:role_gen:{role}`) with a 24-hour TTL that resets on every mutation. Unused roles expire automatically — the store never grows without bound.
 
 ## User authz version
 
 User role changes are more direct. `UserRoleAdminService` does three things inside one transaction:
 
 1. Assigns or removes the user role.
-2. Increments the user's authorization version.
+2. Increments the user's authorization version in Redis.
 3. Invalidates that user's resolved permission cache.
+
+Authorization versions are stored as individual Redis keys (`authorization:user_version:{sha256(userId)}`) with a 30-day TTL that resets on every role change. Inactive users' keys expire automatically.
 
 JWT access tokens include:
 

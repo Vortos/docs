@@ -172,17 +172,19 @@ final class ExportController
 
 ## Middleware Priority
 
-`FeatureAccessMiddleware` runs at priority 4 — after authentication (6) and authorization (5). This ordering ensures:
+`FeatureAccessMiddleware` runs at priority 1 — after ownership (2) and authorization (3). This ordering ensures:
 
 1. User is authenticated before feature check
-2. User has the required permission before feature check
-3. Feature check happens last — after all security gates pass
+2. User has the required permission and passes ownership before feature check
+3. Feature check happens after all security gates pass, before quota enforcement
 
 ```
-priority 7: RateLimitMiddleware
-priority 6: AuthMiddleware
-priority 5: AuthorizationMiddleware
-priority 4: FeatureAccessMiddleware  ← here
-priority 3: QuotaMiddleware
-priority 2: AuditMiddleware
+priority 7: RateLimitIpGlobal       — IP/global limits (before auth)
+priority 6: AuthMiddleware          — validate token, set identity
+priority 5: TwoFactorMiddleware     — 2FA gate
+priority 4: RateLimitUser           — per-user rate limits
+priority 3: AuthorizationMiddleware — check permissions
+priority 2: OwnershipMiddleware     — check resource ownership
+priority 1: FeatureAccessMiddleware — check plan/feature gates  ← here
+priority 0: QuotaMiddleware         — check usage quotas
 ```

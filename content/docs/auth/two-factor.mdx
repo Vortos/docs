@@ -15,12 +15,16 @@ All `#[Requires2FA]` attributes are scanned at compile time. Runtime middleware 
 
 ## Middleware Priority
 
-`TwoFactorMiddleware` runs at priority 5.5 — between `AuthMiddleware` (6) and `AuthorizationMiddleware` (5):
+`TwoFactorMiddleware` runs at priority 5 — after `AuthMiddleware` (6), before `AuthorizationMiddleware` (3):
 
 ```
-priority 6: AuthMiddleware         — validate token, set identity
-priority 5.5: TwoFactorMiddleware  — check 2FA verification
-priority 5: AuthorizationMiddleware — check permissions
+priority 6: AuthMiddleware          — validate token, set identity
+priority 5: TwoFactorMiddleware     — check 2FA verification  ← here
+priority 4: RateLimitUser           — per-user rate limits
+priority 3: AuthorizationMiddleware — check permissions
+priority 2: OwnershipMiddleware     — check resource ownership
+priority 1: FeatureAccessMiddleware — check plan/feature gates
+priority 0: QuotaMiddleware         — check usage quotas
 ```
 
 This ensures the user is authenticated before 2FA is checked, and 2FA is verified before permissions are evaluated.

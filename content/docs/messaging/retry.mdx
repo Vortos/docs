@@ -1,6 +1,6 @@
 ---
 title: Retry & Dead Letter
-description: Automatic retry with exponential backoff and dead letter storage — Tekton handles failure recovery so your handlers don't have to.
+description: Automatic retry with exponential backoff and dead letter storage — Vortos handles failure recovery so your handlers don't have to.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -8,17 +8,17 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 
 # Retry & Dead Letter
 
-When a handler throws an exception, Tekton does not immediately discard the message. It retries the handler with a configurable backoff policy. Only after all retry attempts are exhausted does the message get written to the dead letter store — where it can be inspected and replayed manually.
+When a handler throws an exception, Vortos does not immediately discard the message. It retries the handler with a configurable backoff policy. Only after all retry attempts are exhausted does the message get written to the dead letter store — where it can be inspected and replayed manually.
 
 ## How Retry Works
 
-The retry logic lives in `ConsumerRunner::processHandler()`. On the first failure, it reads the consumer's retry policy from `ConsumerRegistry`, then enters a retry loop:
+The retry logic lives in `ConsumerRunner::processHandler()`. On the first failure, the consumer's retry policy is read once from `ConsumerRegistry`, then a retry loop begins:
 
 ```
 Handler throws exception
     │
     ▼
-Read RetryPolicy from ConsumerRegistry
+Read RetryPolicy from ConsumerRegistry (once — not per retry iteration)
     │
     ▼
 attempt = 1
@@ -27,7 +27,7 @@ attempt = 1
 RetryDecider::shouldRetry(policy, attempt)?
     ├── YES → sleep(getDelayMs(policy, attempt)) → retry handler
     │             │
-    │          SUCCESS → commit cache key, return true
+    │          SUCCESS → set idempotency cache key, return true
     │          FAILURE → attempt++, lastException = e, loop again
     │
     └── NO → DeadLetterWriter::write(...) → return false
@@ -43,7 +43,7 @@ Retry is configured per consumer in your `#[MessagingConfig]` class:
 
 <Tab value="Exponential">
 ```php
-use Fortizan\Tekton\Messaging\Retry\RetryPolicy;
+use Vortos\Messaging\Retry\RetryPolicy;
 
 #[RegisterConsumer]
 public function userConsumer(): KafkaConsumerDefinition
@@ -101,14 +101,14 @@ RetryPolicy::fixed(
 
 ## Kafka Offset and Retry
 
-It is important to understand that Tekton's retry is **in-process** — it retries the handler directly without re-consuming from Kafka. The Kafka offset is **not committed** during retries. This means:
+It is important to understand that Vortos' retry is **in-process** — it retries the handler directly without re-consuming from Kafka. The Kafka offset is **not committed** during retries. This means:
 
 - If the worker process crashes mid-retry, Kafka redelivers the message on restart (at-least-once guarantee)
 - The retry delay is a PHP `usleep()` — the consumer process is blocked during this time
 - For very long retry delays with many consumers, consider reducing `maxDelayMs` and accepting more retries instead
 
 <Callout type="info" title="At-Least-Once Delivery">
-Kafka only knows about the message being processed after the offset is committed. Tekton commits the offset only on success (acknowledge) or after dead-lettering (reject). During retries, the offset remains uncommitted — Kafka will redeliver if the process restarts.
+Kafka only knows about the message being processed after the offset is committed. Vortos commits the offset only on success (acknowledge) or after dead-lettering (reject). During retries, the offset remains uncommitted — Kafka will redeliver if the process restarts.
 </Callout>
 
 ## Dead Letter
@@ -174,15 +174,15 @@ public function userDlqTransport(): KafkaTransportDefinition
 Once the root cause of failures is fixed, use the CLI command to replay:
 
 ```bash
-php bin/console tekton:dlq:replay user.events
+php bin/console vortos:dlq:replay user.events
 ```
 
 Options:
 
 ```bash
-php bin/console tekton:dlq:replay user.events --limit=100
-php bin/console tekton:dlq:replay user.events --event-class="App\User\Domain\Event\UserRegisteredEvent"
-php bin/console tekton:dlq:replay user.events --from-date="2026-01-01" --to-date="2026-01-31"
+php bin/console vortos:dlq:replay user.events --limit=100
+php bin/console vortos:dlq:replay user.events --event-class="App\User\Domain\Event\UserRegisteredEvent"
+php bin/console vortos:dlq:replay user.events --from-date="2026-01-01" --to-date="2026-01-31"
 ```
 
 Replayed messages are re-dispatched through the same consumer pipeline — they go through deserialization, handler execution, middleware, and retry again as if they were fresh messages.

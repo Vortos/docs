@@ -29,10 +29,10 @@ The outbox pattern eliminates this by making the event write part of the same da
 ```
 BEGIN TRANSACTION
     1. Write user to database
-    2. Write event to tekton_outbox table   ← same connection, same transaction
+    2. Write event to vortos_outbox table   ← same connection, same transaction
 COMMIT (or ROLLBACK — both writes succeed or both fail)
 
-[Separately, OutboxRelayWorker polls tekton_outbox]
+[Separately, OutboxRelayWorker polls vortos_outbox]
     3. Read pending outbox rows
     4. Publish to Kafka
     5. Mark rows as published
@@ -68,7 +68,7 @@ Disabling outbox means events can be lost if Kafka is unavailable when `dispatch
 You must create the outbox table in your database. Run this migration:
 
 ```sql
-CREATE TABLE tekton_outbox (
+CREATE TABLE vortos_outbox (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transport   VARCHAR(255) NOT NULL,
     event_class VARCHAR(512) NOT NULL,
@@ -82,13 +82,13 @@ CREATE TABLE tekton_outbox (
     failure_reason TEXT
 );
 
-CREATE INDEX idx_tekton_outbox_status_created
-    ON tekton_outbox (status, created_at)
+CREATE INDEX idx_vortos_outbox_status_created
+    ON vortos_outbox (status, created_at)
     WHERE status = 'pending';
 ```
 
 <Callout type="info" title="FOR UPDATE SKIP LOCKED">
-The outbox poller uses `SELECT ... FOR UPDATE SKIP LOCKED` to safely support multiple relay processes running in parallel. Each relay process locks the rows it is processing — other processes skip locked rows and pick up different ones. This prevents duplicate publishing.
+Both `fetchPending` (relay) and `fetchFailed` (replay) use `SELECT ... FOR UPDATE SKIP LOCKED`. Running multiple relay or replay workers in parallel is safe — each process locks the rows it is processing and other processes skip those rows entirely. No message is ever processed by two workers simultaneously.
 </Callout>
 
 ## How the Relay Works
@@ -102,7 +102,7 @@ The `OutboxRelayWorker` runs in a loop, polling the outbox table and producing p
 ### Poll for pending rows
 
 ```sql
-SELECT * FROM tekton_outbox
+SELECT * FROM vortos_outbox
 WHERE status = 'pending'
   AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
 ORDER BY created_at ASC
@@ -126,7 +126,7 @@ For each pending row, deserialize the payload and call `ProducerInterface::produ
 
 On success, update the row:
 ```sql
-UPDATE tekton_outbox
+UPDATE vortos_outbox
 SET status = 'published', published_at = NOW()
 WHERE id = $id
 ```
@@ -137,14 +137,25 @@ WHERE id = $id
 
 ### Handle failure
 
-On failure, increment `attempt_count` and set `next_attempt_at` to apply backoff before the next retry:
+On failure, a single atomic `UPDATE` increments `attempt_count`, computes the exponential backoff delay, and sets the status — all in one round-trip with no SELECT preceding it:
+
 ```sql
-UPDATE tekton_outbox
-SET attempt_count = attempt_count + 1,
-    next_attempt_at = NOW() + INTERVAL '...',
-    failure_reason = $reason
-WHERE id = $id
+UPDATE vortos_outbox
+SET
+    attempt_count    = attempt_count + 1,
+    failure_reason   = :reason,
+    status           = CASE
+        WHEN attempt_count + 1 >= :maxAttempts THEN 'failed'
+        ELSE 'pending'
+    END,
+    next_attempt_at  = CASE
+        WHEN attempt_count + 1 >= :maxAttempts THEN NULL
+        ELSE NOW() + make_interval(secs => LEAST(:backoff_base * POWER(2, attempt_count + 1)::int, :backoff_cap))
+    END
+WHERE id = :id
 ```
+
+Delay doubles on each attempt (`backoffBase * 2^attempt`), capped at `backoffCap` seconds. Both values are configurable — see [Global Configuration](#global-configuration) below. When `attempt_count` reaches `maxAttempts`, the row is marked `failed` and `next_attempt_at` is cleared — it will not be picked up again by the relay and requires the `vortos:outbox:replay` command.
 
 </Step>
 
@@ -156,7 +167,7 @@ The outbox relay runs as a separate long-lived process alongside your consumers.
 
 ```ini title="docker/worker/supervisord.conf"
 [program:outbox-relay]
-command=php /var/www/html/bin/console tekton:outbox:relay
+command=php /var/www/html/bin/console vortos:outbox:relay
 autostart=true
 autorestart=true
 startsecs=3
@@ -167,10 +178,69 @@ stderr_logfile=/var/log/supervisor/outbox-relay.err.log
 Or run manually:
 
 ```bash
-php bin/console tekton:outbox:relay
-php bin/console tekton:outbox:relay --batch-size=50
-php bin/console tekton:outbox:relay --sleep-ms=100
+php bin/console vortos:outbox:relay
+php bin/console vortos:outbox:relay --batch-size=50
+php bin/console vortos:outbox:relay --sleep-ms=100
+
+# dry run — lists pending rows without producing to Kafka
+php bin/console vortos:outbox:relay --dry-run
 ```
+
+## Global Configuration
+
+Outbox infrastructure settings are configured globally in your bootstrap via `VortosMessagingConfig`:
+
+```php
+use Vortos\Messaging\DependencyInjection\VortosMessagingConfig;
+
+$config = new VortosMessagingConfig();
+
+$config->outbox()
+    ->table('vortos_outbox')       // default — must match the table in your migration
+    ->maxAttempts(5)               // default — rows failing beyond this are marked 'failed'
+    ->backoffBase(30)              // default — initial backoff in seconds, doubles each attempt
+    ->backoffCap(3600);            // default — backoff ceiling in seconds (1 hour)
+```
+
+These defaults are production-ready for most workloads. Tune `maxAttempts` and the backoff values to match your Kafka SLA and downstream service recovery times.
+
+## Replaying Failed Outbox Rows
+
+When a relay attempt exhausts `maxAttempts`, the row is marked `status = 'failed'` and will not be picked up by the relay again. Use `vortos:outbox:replay` to reset these rows back to pending so the relay will retry them:
+
+```bash
+# inspect what will be replayed without making changes
+php bin/console vortos:outbox:replay --dry-run
+
+# replay all failed rows
+php bin/console vortos:outbox:replay
+
+# replay up to 50 rows (default: all)
+php bin/console vortos:outbox:replay --limit=50
+
+# replay only rows for a specific transport
+php bin/console vortos:outbox:replay --transport=user.events
+```
+
+```
+Found 3 failed outbox row(s).
+
+  • 019d4784-7b26-...  |  UserCreatedEvent  →  user.events  (attempts: 5)
+  • 019d4784-93cf-...  |  OrderPlacedEvent  →  orders.placed  (attempts: 5)
+  • 019d4785-1abc-...  |  UserCreatedEvent  →  user.events  (attempts: 5)
+
+Reset: 3  Dry run: false
+```
+
+The command resets `status` back to `pending`, clears `attempt_count` to `0`, and nulls `failure_reason` and `next_attempt_at`. The relay picks the rows up on the next poll cycle.
+
+<Callout type="info" title="FOR UPDATE SKIP LOCKED on Replay">
+`vortos:outbox:replay` uses `SELECT ... FOR UPDATE SKIP LOCKED` when fetching failed rows. Running multiple replay workers in parallel is safe — each locks a non-overlapping batch.
+</Callout>
+
+<Callout type="warn" title="Fix the Root Cause First">
+Resetting failed rows without fixing the underlying problem — Kafka unreachable, serialization error, misconfigured transport — will cause them to fail again and hit `maxAttempts` a second time. Investigate `failure_reason` before replaying.
+</Callout>
 
 ## Transaction Ownership
 
@@ -214,11 +284,11 @@ Check for stuck or failed outbox rows:
 
 ```sql
 -- Pending rows older than 5 minutes (relay may be down)
-SELECT COUNT(*) FROM tekton_outbox
+SELECT COUNT(*) FROM vortos_outbox
 WHERE status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes';
 
 -- Failed rows that need attention
-SELECT * FROM tekton_outbox
+SELECT * FROM vortos_outbox
 WHERE status = 'failed'
 ORDER BY created_at DESC
 LIMIT 20;

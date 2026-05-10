@@ -128,9 +128,16 @@ Temporal permissions are stored in Redis:
 Key:   temporal_perm:{userId}:{permission}
 Value: {"expires_at": 1719532800}
 TTL:   seconds until expiry
+
+Index: temporal_perms:{userId}   ← set of active permission names
+TTL:   extended to the longest active grant, never shrunk
 ```
 
-Redis auto-expires the key when the TTL reaches zero. No cleanup job is needed. The `isValid()` check simply calls `Redis::exists()` — if the key is gone, access is denied.
+Redis auto-expires each permission key when its TTL reaches zero. No cleanup job is needed. The `isValid()` check calls `Redis::exists()` — if the key is gone, access is denied.
+
+The index set is used by `activeGrantsForUser()` to enumerate all grants for a user in one round-trip. Existence for each member is batch-checked via a pipeline — no N+1 Redis calls. Expired entries are lazily removed from the index in the same pass.
+
+The index TTL is only ever extended when a new grant is longer-lived than the current TTL — adding a short-lived grant never shrinks the index TTL and never causes longer-lived grants to disappear from enumeration.
 
 <Callout type="warn" title="Redis Restart and Temporal Permissions">
 Temporal permissions are stored only in Redis. A Redis restart clears all grants. For production, consider storing grants in a database as the source of truth and using Redis as a cache:

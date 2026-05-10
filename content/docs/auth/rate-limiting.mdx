@@ -16,18 +16,29 @@ All `#[RateLimit]` attributes are scanned at compile time by `RateLimitCompilerP
 
 ## How It Works
 
+`RateLimitMiddleware` runs as two separate listeners to handle scope ordering correctly:
+
 ```
 HTTP Request
     │
     ▼
-RateLimitMiddleware (priority 7 — before auth)
+priority 7: RateLimitMiddleware (IP + Global scopes — before auth)
     ├── Lookup controller in compile-time route map
-    ├── For each rule: resolve policy, compute key, check Redis counter
+    ├── For each IP/Global rule: resolve policy, compute key, check Redis counter
+    ├── Counter within limit → increment and continue
+    └── Counter exceeded → 429 + Retry-After header
+    │
+    ▼
+priority 6: AuthMiddleware — validate token, set identity
+    │
+    ▼
+priority 4: RateLimitMiddleware (User scope — after auth)
+    ├── For each User rule: keyed on resolved user ID
     ├── Counter within limit → increment and continue
     └── Counter exceeded → 429 + Retry-After header
 ```
 
-Running at priority 7 — before `AuthMiddleware` at priority 6 — means IP-based rate limits protect unauthenticated routes too.
+IP-scoped and Global-scoped limits run at priority 7 — before `AuthMiddleware` — so they protect unauthenticated routes such as `/api/auth/login`. User-scoped limits run at priority 4 — after auth — so the real user ID is available for per-user bucketing.
 
 ## Implement a Policy
 
