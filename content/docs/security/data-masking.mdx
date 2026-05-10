@@ -1,0 +1,223 @@
+---
+title: Data Masking
+description: Monolog processor that automatically redacts PII from log context and extra arrays — passwords, tokens, credit cards, and custom sensitive fields — using configurable masking strategies.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Data Masking
+
+Logs are a critical operational tool — but they are also a frequent source of data breaches. Passwords, JWT tokens, credit card numbers, and social security numbers can easily end up in log output when developers log request payloads or user objects during debugging.
+
+Data masking intercepts log records before they are written and replaces sensitive values with redacted representations. Vortos implements this as a [Monolog processor](https://github.com/Seldaek/monolog/blob/main/doc/02-handlers-formatters-processors.md#processors) — a callable that transforms each `LogRecord` before it reaches any handler.
+
+**Reference:** [Monolog — Processors](https://github.com/Seldaek/monolog/blob/main/doc/02-handlers-formatters-processors.md#processors) | [OWASP — Logging Cheat Sheet](https://cheatsheats.owasp.org/cheatsheets/Logging_Cheat_Sheet.html)
+
+<Callout type="info" title="Opt-In — Zero Overhead When Disabled">
+`DataMaskingProcessor` is not registered unless `$config->dataMasking()->enabled(true)` is set. When disabled, nothing is injected into Monolog's processor stack.
+</Callout>
+
+## Enabling Data Masking
+
+```php title="config/security.php"
+use Vortos\Security\Masking\Strategy\MaskPartialStrategy;
+use Vortos\Security\Masking\Strategy\MaskAllStrategy;
+
+$config->dataMasking()
+    ->enabled(true)
+    ->defaultStrategy(MaskPartialStrategy::class) // or MaskAllStrategy / MaskHashStrategy
+    ->allChannels(false) // true = mask PII in ALL log channels, not just 'security'
+;
+```
+
+When `allChannels(false)` (default), the processor is added to the `security` log channel only — security events are masked but application debug logs are unaffected. Set to `true` to mask PII across all channels.
+
+## Built-In Sensitive Keys
+
+The following keys are masked automatically — wherever they appear in log context or extra arrays, at any nesting depth:
+
+```
+password, passwd, pass, secret, token, access_token, refresh_token,
+api_key, apikey, api_secret, authorization, credit_card, card_number,
+cvv, cvc, ssn, social_security_number, private_key, jwt
+```
+
+Key matching is case-insensitive (`Password`, `PASSWORD`, `password` all match).
+
+## Masking Strategies
+
+### `MaskAllStrategy`
+
+Replaces the value entirely with `***`. Use for values that should never appear in any form.
+
+```
+"password": "MyS3cur3P@ss!" → "password": "***"
+"jwt": "eyJhbGciOi..."     → "jwt": "***"
+```
+
+### `MaskPartialStrategy` (default)
+
+Shows enough to identify the type of value while hiding the sensitive parts.
+
+- **Emails:** `john.doe@example.com` → `jo***@ex***.com`
+- **Other strings:** `SuperSecret99!` → `Su***9!`
+
+Useful for debugging — you can confirm the right user's token was used without exposing the actual value.
+
+### `MaskHashStrategy`
+
+Replaces the value with a truncated SHA-256 hash prefix:
+
+```
+"token": "eyJhbGciOi..." → "token": "sha256:8d969eef6e..."
+```
+
+Useful when you want correlation across log entries (e.g., confirm the same token was used in two requests) without storing the actual token.
+
+## Custom Sensitive Keys
+
+Register additional keys at configuration time:
+
+```php
+$config->dataMasking()
+    ->enabled(true)
+    ->defaultStrategy(MaskPartialStrategy::class)
+    ->sensitiveKeys([
+        'national_id'   => MaskAllStrategy::class,
+        'health_record' => MaskAllStrategy::class,
+        'phone_number'  => MaskPartialStrategy::class,
+    ])
+;
+```
+
+Keys added here are merged with the built-in list. You can override the strategy for individual keys.
+
+## `#[Sensitive]` Attribute on DTOs
+
+Mark DTO or entity properties with `#[Sensitive]` to document which fields contain PII. The `DataMaskingProcessor` checks object keys in log context against the property names of the serialized object.
+
+```php
+use Vortos\Security\Masking\Attribute\Sensitive;
+use Vortos\Security\Masking\Strategy\MaskAllStrategy;
+
+final class UserDto
+{
+    public function __construct(
+        public readonly string $id,
+        public readonly string $email,
+        #[Sensitive(strategy: MaskAllStrategy::class)]
+        public readonly string $password,
+        #[Sensitive]                                    // uses default strategy
+        public readonly string $phoneNumber,
+    ) {}
+}
+```
+
+When a `UserDto` is logged as part of a context array, `password` and `phoneNumber` are masked according to their declared strategies.
+
+## How the Processor Works
+
+```
+Logger::info('User logged in', ['user' => $user, 'token' => $token])
+    │
+    ▼ DataMaskingProcessor::__invoke(LogRecord $record): LogRecord
+    │   ├── maskArray($record->context)
+    │   │     ├── foreach key in array:
+    │   │     │     ├── key in sensitiveKeys? → mask value
+    │   │     │     ├── value is array? → recurse
+    │   │     │     └── value is object? → mask matching property values
+    │   │     └── return masked context
+    │   └── maskArray($record->extra) — same process
+    │
+    ▼ Masked LogRecord passed to handlers
+    │
+    ▼ Written to log file / stdout / Graylog — PII never reaches the output
+```
+
+The processor does not mutate the original data — it creates a new `LogRecord` with masked copies.
+
+## What the Output Looks Like
+
+**Before masking:**
+```json
+{
+  "message": "Login attempt",
+  "context": {
+    "email": "alice@example.com",
+    "password": "MyP@ssword99!",
+    "remember_token": "abc123def456"
+  }
+}
+```
+
+**After masking (MaskPartialStrategy):**
+```json
+{
+  "message": "Login attempt",
+  "context": {
+    "email": "al***@ex***.com",
+    "password": "***",
+    "remember_token": "ab***56"
+  }
+}
+```
+
+## Verifying Data Masking Is Working
+
+**Write a test log entry and inspect the output:**
+
+```php
+$this->logger->info('Test masking', [
+    'password' => 'SuperSecret123!',
+    'email'    => 'test@example.com',
+    'safe_key' => 'this is fine',
+]);
+```
+
+Tail the security log:
+```bash
+tail -f var/log/security.log
+```
+
+Confirm `password` is masked and `safe_key` is untouched.
+
+**Unit test the processor directly:**
+
+```php
+use Vortos\Security\Masking\DataMaskingProcessor;
+use Vortos\Security\Masking\Strategy\MaskAllStrategy;
+
+$processor = new DataMaskingProcessor(new MaskAllStrategy());
+$record = new \Monolog\LogRecord(
+    datetime: new \DateTimeImmutable(),
+    channel: 'test',
+    level: \Monolog\Level::Info,
+    message: 'test',
+    context: ['password' => 'secret123', 'username' => 'alice'],
+    extra: [],
+);
+
+$result = $processor($record);
+
+assertEquals('***', $result->context['password']);
+assertEquals('alice', $result->context['username']); // not masked
+```
+
+## Troubleshooting
+
+**Sensitive values still appearing in logs.**
+
+Confirm `->enabled(true)` is set in your active config and that the config file is being loaded (check that `config/security.php` exists and `SecurityExtension` is resolving it). Also confirm you are logging to a channel that has the processor attached — if `allChannels(false)`, only the `security` channel is masked.
+
+**Custom keys not being masked.**
+
+Keys are compared case-insensitively against the built-in list plus any keys configured via `sensitiveKeys()`. If the key in your log context is `phone` but you registered `phone_number`, it will not match. Register the exact key as it appears in your log context.
+
+**Deeply nested values not masked.**
+
+`maskArray()` recurses into nested arrays. However, if the sensitive value is inside a JSON-encoded string (e.g., `'body' => '{"password":"secret"}'`), the processor sees a plain string, not an array — it cannot introspect the JSON. Log structured arrays, not pre-serialized JSON strings.
+
+**Performance impact.**
+
+Each log record's context is traversed once. For typical log records with < 20 keys, this is under 1 µs. If you are logging very large arrays (hundreds of keys), consider logging a summary instead. The overhead is negligible for normal use.

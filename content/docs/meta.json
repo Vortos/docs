@@ -5,6 +5,7 @@
     "setup",
     "auth",
     "authorization",
+    "security",
     "messaging",
     "cqrs",
     "persistence",

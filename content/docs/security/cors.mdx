@@ -1,0 +1,173 @@
+---
+title: CORS
+description: Cross-Origin Resource Sharing — preflight handling and CORS header injection with per-route overrides via #[Cors].
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# CORS
+
+Cross-Origin Resource Sharing (CORS) is a browser security mechanism that restricts which origins can make HTTP requests to your API. When a browser makes a cross-origin request (different domain, port, or scheme), it first sends a preflight `OPTIONS` request to ask the server if the real request is permitted. The server responds with CORS headers telling the browser what it will and won't allow.
+
+Without correct CORS headers, every fetch from your frontend to your API fails in the browser with a network error — even if the API is working perfectly.
+
+**Reference:** [MDN — CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS) | [Fetch spec — CORS protocol](https://fetch.spec.whatwg.org/#http-cors-protocol)
+
+<Callout type="info" title="Browser-Only Enforcement">
+CORS is enforced by browsers, not servers. Curl, Postman, and server-to-server requests are never blocked by CORS — they simply ignore the headers. CORS is not a security boundary for APIs — it only controls which browser-side JavaScript can read responses.
+</Callout>
+
+## How It Works
+
+`CorsMiddleware` subscribes to two kernel events:
+
+```
+Inbound Request
+    │
+    ▼ priority 95: CorsMiddleware (KernelEvents::REQUEST)
+    │   ├── Is this an OPTIONS preflight?
+    │   │       ├── YES → validate origin, return 204 No Content + CORS headers (short-circuit)
+    │   │       └── NO  → validate origin, set allowed flag, continue
+    │
+    ▼ [rest of middleware chain — auth, controller, etc.]
+    │
+    ▼ priority 95: CorsMiddleware (KernelEvents::RESPONSE)
+    │   └── If origin was allowed → append CORS headers to the real response
+    │
+    ▼ Delivered to browser
+```
+
+For simple requests (GET, POST with `Content-Type: application/json`), the browser skips the preflight and goes straight to the real request. The middleware appends CORS headers to the actual response.
+
+For complex requests (custom headers, methods other than GET/POST, `credentials: true`), the browser sends an OPTIONS preflight first. `CorsMiddleware` intercepts it at priority 95 on `REQUEST`, builds the 204 response, and returns it — the controller is never called.
+
+## Global Configuration
+
+```php title="config/security.php"
+$config->cors()
+    ->origins(['https://app.example.com', 'https://admin.example.com'])
+    ->methods(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'])
+    ->allowedHeaders(['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token'])
+    ->exposedHeaders(['X-RateLimit-Remaining', 'X-Request-Id'])
+    ->credentials(false)
+    ->maxAge(3600);
+```
+
+| Option | Description |
+|---|---|
+| `origins` | Allowed origins. Use exact URLs — no trailing slash. |
+| `methods` | Allowed HTTP methods. Always include `OPTIONS` for preflight. |
+| `allowedHeaders` | Headers the browser is permitted to send. |
+| `exposedHeaders` | Headers the browser is permitted to read from the response. |
+| `credentials` | Allow `credentials: 'include'` (cookies, HTTP auth). Never combine with `origins(['*'])`. |
+| `maxAge` | How long (seconds) the browser may cache the preflight response. Default 3600. |
+
+<Callout type="warn" title="Credentials + Wildcard Origin">
+Setting `credentials(true)` with `origins(['*'])` is rejected by all browsers. When `credentials` is true, you must list each origin explicitly. This is by design — `Access-Control-Allow-Origin: *` with credentials would defeat the entire purpose of CORS.
+</Callout>
+
+## Per-Route Override
+
+Use `#[Cors]` on a controller class or method to override the global config for that route. All properties are nullable — only the ones you set override the global values; unset properties inherit from the global config.
+
+```php
+use Vortos\Security\Cors\Attribute\Cors;
+
+// Allow additional origin just for this controller
+#[Cors(origins: ['https://partner.example.com', 'https://app.example.com'])]
+final class PartnerApiController
+{
+    // ...
+}
+
+// Allow credentials for a specific endpoint
+#[Cors(credentials: true, origins: ['https://app.example.com'])]
+public function currentUser(Request $request): Response
+{
+    // ...
+}
+
+// Restrict to GET-only for a read-only endpoint
+#[Cors(methods: ['GET', 'OPTIONS'])]
+final class PublicStatsController { ... }
+```
+
+<Callout type="info" title="Wildcard Subdomain Matching">
+Origins support wildcard subdomain patterns. `https://*.example.com` will match any subdomain of `example.com`. The middleware checks this using a regex derived at compile time from the configured origin list.
+</Callout>
+
+## Dev vs Prod
+
+```php title="config/dev/security.php"
+return static function (VortosSecurityConfig $config): void {
+    // Allow all origins in dev — Postman, frontend on any port, etc.
+    $config->cors()->origins(['*']);
+};
+```
+
+```php title="config/prod/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->cors()
+        ->origins(['https://app.squaura.com'])
+        ->credentials(false);
+};
+```
+
+## The `Vary: Origin` Header
+
+The middleware always sets `Vary: Origin` on responses that include CORS headers. This tells caches (CDN, browser cache, reverse proxy) that the response may differ based on the `Origin` header, preventing cached responses from being served to the wrong origin.
+
+Without `Vary: Origin`, a CDN might cache a response with `Access-Control-Allow-Origin: https://app.example.com` and serve it to `https://evil.example.com` — which then sees the allow header and proceeds.
+
+## Verifying CORS Is Working
+
+### Browser DevTools
+
+Open DevTools → Network. Make a cross-origin request from your frontend. Look for:
+- The preflight OPTIONS request (if any) — should return 204 with `Access-Control-Allow-*` headers
+- The actual request — should return 200 with `Access-Control-Allow-Origin: https://your-frontend.com`
+
+### curl
+
+Simulate a preflight:
+
+```bash
+curl -I -X OPTIONS https://api.example.com/api/users \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: Content-Type, Authorization"
+```
+
+Expected:
+```
+HTTP/2 204
+access-control-allow-origin: https://app.example.com
+access-control-allow-methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+access-control-allow-headers: Content-Type, Authorization
+access-control-max-age: 3600
+vary: Origin
+```
+
+Simulate a simple request:
+
+```bash
+curl -I https://api.example.com/api/users \
+  -H "Origin: https://app.example.com"
+```
+
+Expected response includes `access-control-allow-origin: https://app.example.com`.
+
+## Troubleshooting
+
+**Browser shows "CORS error" / "No 'Access-Control-Allow-Origin' header".**
+The origin making the request is not in your `origins` list, or the list is empty. Check that the exact origin (scheme + host + port) matches — `https://app.example.com` is different from `http://app.example.com` and `https://app.example.com:3000`. Update your `origins` config or add `#[Cors(origins: [...])]` to the specific controller.
+
+**Preflight returns 401 instead of 204.**
+An upstream middleware (AuthMiddleware or IpFilterMiddleware) is rejecting the OPTIONS request before CorsMiddleware gets to respond. CORS preflight requests do not carry credentials, so `AuthMiddleware` must not reject OPTIONS requests. Check that your auth middleware skips unauthenticated OPTIONS requests (the Vortos `AuthMiddleware` does this by default).
+
+**`credentials: true` requests still failing.**
+Confirm that `credentials(false)` is not set in a prod override. Also confirm the browser-side `fetch()` call includes `credentials: 'include'`. Both sides must agree — the server must send `Access-Control-Allow-Credentials: true` and the browser must request it.
+
+**Cloudflare / CDN caching wrong CORS response.**
+Ensure `Vary: Origin` appears in your response headers (the middleware sets it automatically). If it's missing, the CDN is stripping it — configure your CDN to preserve the `Vary` header.

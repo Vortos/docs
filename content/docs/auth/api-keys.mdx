@@ -1,0 +1,316 @@
+---
+title: API Keys (M2M)
+description: Machine-to-machine API key authentication — generate scoped keys, validate them with #[RequiresApiKey], revoke them, and choose between Redis (fast) or PostgreSQL (audit trail) storage.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# API Keys (M2M)
+
+API keys are the standard authentication mechanism for machine-to-machine (M2M) communication — server-to-server calls, CI/CD pipelines, backend integrations, and third-party partner access. Unlike JWTs, API keys are long-lived opaque tokens that identify a specific application or integration, not a human user.
+
+Vortos API keys:
+- Are prefixed with `vrtk_` for easy identification in logs and grep output
+- Are stored hashed (SHA-256) — the server never holds the plaintext key after generation
+- Support scopes (e.g., `read:athletes`, `write:records`) for granular access control
+- Support expiry dates
+- Can be backed by Redis (fast lookup) or PostgreSQL (audit trail + management UI)
+
+<Callout type="info" title="Compile-Time Route Map">
+`#[RequiresApiKey]` attributes are scanned at compile time by `ApiKeyCompilerPass`. At runtime, `ApiKeyAuthMiddleware` does a single array lookup — zero reflection.
+</Callout>
+
+## How It Works
+
+```
+Inbound Request with 'Authorization: ApiKey vrtk_...' header
+    │
+    ▼ priority 6: ApiKeyAuthMiddleware (same level as AuthMiddleware)
+    │   ├── Header present and starts with 'ApiKey '?
+    │   │       └── NO → skip (pass to AuthMiddleware for JWT handling)
+    │   ├── SHA-256 hash the raw key
+    │   ├── Look up hash in storage (Redis or database)
+    │   ├── Key not found / revoked / expired → 401
+    │   ├── Route has #[RequiresApiKey(scopes: [...])]?
+    │   │       └── YES → key has all required scopes? NO → 403
+    │   ├── Set request attributes: _api_key_record, _api_key_user_id, _api_key_scopes
+    │   └── Continue to controller
+```
+
+JWT and API Key auth coexist at priority 6. The middleware that matches the request's Authorization header format claims the request — if neither matches, the next middleware (AuthorizationMiddleware) decides whether the route requires authentication.
+
+## Generating API Keys
+
+Use `ApiKeyService` in a command handler or admin controller:
+
+```php
+use Vortos\Auth\ApiKey\ApiKeyService;
+
+final class CreateApiKeyCommandHandler
+{
+    public function __construct(
+        private readonly ApiKeyService $apiKeys,
+    ) {}
+
+    public function handle(CreateApiKeyCommand $command): string
+    {
+        // Returns the raw key — only time it's visible
+        $rawKey = $this->apiKeys->generate(
+            name:      $command->name,         // e.g., "Squaura Analytics Service"
+            userId:    $command->userId,        // the user or service account this key belongs to
+            scopes:    $command->scopes,        // e.g., ['read:athletes', 'read:records']
+            expiresAt: $command->expiresAt,     // null = never expires
+        );
+
+        // Store or display rawKey now — it will never be retrievable again
+        return $rawKey;
+    }
+}
+```
+
+The raw key format: `vrtk_` + 43 characters of URL-safe base64 (256 bits of entropy).
+
+<Callout type="warn" title="Show the Key Once">
+The plaintext key is returned only at generation time. After that, only its SHA-256 hash is stored. Display it to the user immediately and explain it cannot be retrieved again. If lost, revoke and regenerate.
+</Callout>
+
+## Protecting Routes with `#[RequiresApiKey]`
+
+```php
+use Vortos\Auth\ApiKey\Attribute\RequiresApiKey;
+
+// Require a valid API key — any scope
+#[RequiresApiKey]
+final class DataExportController { ... }
+
+// Require specific scopes — key must have ALL listed scopes
+#[RequiresApiKey(scopes: ['read:athletes', 'read:records'])]
+final class AthleteFeedController { ... }
+
+// Method-level — only this action requires an API key
+final class AdminController
+{
+    #[RequiresApiKey(scopes: ['admin:write'])]
+    public function bulkImport(Request $request): Response { ... }
+
+    public function dashboard(Request $request): Response { ... }
+}
+```
+
+## Reading Key Data in a Controller
+
+When an API key request succeeds, the middleware sets request attributes you can read in your controller:
+
+```php
+final class DataExportController
+{
+    public function export(Request $request): Response
+    {
+        $keyRecord = $request->attributes->get('_api_key_record'); // ApiKeyRecord
+        $userId    = $request->attributes->get('_api_key_user_id');
+        $scopes    = $request->attributes->get('_api_key_scopes');  // array
+
+        // Use userId to load the associated user if needed
+        $user = $this->users->find($userId);
+
+        return new JsonResponse([
+            'key_name' => $keyRecord->name,
+            'scopes'   => $scopes,
+        ]);
+    }
+}
+```
+
+## `ApiKeyRecord`
+
+The `ApiKeyRecord` value object carries all metadata about a key:
+
+```php
+use Vortos\Auth\ApiKey\ApiKeyRecord;
+
+$record->id;           // string UUID
+$record->userId;       // string — owner's user ID
+$record->name;         // string — human-readable label
+$record->hashedKey;    // string — SHA-256 hash (never the plaintext)
+$record->scopes;       // array<string>
+$record->active;       // bool
+$record->createdAt;    // \DateTimeImmutable
+$record->expiresAt;    // ?\DateTimeImmutable
+$record->lastUsedAt;   // ?\DateTimeImmutable
+
+$record->isExpired();            // bool
+$record->hasScope('read:foo');   // bool
+$record->hasAllScopes(['a','b']); // bool
+```
+
+## Revoking Keys
+
+```php
+$this->apiKeys->revoke($keyId);
+```
+
+Revocation marks the key as inactive in storage. Subsequent requests using the revoked key receive `401 Unauthorized`.
+
+## Listing Keys for a User
+
+```php
+$keys = $this->apiKeys->listForUser($userId);
+// Returns array<ApiKeyRecord> — useful for a key management UI
+```
+
+## Storage Backends
+
+### Redis (default — fast lookup)
+
+```
+apikey:hash:{sha256}   → JSON-encoded ApiKeyRecord     (expires at key's expiresAt)
+apikey:user:{userId}   → SET of key IDs               (for listForUser())
+apikey:id:{keyId}      → sha256 hash (reverse lookup)
+```
+
+Redis lookup is O(1) — `GET apikey:hash:{hash}` returns the key record directly. No joins, no SQL.
+
+### PostgreSQL (opt-in — audit trail)
+
+```sql
+CREATE TABLE api_keys (
+    id          UUID PRIMARY KEY,
+    user_id     UUID NOT NULL,
+    name        VARCHAR(255) NOT NULL,
+    hashed_key  VARCHAR(64) NOT NULL UNIQUE,  -- SHA-256 hex
+    scopes      JSONB NOT NULL DEFAULT '[]',
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL,
+    expires_at  TIMESTAMPTZ,
+    last_used_at TIMESTAMPTZ
+);
+```
+
+Use the database backend when you need:
+- Full audit trail of key creation, usage, and revocation
+- Management UI with search/filter
+- Reporting on key activity
+
+Configure in `AuthExtension` — the backend is chosen based on what's available in the container (Redis preferred, DBAL fallback).
+
+## Scopes
+
+Scopes are arbitrary strings — you define the convention. A common pattern:
+
+```
+read:{resource}    — read-only access to a resource type
+write:{resource}   — create/update access
+delete:{resource}  — delete access
+admin:{resource}   — full admin control
+```
+
+Examples:
+```php
+['read:athletes', 'read:records']       // read-only analytics key
+['write:athletes', 'write:records']     // import service key
+['admin:*']                             // internal super-key (use sparingly)
+```
+
+Scope matching is exact string equality — `read:athletes` does not imply `read:records`. There is no wildcard expansion at runtime; define the exact scopes a key needs.
+
+## Client Usage
+
+API key clients send the key in the `Authorization` header:
+
+```http
+POST /api/athletes HTTP/1.1
+Authorization: ApiKey vrtk_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789AbC
+Content-Type: application/json
+```
+
+Most HTTP clients support this directly:
+
+```bash
+curl -X GET https://api.example.com/api/athletes \
+  -H "Authorization: ApiKey vrtk_yourkey"
+```
+
+```python
+import httpx
+client = httpx.Client(headers={"Authorization": "ApiKey vrtk_yourkey"})
+response = client.get("https://api.example.com/api/athletes")
+```
+
+## Verifying API Key Auth Is Working
+
+<Steps>
+<Step>
+**Generate a test key.**
+
+```php
+$rawKey = $this->apiKeys->generate(
+    name: 'Test Key',
+    userId: 'test-user-id',
+    scopes: ['read:athletes'],
+);
+// vrtk_...
+```
+</Step>
+<Step>
+**Use the key in a request.**
+
+```bash
+curl -H "Authorization: ApiKey vrtk_..." https://api.example.com/api/athletes
+```
+
+Expected: `HTTP 200`.
+</Step>
+<Step>
+**Confirm rejection without a key.**
+
+```bash
+curl https://api.example.com/api/athletes
+```
+
+Expected: `HTTP 401`.
+</Step>
+<Step>
+**Confirm scope enforcement.**
+
+Use a key with `read:athletes` on an endpoint that requires `write:athletes`:
+
+```bash
+curl -X POST -H "Authorization: ApiKey vrtk_read-only-key" \
+  https://api.example.com/api/athletes
+```
+
+Expected: `HTTP 403`.
+</Step>
+<Step>
+**Revoke the key and confirm rejection.**
+
+```php
+$this->apiKeys->revoke($keyId);
+```
+
+```bash
+curl -H "Authorization: ApiKey vrtk_revokedkey" https://api.example.com/api/athletes
+```
+
+Expected: `HTTP 401`.
+</Step>
+</Steps>
+
+## Troubleshooting
+
+**`401` even with a correct key.**
+
+Confirm the header is exactly `Authorization: ApiKey vrtk_...` (capital A in ApiKey, space between scheme and key). The middleware strips the `ApiKey ` prefix and hashes the remainder — any formatting difference produces a different hash.
+
+**Key validates locally but fails in production.**
+
+Check that the Redis or database instance used in production has the key stored. If you generated the key against a local Redis and production uses a separate Redis, they do not share data.
+
+**`403` scope mismatch — key has the scope but is still rejected.**
+
+Scope matching is exact string equality and case-sensitive. `Read:Athletes` does not match `read:athletes`. Confirm scopes were stored exactly as expected using `$this->apiKeys->listForUser($userId)` and inspecting the `scopes` array on the returned `ApiKeyRecord`.
+
+**Redis key expires too early.**
+
+Keys with an `expiresAt` are stored in Redis with a TTL derived from `expiresAt - now`. If your server clock drifts or the key's expiry is in the past at creation time, the Redis key will expire immediately. Confirm `expiresAt` is a future date and your server clock is NTP-synced.

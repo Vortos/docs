@@ -1,0 +1,265 @@
+---
+title: Security Headers
+description: HTTP security headers — CSP, HSTS, X-Frame-Options, Referrer-Policy, Permissions-Policy, and cross-origin isolation — applied to every response with zero runtime overhead.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Security Headers
+
+HTTP security headers are response headers that instruct the browser on how to behave when rendering your content. They are the first line of defence against a wide class of attacks — clickjacking, MIME confusion, cross-site scripting (via CSP), and protocol downgrade attacks (via HSTS). They cost nothing to apply and every modern browser respects them.
+
+`SecurityHeadersMiddleware` listens on `KernelEvents::RESPONSE` at priority 100 (outermost) and stamps every response with the configured header set. The header map is frozen at container compile time — the middleware simply iterates a plain `array<string, string>` at runtime. There is no per-request configuration, reflection, or branching.
+
+<Callout type="info" title="Compile-Time Header Map">
+The entire header set is computed once when the container is compiled and stored as a constructor argument. Runtime cost is a single `foreach` over a small array — typically under 1 µs.
+</Callout>
+
+## How It Works
+
+```
+HTTP Response (outbound)
+    │
+    ▼ priority 100: SecurityHeadersMiddleware
+    │   ├── foreach $this->headers as $name => $value
+    │   └──   $response->headers->set($name, $value)
+    │
+    ▼ Delivered to client
+```
+
+## Configuration
+
+```php title="config/security.php"
+use Vortos\Security\DependencyInjection\VortosSecurityConfig;
+
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()
+        // HSTS — forces HTTPS. Disable in dev, enable in prod only.
+        // ->hsts(maxAge: 31536000, includeSubDomains: true, preload: false)
+
+        // Clickjacking — prevents your page from being loaded in an iframe
+        ->xFrameOptions('DENY')
+
+        // MIME confusion — tells the browser to trust the declared Content-Type
+        ->xContentTypeOptions(true)
+
+        // Referrer leakage — controls what's sent in the Referer header
+        ->referrerPolicy('strict-origin-when-cross-origin')
+
+        // Permissions-Policy — restrict browser APIs (camera, mic, geolocation)
+        // ->permissionsPolicy(['camera' => [], 'microphone' => [], 'geolocation' => []])
+
+        // Content Security Policy — controls what resources the browser may load
+        // ->csp()
+        //     ->defaultSrc("'self'")
+        //     ->scriptSrc("'self'")
+        //     ->styleSrc("'self'")
+        //     ->imgSrc("'self'", 'data:')
+        //     ->reportUri('/csp-report')
+        //     ->reportOnly(true)
+    ;
+};
+```
+
+## Headers Reference
+
+### `Strict-Transport-Security` (HSTS)
+
+**Theory:** Tells the browser that this domain should only ever be contacted over HTTPS. Once a browser receives an HSTS header it will refuse plain HTTP connections for the declared `max-age` (even if the user types `http://`). The `preload` flag registers the domain with browser vendors' built-in HSTS lists.
+
+**Risk without it:** A network attacker can intercept the first plain HTTP request (SSL stripping) before the redirect fires.
+
+**Reference:** [MDN — Strict-Transport-Security](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Strict-Transport-Security) | [HSTS Preload](https://hstspreload.org)
+
+```php
+$config->headers()->hsts(
+    maxAge: 31536000,       // 1 year in seconds — don't lower this in prod
+    includeSubDomains: true, // extend to all subdomains
+    preload: true           // opt into browser vendor preload lists
+);
+```
+
+<Callout type="warn" title="Disable in Dev">
+Never enable HSTS in a dev environment without HTTPS. The browser will cache the directive and refuse plain HTTP for the entire `max-age` window — breaking your local setup. Set `->hsts(false)` in `config/dev/security.php`.
+</Callout>
+
+---
+
+### `X-Frame-Options`
+
+**Theory:** Controls whether the browser permits your page to be embedded in a `<frame>`, `<iframe>`, or `<object>`. Clickjacking attacks load your page in a transparent iframe on an attacker's site and trick users into clicking buttons they can't see.
+
+**Reference:** [MDN — X-Frame-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Frame-Options)
+
+| Value | Meaning |
+|---|---|
+| `DENY` | Never allow framing — recommended for APIs |
+| `SAMEORIGIN` | Allow framing only from the same origin |
+
+```php
+$config->headers()->xFrameOptions('DENY');
+```
+
+<Callout type="info" title="CSP Supersedes This">
+`Content-Security-Policy: frame-ancestors` is the modern replacement. Both can be set simultaneously for maximum browser compatibility.
+</Callout>
+
+---
+
+### `X-Content-Type-Options`
+
+**Theory:** When set to `nosniff`, the browser will not try to guess the content type from the response body. Without it, a browser that receives `Content-Type: text/plain` containing valid HTML or JavaScript may execute it — a MIME confusion attack.
+
+**Reference:** [MDN — X-Content-Type-Options](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Content-Type-Options)
+
+```php
+$config->headers()->xContentTypeOptions(true); // sets nosniff
+```
+
+---
+
+### `Referrer-Policy`
+
+**Theory:** Controls what URL is sent in the `Referer` header when a user navigates from your site to another. Without it, your full URL (including query strings with tokens or IDs) may be leaked to third-party servers via their access logs.
+
+**Reference:** [MDN — Referrer-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Referrer-Policy)
+
+| Value | Behaviour |
+|---|---|
+| `no-referrer` | Never send Referer |
+| `strict-origin-when-cross-origin` | Send full URL for same-origin, origin only for cross-origin HTTPS, nothing for cross-origin HTTP |
+| `same-origin` | Send full URL for same-origin only |
+
+```php
+$config->headers()->referrerPolicy('strict-origin-when-cross-origin');
+```
+
+---
+
+### `Permissions-Policy`
+
+**Theory:** Restricts which browser APIs (camera, microphone, geolocation, etc.) can be used by the page and any embedded iframes. An empty array for a feature means it is denied entirely.
+
+**Reference:** [MDN — Permissions-Policy](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Permissions-Policy)
+
+```php
+$config->headers()->permissionsPolicy([
+    'camera'      => [],         // deny camera access
+    'microphone'  => [],         // deny microphone access
+    'geolocation' => [],         // deny geolocation
+    'payment'     => ["'self'"], // allow payment API on same origin only
+]);
+```
+
+---
+
+### `Content-Security-Policy` (CSP)
+
+**Theory:** The most powerful security header. CSP defines a whitelist of approved sources for scripts, styles, images, fonts, and other resource types. It is the primary defence against Cross-Site Scripting (XSS) — even if an attacker injects a `<script>` tag, the browser refuses to execute it if the source is not whitelisted.
+
+CSP is complex. Start with `reportOnly(true)` to observe violations without breaking anything, then tighten.
+
+**Reference:** [MDN — CSP](https://developer.mozilla.org/en-US/docs/Web/HTTP/CSP) | [CSP Evaluator](https://csp-evaluator.withgoogle.com)
+
+```php
+$config->headers()->csp()
+    ->defaultSrc("'self'")               // default: same origin only
+    ->scriptSrc("'self'", "'nonce-abc'") // scripts: self + nonce
+    ->styleSrc("'self'")                 // styles: self only
+    ->imgSrc("'self'", 'data:')          // images: self + data URIs
+    ->fontSrc("'self'", 'https://fonts.gstatic.com')
+    ->connectSrc("'self'", 'https://api.example.com')
+    ->frameSrc("'none'")                 // no iframes at all
+    ->objectSrc("'none'")               // no plugins
+    ->upgradeInsecureRequests()          // rewrite http:// → https://
+    ->reportUri('/csp-report')          // POSTs violations here
+    ->reportOnly(true);                  // observe first, enforce later
+```
+
+<Callout type="warn" title="Report-Only First">
+Never deploy an enforcing CSP without first running in report-only mode. One missed source blocks a critical resource in production. Run `reportOnly(true)` for at least a week and monitor `/csp-report` before switching to enforcing mode.
+</Callout>
+
+---
+
+### Cross-Origin Isolation Headers
+
+**Theory:** These three headers isolate your origin from other origins at the browser level, enabling access to high-resolution timers and `SharedArrayBuffer` (required by some WebAssembly workloads). They are off by default because they break cross-origin resource loading unless each external resource opts in via `Cross-Origin-Resource-Policy`.
+
+**Reference:** [web.dev — Cross-Origin Isolation](https://web.dev/cross-origin-isolation-guide/)
+
+```php
+$config->headers()
+    ->crossOriginEmbedderPolicy('require-corp') // COEP — resources must opt-in
+    ->crossOriginOpenerPolicy('same-origin')    // COOP — isolate window context
+    ->crossOriginResourcePolicy('same-origin'); // CORP — only same-origin may load this
+```
+
+<Callout type="warn" title="Breaking Change">
+Enabling COEP (`require-corp`) will block any cross-origin resource that doesn't include `Cross-Origin-Resource-Policy: cross-origin`. Only enable these three together if you know your CDN and third-party dependencies support them.
+</Callout>
+
+---
+
+## Dev vs Prod
+
+```php title="config/dev/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()
+        ->hsts(false)               // never HSTS in dev
+        ->csp()->reportOnly(true);  // observe CSP violations, don't enforce
+};
+```
+
+```php title="config/prod/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()
+        ->hsts(maxAge: 31536000, includeSubDomains: true, preload: true)
+        ->csp()
+            ->defaultSrc("'self'")
+            ->scriptSrc("'self'")
+            ->styleSrc("'self'")
+            ->imgSrc("'self'", 'data:')
+            ->reportUri('/csp-report');
+};
+```
+
+## Verifying Headers Are Applied
+
+### Browser DevTools
+
+Open DevTools → Network → click any request → Headers tab → scroll to Response Headers. You should see `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`, and any CSP or HSTS headers you configured.
+
+### curl
+
+```bash
+curl -I https://your-api.example.com/api/ping
+```
+
+Expected output (partial):
+```
+HTTP/2 200
+x-frame-options: DENY
+x-content-type-options: nosniff
+referrer-policy: strict-origin-when-cross-origin
+strict-transport-security: max-age=31536000; includeSubDomains; preload
+```
+
+### Security Scanner
+
+Run your API through [Mozilla Observatory](https://observatory.mozilla.org) or [SecurityHeaders.com](https://securityheaders.com) to get a graded report of which headers are present and correctly configured.
+
+## Troubleshooting
+
+**Headers are missing from responses.**
+Check that `SecurityPackage` is loaded (confirm `security` appears in the compiled container's service list). Verify that `SecurityHeadersMiddleware` is registered as a `kernel.event_subscriber`. Ensure no other middleware is short-circuiting the response before priority 100 fires.
+
+**HSTS is blocking local development.**
+You enabled HSTS in dev. Set `->hsts(false)` in `config/dev/security.php`. If the browser has already cached the directive, open Chrome at `chrome://net-internals/#hsts`, find your domain, and delete the HSTS entry.
+
+**CSP is blocking resources in prod.**
+Switch to `reportOnly(true)` temporarily. Monitor `POST /csp-report` (log the raw request body in a simple controller). Add the missing source to the appropriate directive. Re-enable enforcing mode.
+
+**`Permissions-Policy` breaking embedded iframes.**
+Embedded iframes inherit the parent's Permissions-Policy. Add `"'src'"` to the relevant feature in your policy, or use `['geolocation' => ["'self'", "https://maps.example.com"]]` to allowlist specific origins.

@@ -13,6 +13,7 @@
     "feature-access",
     "quotas",
     "audit-logging",
-    "two-factor"
+    "two-factor",
+    "api-keys"
   ]
 }

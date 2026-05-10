@@ -1,0 +1,197 @@
+---
+title: Security Event Bus
+description: Internal event bus for CSRF violations, IP denials, signature failures, and suspicious requests — automatically wired to Logger and Metrics with opt-in listener support.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Security Event Bus
+
+When a security check fails — a CSRF token mismatch, an IP in the deny list, an invalid webhook signature — the security module fires a typed security event. These events are dispatched through `SecurityEventDispatcher`, which automatically logs them and increments Metrics counters. You can also attach your own listeners for custom alerting, rate limiting escalation, or audit trail entries.
+
+<Callout type="info" title="Lightweight — Not the Domain Event Bus">
+`SecurityEventDispatcher` is a simple in-process event bus, separate from the domain `MessageBus`. It has no Kafka/AMQP involvement. Security events are synchronous and local to the current request.
+</Callout>
+
+## Events
+
+| Event Class | Event Name | Fired When |
+|---|---|---|
+| `CsrfViolationEvent` | `security.csrf_violation` | CSRF token missing or mismatched |
+| `IpDeniedEvent` | `security.ip_denied` | Client IP rejected by allowlist or denylist |
+| `SignatureInvalidEvent` | `security.signature_invalid` | HMAC signature mismatch or replay detected |
+| `SuspiciousRequestEvent` | `security.suspicious_request` | General suspicious activity (reserved for custom use) |
+
+All events implement `SecurityEventInterface`:
+
+```php
+interface SecurityEventInterface
+{
+    public function eventName(): string;
+    public function context(): array; // structured data about the event
+}
+```
+
+### Event Context Data
+
+Each event carries relevant context:
+
+```php
+// CsrfViolationEvent
+[
+    'ip'         => '203.0.113.42',
+    'uri'        => '/api/posts',
+    'method'     => 'POST',
+    'user_agent' => 'Mozilla/5.0 ...',
+]
+
+// IpDeniedEvent
+[
+    'ip'         => '1.2.3.4',
+    'uri'        => '/api/admin/users',
+    'rule'       => 'global_denylist',  // or 'route_allowlist', 'route_denylist', 'global_allowlist'
+]
+
+// SignatureInvalidEvent
+[
+    'ip'       => '203.0.113.42',
+    'uri'      => '/api/webhooks/stripe',
+    'reason'   => 'signature_mismatch', // or 'replay_attack', 'missing_header'
+    'header'   => 'Stripe-Signature',
+]
+```
+
+## Automatic Logger Integration
+
+When the Logger module is installed, `SecurityEventDispatcher` logs all events to the `security` channel automatically:
+
+| Event | Log Level | Message |
+|---|---|---|
+| CSRF violation | `warning` | `security.csrf_violation` + context |
+| IP denied | `warning` | `security.ip_denied` + context |
+| Signature invalid | `error` | `security.signature_invalid` + context |
+| Suspicious request | `warning` | `security.suspicious_request` + context |
+
+No configuration is required — if `LoggerInterface` is in the container, the dispatcher uses it.
+
+## Automatic Metrics Integration
+
+When the Metrics module is installed, each security event increments a labelled counter:
+
+| Event | Metric Name |
+|---|---|
+| CSRF violation | `security_csrf_violations_total` |
+| IP denied | `security_ip_denied_total` |
+| Signature invalid | `security_signature_failures_total` |
+| Suspicious request | `security_suspicious_requests_total` |
+
+These counters are exposed via the standard Metrics endpoint (`/metrics` in Prometheus format) and can be graphed or alerted on.
+
+## Custom Listeners
+
+Register your own listeners to react to security events — fire an alert, add to a blocklist, notify your security team:
+
+```php
+use Vortos\Security\Event\SecurityEventDispatcher;
+use Vortos\Security\Event\IpDeniedEvent;
+use Vortos\Security\Event\CsrfViolationEvent;
+
+// In a service or command handler
+$dispatcher->addListener(
+    IpDeniedEvent::EVENT_NAME,
+    function (IpDeniedEvent $event): void {
+        // e.g., add the IP to a temporary Redis blocklist
+        $this->redis->setex('blocklist:' . $event->context()['ip'], 3600, '1');
+    }
+);
+
+// Listen to all security events
+$dispatcher->addListener('*', function (SecurityEventInterface $event): void {
+    $this->alerting->send('security-alerts', [
+        'event'   => $event->eventName(),
+        'context' => $event->context(),
+    ]);
+});
+```
+
+<Callout type="info" title="Wildcard Listener">
+Passing `'*'` as the event name registers a listener for all security events. This is useful for a single alerting handler that routes events to Slack, PagerDuty, or any other system.
+</Callout>
+
+## Firing Custom Events
+
+You can dispatch `SuspiciousRequestEvent` from your own code when you detect abnormal behaviour:
+
+```php
+use Vortos\Security\Event\SecurityEventDispatcher;
+use Vortos\Security\Event\SuspiciousRequestEvent;
+
+final class LoginController
+{
+    public function __construct(
+        private readonly SecurityEventDispatcher $securityEvents,
+    ) {}
+
+    public function login(Request $request): Response
+    {
+        if ($this->isSuspiciousLoginPattern($request)) {
+            $this->securityEvents->dispatch(new SuspiciousRequestEvent(
+                ip: $request->getClientIp(),
+                uri: $request->getRequestUri(),
+                reason: 'credential_stuffing_pattern',
+            ));
+        }
+        // ...
+    }
+}
+```
+
+## Verifying Events Are Firing
+
+**Check the security log channel:**
+
+```bash
+tail -f var/log/security.log
+```
+
+Trigger a CSRF failure (POST without the X-CSRF-Token header in a dev env with CSRF enabled) and look for a `security.csrf_violation` log entry.
+
+**Check Metrics counters:**
+
+```bash
+curl http://localhost:8080/metrics | grep security_
+```
+
+Expected output after a denied IP:
+```
+# HELP security_ip_denied_total Total IP filter denials
+# TYPE security_ip_denied_total counter
+security_ip_denied_total 3
+```
+
+**Write a unit test:**
+
+```php
+$dispatcher = new SecurityEventDispatcher(logger: null, metrics: null);
+
+$fired = [];
+$dispatcher->addListener('*', function ($e) use (&$fired) { $fired[] = $e->eventName(); });
+
+$dispatcher->dispatch(new CsrfViolationEvent(ip: '1.2.3.4', uri: '/api/test', method: 'POST'));
+
+assertEquals(['security.csrf_violation'], $fired);
+```
+
+## Troubleshooting
+
+**Security events not appearing in logs.**
+
+Logger is not wired or the `security` log channel is not configured. Check that `vortos-logger` is installed and that a `security` channel is defined in your logger config. The dispatcher checks for a `LoggerInterface` in the container — if it is absent (e.g., in a test container), logging is silently skipped.
+
+**Metrics counters not incrementing.**
+
+`vortos-metrics` may not be installed or the `MetricsInterface` is not in the container. The dispatcher checks for the metrics service at construction time — if absent, the counter increment is silently skipped. Confirm with `bin/console debug:container vortos.metrics` (or equivalent).
+
+**Custom listener not called.**
+
+`addListener()` must be called before `dispatch()`. For container-managed listeners, register them in a compiler pass or as tagged services and inject the `SecurityEventDispatcher` into your listener factory.

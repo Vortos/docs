@@ -1,0 +1,179 @@
+---
+title: IP Filtering
+description: Global and per-route allow/deny lists with full CIDR range support, trusted proxy handling, and compile-time per-route maps — reject bad IPs before any business logic runs.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# IP Filtering
+
+IP filtering lets you restrict access to your API by the client's IP address or CIDR range. Common use cases: allowlisting your own office or CI server IPs for internal admin endpoints, denylisting known abusive ranges at the application layer, and restricting staging environments to your team's network.
+
+Vortos evaluates IP rules at priority 90 — after CORS (95) but before CSRF (85) and auth (6). Rejected requests never reach auth or your domain code.
+
+<Callout type="info" title="Compile-Time Per-Route Map">
+`#[AllowIp]` and `#[DenyIp]` attributes on controllers are scanned by `IpFilterCompilerPass` at container build time. At runtime, `IpFilterMiddleware` does a single array lookup by controller class — no reflection, no annotation parsing.
+</Callout>
+
+## How It Works
+
+```
+Inbound Request
+    │
+    ▼ priority 90: IpFilterMiddleware
+    │   ├── Resolve real client IP (IpResolver — trusts X-Forwarded-For from configured proxies)
+    │   ├── Identify controller class from request attributes
+    │   ├── Per-route allowlist configured?
+    │   │       └── YES → IP in allowlist? NO → 403, fire IpDeniedEvent
+    │   ├── Per-route denylist configured?
+    │   │       └── YES → IP in denylist? YES → 403, fire IpDeniedEvent
+    │   ├── Global allowlist configured?
+    │   │       └── YES → IP in allowlist? NO → 403, fire IpDeniedEvent
+    │   ├── Global denylist configured?
+    │   │       └── YES → IP in denylist? YES → 403, fire IpDeniedEvent
+    │   └── All checks passed → continue
+```
+
+Evaluation order is important: per-route rules take precedence over global rules, and allowlists take precedence over denylists within the same scope.
+
+## Global Configuration
+
+```php title="config/security.php"
+$config->ipFilter()
+    ->enabled(true)
+    ->allow(['203.0.113.0/24', '198.51.100.5'])  // allowlist — all other IPs denied
+    ->deny(['10.0.0.0/8', '172.16.0.0/12'])       // denylist — these IPs blocked
+    ->trustedProxies(['127.0.0.1', '::1', '10.0.0.1/8']) // proxies whose X-Forwarded-For is trusted
+;
+```
+
+<Callout type="warn" title="Allowlist vs Denylist — Pick One">
+Using an allowlist (`->allow(...)`) means everyone NOT on the list is denied. Using a denylist (`->deny(...)`) means everyone NOT on the list is allowed. Mixing both means: allowed-list wins, then denied-list is checked for the remainder. In most cases pick one approach — combining them creates complex and surprising behaviour.
+</Callout>
+
+## Per-Route Rules via Attributes
+
+`#[AllowIp]` and `#[DenyIp]` can be placed on controller classes or individual methods. They are evaluated before global rules and override the global policy for that route.
+
+```php
+use Vortos\Security\IpFilter\Attribute\AllowIp;
+use Vortos\Security\IpFilter\Attribute\DenyIp;
+
+// Only internal IPs may access this controller
+#[AllowIp(['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'])]
+final class InternalAdminController { ... }
+
+// Block Tor exit nodes from this endpoint
+#[DenyIp(['185.220.101.0/24', '185.220.102.0/23'])]
+final class SignupController { ... }
+
+// Method-level — override per action
+final class UserController
+{
+    // Only admins' office IP can delete accounts
+    #[AllowIp(['203.0.113.42'])]
+    public function delete(Request $request): Response { ... }
+
+    // No IP restriction on read
+    public function show(Request $request): Response { ... }
+}
+```
+
+## CIDR Support
+
+Both IPv4 and IPv6 CIDR notation is supported.
+
+```
+IPv4 single host:   203.0.113.1
+IPv4 range:         203.0.113.0/24   (256 addresses)
+IPv4 subnet:        10.0.0.0/8       (16.7M addresses)
+
+IPv6 single host:   2001:db8::1
+IPv6 range:         2001:db8::/32
+```
+
+`IpResolver` computes CIDR masks using bitwise comparison — no string parsing at runtime.
+
+## Trusted Proxies and `X-Forwarded-For`
+
+When your application runs behind a load balancer or reverse proxy, the `REMOTE_ADDR` seen by PHP is the proxy's IP, not the real client IP. `IpResolver` handles this by reading the `X-Forwarded-For` header — but only from IPs listed in `trustedProxies`.
+
+**Why this matters:** If you trusted `X-Forwarded-For` from any IP, an attacker could spoof the header to bypass your IP filter.
+
+```php
+$config->ipFilter()->trustedProxies([
+    '127.0.0.1',        // local loopback
+    '::1',              // IPv6 loopback
+    '10.0.0.0/8',       // internal network (your load balancer subnet)
+    '172.31.0.1',       // specific ALB IP
+]);
+```
+
+`IpResolver` takes the leftmost IP from `X-Forwarded-For` that is not itself a trusted proxy. This correctly handles chains like: `X-Forwarded-For: 203.0.113.5, 10.0.0.1` → resolved IP is `203.0.113.5`.
+
+**Reference:** [OWASP — Reverse Proxy Header Spoofing](https://cheatsheats.owasp.org/cheatsheets/Unvalidated_Redirects_and_Forwards_Cheat_Sheet.html)
+
+## Dev vs Prod
+
+```php title="config/dev/security.php"
+return static function (VortosSecurityConfig $config): void {
+    // Disable IP filtering entirely in dev
+    $config->ipFilter()->enabled(false);
+};
+```
+
+```php title="config/prod/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->ipFilter()
+        ->enabled(true)
+        ->trustedProxies(['10.0.0.0/8']); // your load balancer subnet
+};
+```
+
+## Verifying IP Filtering Is Working
+
+**Confirm a denied IP gets 403:**
+
+```bash
+# Simulate a request with a spoofed IP (only works if the proxy IP is trusted)
+curl -X GET https://api.example.com/api/admin \
+  -H "X-Forwarded-For: 1.2.3.4" \
+  -v
+```
+
+Expected: `HTTP 403` with `{"error": "Access denied"}`.
+
+**Confirm an allowed IP gets through:**
+
+```bash
+curl -X GET https://api.example.com/api/admin \
+  -H "X-Forwarded-For: 203.0.113.42" \
+  -v
+```
+
+Expected: `HTTP 200` (or whatever the controller normally returns).
+
+**Tail the security log channel** to see `IpDeniedEvent` entries:
+
+```bash
+tail -f var/log/security.log
+```
+
+## Troubleshooting
+
+**All requests are blocked (403) even from expected IPs.**
+
+You configured an allowlist but your application is behind a proxy. The resolved IP is the proxy's IP, not the client IP — because the proxy isn't in `trustedProxies`. Add your load balancer subnet to `->trustedProxies([...])`.
+
+**IP filtering is not triggering for a specific route.**
+
+Check that the attribute is on the right class or method. The compiler pass uses the FQCN and method name as keys — if the controller method is `__invoke`, the key is just the class name. Rebuild the container (`bin/console cache:clear` or equivalent) after changing attributes.
+
+**IP filter disabled in prod by mistake.**
+
+Check `config/prod/security.php` — a `->enabled(false)` there overrides the base `config/security.php`. Remove it or change to `->enabled(true)`.
+
+**IPv6 addresses are not matching.**
+
+IPv6 addresses have many valid representations (`::1` vs `0:0:0:0:0:0:0:1`). `IpResolver` normalises both the client IP and the CIDR range using PHP's `inet_pton` before comparing. If matching still fails, log the raw `$request->server->get('REMOTE_ADDR')` to see exactly what the server reports.

@@ -1,0 +1,231 @@
+---
+title: Field-Level Encryption
+description: Opt-in AES-256-GCM field-level encryption with HKDF-SHA256 per-context sub-key derivation — encrypt specific model fields at rest without encrypting the entire database.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Field-Level Encryption
+
+Field-level encryption (FLE) protects specific sensitive fields — SSNs, health data, financial details, private keys — at the application layer, independently of database-level encryption. Even if someone gains direct database access, encrypted fields are unreadable without the application's master key.
+
+Vortos uses **AES-256-GCM** — a widely deployed authenticated encryption (AEAD) cipher with hardware acceleration on modern CPUs via AES-NI. Each encryption call generates a fresh random 12-byte nonce, so identical plaintexts produce different ciphertexts.
+
+**Reference:** [NIST — AES-GCM](https://csrc.nist.gov/publications/detail/sp/800-38d/final) | [HKDF — RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869) | [PHP openssl_encrypt](https://www.php.net/manual/en/function.openssl-encrypt.php)
+
+<Callout type="info" title="Opt-In — Zero Overhead When Disabled">
+Encryption is disabled by default. `EncryptionService` and `KeyDerivationService` are not registered in the container unless `$config->encryption()->enabled(true)` is set. When disabled, there is no overhead whatsoever.
+</Callout>
+
+## Enabling Encryption
+
+<Steps>
+<Step>
+**Generate a master key.**
+
+The master key must be exactly 32 bytes of cryptographically random data, base64-encoded:
+
+```bash
+php -r "echo base64_encode(random_bytes(32)) . PHP_EOL;"
+# → e.g. YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=
+```
+
+Store this in your secrets manager or environment. Never commit it to source control.
+</Step>
+<Step>
+**Configure encryption.**
+
+```php title="config/security.php"
+$config->encryption()
+    ->enabled(true)
+    ->masterKeyEnv('ENCRYPTION_KEY') // reads from $_ENV['ENCRYPTION_KEY']
+;
+```
+</Step>
+<Step>
+**Set the env var.**
+
+```bash title=".env.prod"
+ENCRYPTION_KEY=YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=
+```
+
+Or store it in Vault / AWS SSM and read it via the [Secrets Management](/docs/security/secrets) provider.
+</Step>
+</Steps>
+
+## Using `EncryptionService`
+
+Inject via constructor and call `encrypt`/`decrypt`. The `$context` parameter is used for sub-key derivation — use a meaningful string that identifies what the data is.
+
+```php
+use Vortos\Security\Contract\EncryptionInterface;
+
+final class UserProfileRepository
+{
+    public function __construct(
+        private readonly EncryptionInterface $encryption,
+    ) {}
+
+    public function save(UserProfile $profile): void
+    {
+        $this->db->insert('user_profiles', [
+            'id'  => $profile->id,
+            'ssn' => $this->encryption->encrypt($profile->ssn, 'user.ssn'),
+            'dob' => $profile->dob, // not sensitive — stored plaintext
+        ]);
+    }
+
+    public function find(string $id): UserProfile
+    {
+        $row = $this->db->fetchOne('user_profiles', $id);
+
+        return new UserProfile(
+            id:  $row['id'],
+            ssn: $this->encryption->decrypt($row['ssn'], 'user.ssn'),
+            dob: $row['dob'],
+        );
+    }
+}
+```
+
+<Callout type="warn" title="Encrypted Fields Are Not Queryable">
+AES-256-GCM produces a different ciphertext every time (due to the random nonce), so you cannot do `WHERE ssn = ?`. If you need to search by an encrypted field, store a deterministic hash (SHA-256 of the value) as a separate indexed column alongside the ciphertext.
+</Callout>
+
+## `#[Encrypted]` Attribute
+
+Mark properties with `#[Encrypted]` to document which fields are encrypted. `EncryptionCompilerPass` scans all service classes and stores the field map as a container parameter — useful for tooling and migrations:
+
+```php
+use Vortos\Security\Encryption\Attribute\Encrypted;
+
+final class UserProfile
+{
+    public function __construct(
+        public readonly string $id,
+        #[Encrypted(context: 'user.ssn')]
+        public readonly string $ssn,
+        #[Encrypted(context: 'user.health')]
+        public readonly string $healthData,
+        public readonly string $email, // not encrypted
+    ) {}
+}
+```
+
+The attribute itself does not auto-encrypt/decrypt — you must still call `EncryptionService` explicitly. The attribute is a declaration for documentation and tooling, and the compiler pass uses it to build an inventory of encrypted fields.
+
+## How Encryption Works
+
+### AES-256-GCM
+
+AES-GCM is an authenticated encryption mode — it both encrypts the data and produces an authentication tag. When you decrypt, the tag is verified first. If the ciphertext was tampered with, decryption throws an exception rather than returning garbled plaintext.
+
+- **Key size:** 256 bits (32 bytes) — the strongest AES variant
+- **Nonce:** 12 bytes, cryptographically random per call — never reuse
+- **Tag size:** 16 bytes — appended to ciphertext
+- **Hardware:** AES-NI on modern CPUs makes this faster than software SHA-256
+
+### Wire Format
+
+Ciphertexts are stored as base64-encoded strings. The binary format before encoding:
+
+```
+[4 bytes: version=\x01\x00\x00\x00] [12 bytes: nonce] [16 bytes: GCM tag] [N bytes: ciphertext]
+```
+
+The version prefix enables future key rotation detection — if you change the key format in the future, the version byte tells the decryptor which derivation scheme to use.
+
+### Sub-Key Derivation (HKDF-SHA256)
+
+A single master key is used to derive a unique sub-key for each field context. This means:
+- Each field type is encrypted with a different key
+- Compromising one field's key does not compromise others
+- The master key never touches the data directly
+
+The derivation uses [HKDF-RFC 5869](https://datatracker.ietf.org/doc/html/rfc5869):
+
+```
+PRK = HMAC-SHA256(salt=zeros, inputKeyMaterial=masterKey)
+SubKey = HMAC-SHA256(PRK, info='vortos-encryption:' + context + '\x01')
+```
+
+Context strings like `user.ssn` and `user.health` produce completely independent sub-keys.
+
+## Key Rotation
+
+When you need to rotate the master key:
+
+<Steps>
+<Step>
+**Generate a new master key** and store it as `ENCRYPTION_KEY_NEW`.
+</Step>
+<Step>
+**Write a migration** that reads each encrypted row using the old key and re-encrypts it with the new key.
+
+```php
+// Read with old key, write with new key
+$old = new EncryptionService(new KeyDerivationService($oldKey));
+$new = new EncryptionService(new KeyDerivationService($newKey));
+
+foreach ($this->db->fetchAll('user_profiles') as $row) {
+    $plaintext = $old->decrypt($row['ssn'], 'user.ssn');
+    $this->db->update('user_profiles', [
+        'ssn' => $new->encrypt($plaintext, 'user.ssn'),
+    ], ['id' => $row['id']]);
+}
+```
+</Step>
+<Step>
+**Swap `ENCRYPTION_KEY`** to the new value and remove `ENCRYPTION_KEY_NEW` from the environment.
+</Step>
+</Steps>
+
+The version byte in the wire format helps detect rows encrypted with an old key if you need to support both keys simultaneously during a gradual migration.
+
+## Verifying Encryption Is Working
+
+**Confirm the service is wired:**
+
+```php
+// In a test or debug controller
+$cipher = $this->encryption->encrypt('test', 'debug');
+$plain  = $this->encryption->decrypt($cipher, 'debug');
+assert($plain === 'test');
+```
+
+**Confirm different plaintexts produce different ciphertexts:**
+
+```php
+$a = $this->encryption->encrypt('hello', 'test');
+$b = $this->encryption->encrypt('hello', 'test');
+assert($a !== $b); // different nonce each time
+```
+
+**Confirm tampered ciphertext throws:**
+
+```php
+try {
+    $this->encryption->decrypt('tampered-base64-string', 'test');
+} catch (\RuntimeException $e) {
+    // Expected — authentication tag mismatch
+}
+```
+
+## Troubleshooting
+
+**`ENCRYPTION_KEY` env var not found.**
+
+The service reads the key via `SecretsInterface`. By default, `EnvSecretsProvider` reads `$_ENV['ENCRYPTION_KEY']`. Confirm the var is exported (`export ENCRYPTION_KEY=...`) not just assigned (`ENCRYPTION_KEY=...` without export is not visible to PHP's `$_ENV`). In FrankenPHP worker mode, use the `.env` file or pass via `ENV` in the Caddyfile.
+
+**Decryption fails after deploying a new key.**
+
+You changed `ENCRYPTION_KEY` without migrating existing ciphertexts. All rows encrypted with the old key cannot be decrypted with the new key — the key derivation is deterministic. Run the rotation migration before swapping the key.
+
+**`openssl_encrypt` returns false.**
+
+PHP's OpenSSL extension is not available or AES-256-GCM is not compiled in. Confirm with `php -m | grep openssl` and `openssl_get_cipher_methods() | grep -i gcm`. FrankenPHP's Docker image includes OpenSSL with GCM support.
+
+**Ciphertext is unexpectedly long.**
+
+AES-GCM adds 28 bytes of overhead (4-byte version + 12-byte nonce + 16-byte tag) plus base64 encoding inflates by ~33%. A 64-byte plaintext becomes ~124 base64 characters. Size your database columns accordingly — `VARCHAR(512)` safely covers any plaintext up to ~360 characters.

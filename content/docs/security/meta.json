@@ -1,0 +1,17 @@
+{
+  "title": "Security",
+  "pages": [
+    "index",
+    "headers",
+    "cors",
+    "csrf",
+    "ip-filter",
+    "request-signing",
+    "password-policy",
+    "encryption",
+    "secrets",
+    "data-masking",
+    "event-bus",
+    "testing"
+  ]
+}

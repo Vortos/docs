@@ -1,0 +1,213 @@
+---
+title: CSRF Protection
+description: Double-submit cookie pattern — SameSite=Strict cookie plus X-CSRF-Token request header, validated with constant-time comparison before any state-changing request reaches your controller.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# CSRF Protection
+
+Cross-Site Request Forgery (CSRF) is an attack where a malicious website tricks an authenticated user's browser into making a state-changing request to your API — without the user knowing. Because the browser automatically includes cookies on every request to your domain, the attacker's forged request arrives with a valid session.
+
+Vortos uses the **double-submit cookie pattern**: the server issues a random token as a `SameSite=Strict` cookie, and requires the client to echo it back as a custom `X-CSRF-Token` request header. An attacker's site cannot read cookies from another origin (same-origin policy), so it cannot forge the header — and the validation fails.
+
+**Reference:** [OWASP — CSRF Prevention Cheat Sheet](https://cheatsheats.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html) | [MDN — SameSite cookies](https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie/SameSite)
+
+<Callout type="info" title="JWT APIs Are Naturally CSRF-Resistant">
+If your API is stateless (JWT in Authorization header, no cookies), CSRF is not a threat — attackers cannot forge the Authorization header. CSRF only matters when your auth relies on cookies. If you use Vortos Auth's JWT cookie storage, CSRF protection is essential.
+</Callout>
+
+## How It Works
+
+```
+First Request (any verb)
+    │
+    ▼ priority 85: CsrfMiddleware (KernelEvents::RESPONSE)
+    │   └── No CSRF cookie? → issue new token, set SameSite=Strict cookie
+    │
+Browser stores cookie
+
+State-Changing Request (POST / PUT / PATCH / DELETE)
+    │
+    ▼ priority 85: CsrfMiddleware (KernelEvents::REQUEST)
+    │   ├── Safe method (GET/HEAD/OPTIONS/TRACE)? → skip, continue
+    │   ├── Route marked #[SkipCsrf]? → skip, continue
+    │   ├── Read cookie value
+    │   ├── Read X-CSRF-Token header value
+    │   ├── hash_equals(cookie, header)
+    │   │       ├── MATCH → continue to auth + controller
+    │   │       └── MISMATCH → 403 + CsrfViolationEvent fired
+```
+
+`hash_equals()` performs constant-time comparison, preventing timing attacks that could leak the token character by character.
+
+## Configuration
+
+```php title="config/security.php"
+$config->csrf()
+    ->enabled(true)
+    ->headerName('X-CSRF-Token')      // header the client must send
+    ->cookieName('csrf_token')        // cookie name set by the server
+    // ->cookieSecure(true)           // HTTPS-only cookie (enable in prod)
+    ->cookieSameSite('Strict')        // SameSite attribute
+    ->tokenLength(32)                 // bytes of entropy (default: 32 = 256 bits)
+;
+```
+
+```php title="config/dev/security.php"
+return static function (VortosSecurityConfig $config): void {
+    // Disable for Postman / API clients that don't handle cookies
+    $config->csrf()->enabled(false);
+};
+```
+
+```php title="config/prod/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->csrf()
+        ->enabled(true)
+        ->cookieSecure(true)      // HTTPS-only
+        ->cookieSameSite('Strict');
+};
+```
+
+## Skipping CSRF on Specific Routes
+
+Use `#[SkipCsrf]` on webhook endpoints, public API routes consumed by non-browser clients, or any route where CSRF protection is not applicable. These are scanned at compile time — zero runtime overhead.
+
+```php
+use Vortos\Security\Csrf\Attribute\SkipCsrf;
+
+// Skip for an entire controller (e.g., a webhook receiver)
+#[SkipCsrf]
+final class StripeWebhookController
+{
+    public function handle(Request $request): Response { ... }
+}
+
+// Skip for a single action only
+final class AuthController
+{
+    #[SkipCsrf]
+    public function login(Request $request): Response { ... }
+
+    // This action still requires CSRF
+    public function logout(Request $request): Response { ... }
+}
+```
+
+<Callout type="warn" title="Do Not Skip on User-Triggered Actions">
+Never apply `#[SkipCsrf]` to endpoints that modify user data (profile updates, password changes, financial actions). Only skip on endpoints where the caller is a server (webhooks, M2M API calls — which should use API Key auth instead).
+</Callout>
+
+## Frontend Integration
+
+<Steps>
+<Step>
+**Read the CSRF token from the cookie.**
+
+On page load (or on the first GET request), the server sets a `csrf_token` cookie. Read it with JavaScript:
+
+```javascript
+function getCsrfToken() {
+    return document.cookie
+        .split('; ')
+        .find(row => row.startsWith('csrf_token='))
+        ?.split('=')[1];
+}
+```
+</Step>
+<Step>
+**Send the token as a header on every state-changing request.**
+
+```javascript
+const response = await fetch('/api/posts', {
+    method: 'POST',
+    credentials: 'include', // required for cookies
+    headers: {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': getCsrfToken(),
+    },
+    body: JSON.stringify({ title: 'Hello' }),
+});
+```
+</Step>
+<Step>
+**Axios global interceptor (recommended).**
+
+Set it once and forget:
+
+```javascript
+import axios from 'axios';
+
+axios.defaults.withCredentials = true;
+
+axios.interceptors.request.use(config => {
+    const token = getCsrfToken();
+    if (token && ['post', 'put', 'patch', 'delete'].includes(config.method)) {
+        config.headers['X-CSRF-Token'] = token;
+    }
+    return config;
+});
+```
+</Step>
+</Steps>
+
+## Token Lifecycle
+
+Tokens are not rotated on every request (rotation would break parallel requests). The token is issued once and persists for the duration of the cookie. On logout, clear the cookie server-side.
+
+The `CsrfTokenService` also sets an `X-CSRF-Token-Set: 1` response header alongside the cookie. Your frontend can listen for this header to know a fresh token has been issued (useful after login when a new session begins).
+
+## Verifying CSRF Is Working
+
+**Confirm the cookie is issued:**
+
+```bash
+curl -c /tmp/cookies.txt -b /tmp/cookies.txt \
+  -I https://api.example.com/api/ping
+```
+
+Look for `Set-Cookie: csrf_token=...` in the response headers.
+
+**Confirm rejection without the header:**
+
+```bash
+curl -c /tmp/cookies.txt -b /tmp/cookies.txt \
+  -X POST https://api.example.com/api/posts \
+  -H "Content-Type: application/json" \
+  -d '{"title":"test"}'
+```
+
+Expected: `HTTP 403` with `{"error": "CSRF token mismatch"}`.
+
+**Confirm acceptance with the correct header:**
+
+```bash
+TOKEN=$(grep csrf_token /tmp/cookies.txt | awk '{print $7}')
+curl -c /tmp/cookies.txt -b /tmp/cookies.txt \
+  -X POST https://api.example.com/api/posts \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: $TOKEN" \
+  -d '{"title":"test"}'
+```
+
+Expected: `HTTP 201`.
+
+## Troubleshooting
+
+**All POST requests return 403 even with the correct token.**
+
+Check that `cookieSecure(true)` is not set in dev — secure cookies are not sent over plain HTTP. Also confirm `SameSite=Strict` is not blocking the cookie in a cross-origin dev setup (when your frontend dev server is on port 3000 and API is on port 8000, they are different origins). Use `SameSite=Lax` or disable CSRF in dev.
+
+**CSRF cookie not present after initial request.**
+
+Confirm `credentials: 'include'` is set in your frontend `fetch` calls and that CORS `credentials(true)` is configured (cookies are not sent in cross-origin requests without this). See [CORS](/docs/security/cors).
+
+**Single-page app loses the token after a hard refresh.**
+
+The token is in a cookie, not session storage — it survives hard refreshes. If the cookie disappears, check cookie expiry settings. Vortos sets a session cookie (no max-age) by default — it expires when the browser closes. Add a `maxAge` if you need persistence across browser restarts.
+
+**Getting 403 on a webhook endpoint.**
+
+Add `#[SkipCsrf]` to your webhook controller. Webhook senders (Stripe, GitHub, etc.) do not read cookies and cannot provide the token.

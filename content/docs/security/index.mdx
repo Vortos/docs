@@ -1,0 +1,133 @@
+---
+title: Security
+description: Enterprise-grade HTTP-layer and application-layer security for Vortos — headers, CORS, CSRF, IP filtering, request signing, password policy, encryption, secrets management, and data masking.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Cards, Card } from 'fumadocs-ui/components/card';
+
+# Security
+
+`vortos-security` is the HTTP-layer security module for the Vortos framework. It covers everything a production API needs before a single line of your domain code runs: security headers, CORS preflight, CSRF protection, IP filtering, webhook signature verification, password policy enforcement, field-level encryption, secrets management, and PII masking in logs.
+
+<Callout type="info" title="Compile-Time First">
+Every attribute (`#[SkipCsrf]`, `#[AllowIp]`, `#[RequiresSignature]`, `#[Encrypted]`) is scanned by a compiler pass at container build time. At runtime each middleware does a single array lookup — zero reflection, O(1) cost regardless of how many controllers you have.
+</Callout>
+
+## Middleware Chain
+
+All security middleware runs in the outermost layers of the request pipeline — before authentication, authorization, or any domain logic:
+
+```
+Inbound Request
+    │
+    ▼ priority 100: SecurityHeadersMiddleware   — adds security headers to every response
+    │
+    ▼ priority 95:  CorsMiddleware              — preflight (OPTIONS → 204) + CORS headers
+    │
+    ▼ priority 90:  IpFilterMiddleware          — deny/allow by IP or CIDR range
+    │
+    ▼ priority 85:  CsrfMiddleware              — double-submit cookie validation
+    │
+    ▼ priority 75:  RequestSignatureMiddleware  — HMAC-SHA256 webhook verification
+    │
+    ▼ priority 7:   RateLimitMiddleware (IP)    — [Auth module]
+    │
+    ▼ priority 6:   AuthMiddleware              — [Auth module]
+    │
+    ▼ priority 3:   AuthorizationMiddleware     — [Authorization module]
+    │
+    ▼               Your controller
+```
+
+## Feature Overview
+
+<Cards>
+  <Card title="Security Headers" href="/docs/security/headers" description="CSP, HSTS, X-Frame-Options, Referrer-Policy, Permissions-Policy, and cross-origin isolation headers applied to every response." />
+  <Card title="CORS" href="/docs/security/cors" description="Preflight handling and CORS header injection with per-route overrides via #[Cors]." />
+  <Card title="CSRF Protection" href="/docs/security/csrf" description="Double-submit cookie pattern — SameSite=Strict cookie plus X-CSRF-Token header, verified with constant-time comparison." />
+  <Card title="IP Filtering" href="/docs/security/ip-filter" description="Global and per-route allow/deny lists with CIDR range support and trusted proxy handling." />
+  <Card title="Request Signing" href="/docs/security/request-signing" description="HMAC-SHA256 signature verification for incoming webhooks with replay-window protection." />
+  <Card title="Password Policy" href="/docs/security/password-policy" description="Configurable password rules — length, complexity, common-password dictionary, and HaveIBeenPwned breach check." />
+  <Card title="Encryption" href="/docs/security/encryption" description="Opt-in AES-256-GCM field-level encryption with HKDF-SHA256 sub-key derivation per context." />
+  <Card title="Secrets Management" href="/docs/security/secrets" description="Pluggable secrets backend — env vars by default, opt-in HashiCorp Vault and AWS SSM drivers." />
+  <Card title="Data Masking" href="/docs/security/data-masking" description="Monolog processor that redacts PII from log context and extra arrays using configurable masking strategies." />
+  <Card title="Security Event Bus" href="/docs/security/event-bus" description="Internal event bus for CSRF violations, IP denials, and signature failures — wired to Logger and Metrics automatically." />
+  <Card title="API Keys (M2M)" href="/docs/auth/api-keys" description="Machine-to-machine API key authentication — generate, validate, scope, and revoke keys. Lives in the Auth module." />
+  <Card title="Testing" href="/docs/security/testing" description="How to test every security feature in unit and integration tests." />
+</Cards>
+
+## Installation
+
+`vortos-security` is auto-discovered from the monorepo path repository. In a standalone project:
+
+```bash
+composer require vortos/vortos-security
+```
+
+No manual registration is needed — `SecurityPackage` is discovered via `extra.vortos.package` in its `composer.json`.
+
+## Configuration
+
+All security settings live in `config/security.php`. Per-environment overrides go in `config/dev/security.php` and `config/prod/security.php` — they are loaded after the base file and any value set there wins.
+
+```php title="config/security.php"
+use Vortos\Security\DependencyInjection\VortosSecurityConfig;
+
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()
+        ->xFrameOptions('DENY')
+        ->xContentTypeOptions(true)
+        ->referrerPolicy('strict-origin-when-cross-origin');
+
+    $config->cors()
+        ->origins(['https://app.example.com'])
+        ->methods(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+
+    $config->csrf()->enabled(true);
+    $config->ipFilter()->trustedProxies(['127.0.0.1', '::1']);
+
+    $config->passwordPolicy()
+        ->minLength(12)
+        ->requireUppercase(true)
+        ->requireDigit(true)
+        ->requireSpecial(true)
+        ->checkCommonPasswords(true);
+};
+```
+
+```php title="config/dev/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()->hsts(false);
+    $config->cors()->origins(['*']);
+    $config->csrf()->enabled(false); // disable for Postman / API testing
+    $config->ipFilter()->enabled(false);
+};
+```
+
+```php title="config/prod/security.php"
+return static function (VortosSecurityConfig $config): void {
+    $config->headers()
+        ->hsts(maxAge: 31536000, includeSubDomains: true, preload: true)
+        ->csp()->defaultSrc("'self'")->scriptSrc("'self'")->reportUri('/csp-report');
+
+    $config->cors()->origins(['https://app.example.com']);
+    $config->csrf()->enabled(true)->cookieSecure(true);
+    $config->ipFilter()->enabled(true);
+};
+```
+
+## Opt-In vs Always-On
+
+| Feature | Default | Notes |
+|---|---|---|
+| Security Headers | **Always on** | Zero-overhead — header map built at compile time |
+| CORS | **Always on** | Configure `origins([])` to disable effectively |
+| CSRF | **Always on** | Can be disabled per env or per route via `#[SkipCsrf]` |
+| IP Filtering | **Always on** | No-op unless rules are configured |
+| Request Signing | **Always on** | No-op on routes without `#[RequiresSignature]` |
+| Password Policy | **Always on** | Call `PasswordPolicyService::validate()` explicitly |
+| Encryption | **Opt-in** | Set `$config->encryption()->enabled(true)` |
+| Secrets Management | **Always on** | Default: `EnvSecretsProvider` (zero overhead) |
+| Data Masking | **Opt-in** | Set `$config->dataMasking()->enabled(true)` |
+| Security Event Bus | **Always on** | Only fires when a violation actually occurs |

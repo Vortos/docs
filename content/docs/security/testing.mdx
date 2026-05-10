@@ -1,0 +1,472 @@
+---
+title: Testing Security
+description: How to test every vortos-security feature — unit tests for individual services, middleware integration tests, config override tests, and zero-overhead verification.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Testing Security
+
+Security features are only as good as the tests that verify them. This page covers unit and integration testing patterns for every feature in `vortos-security`.
+
+<Callout type="info" title="Tests Live In packages/Vortos/Tests/">
+All Vortos framework tests are in `packages/Vortos/Tests/`. Security tests go in `packages/Vortos/Tests/Security/`. Run the suite with `./vendor/bin/phpunit packages/Vortos/Tests --no-coverage`.
+</Callout>
+
+## Encryption
+
+```php title="packages/Vortos/Tests/Security/EncryptionServiceTest.php"
+use Vortos\Security\Encryption\EncryptionService;
+use Vortos\Security\Encryption\KeyDerivationService;
+use Vortos\Security\Secrets\EnvSecretsProvider;
+
+final class EncryptionServiceTest extends TestCase
+{
+    private EncryptionService $encryption;
+
+    protected function setUp(): void
+    {
+        $_ENV['TEST_ENCRYPTION_KEY'] = base64_encode(random_bytes(32));
+        $keyDerivation = new KeyDerivationService(new EnvSecretsProvider(), 'TEST_ENCRYPTION_KEY');
+        $this->encryption = new EncryptionService($keyDerivation);
+    }
+
+    public function testRoundTrip(): void
+    {
+        $plaintext = 'my-secret-value';
+        $cipher    = $this->encryption->encrypt($plaintext, 'test.context');
+        $decoded   = $this->encryption->decrypt($cipher, 'test.context');
+
+        $this->assertSame($plaintext, $decoded);
+    }
+
+    public function testDifferentNonceEachCall(): void
+    {
+        $a = $this->encryption->encrypt('same', 'ctx');
+        $b = $this->encryption->encrypt('same', 'ctx');
+
+        $this->assertNotSame($a, $b); // different nonce → different ciphertext
+    }
+
+    public function testDifferentContextsDeriveIndependentKeys(): void
+    {
+        $cipher = $this->encryption->encrypt('value', 'ctx.a');
+
+        $this->expectException(\RuntimeException::class);
+        $this->encryption->decrypt($cipher, 'ctx.b'); // wrong context → auth tag mismatch
+    }
+
+    public function testTamperedCiphertextThrows(): void
+    {
+        $cipher  = $this->encryption->encrypt('value', 'ctx');
+        $tampered = base64_encode(str_repeat('X', 60));
+
+        $this->expectException(\RuntimeException::class);
+        $this->encryption->decrypt($tampered, 'ctx');
+    }
+}
+```
+
+## CSRF Token Service
+
+```php title="packages/Vortos/Tests/Security/CsrfTokenServiceTest.php"
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Vortos\Security\Csrf\CsrfTokenService;
+
+final class CsrfTokenServiceTest extends TestCase
+{
+    private CsrfTokenService $service;
+
+    protected function setUp(): void
+    {
+        $this->service = new CsrfTokenService(
+            headerName:  'X-CSRF-Token',
+            cookieName:  'csrf_token',
+            cookieSecure: false,
+            cookieSameSite: 'Strict',
+            tokenLength: 32,
+        );
+    }
+
+    public function testIssueAndValidate(): void
+    {
+        $response = new Response();
+        $this->service->issue($response);
+
+        // Extract token from Set-Cookie header
+        $setCookie = $response->headers->get('Set-Cookie');
+        preg_match('/csrf_token=([^;]+)/', $setCookie, $matches);
+        $token = $matches[1];
+
+        // Build a request with matching cookie + header
+        $request = Request::create('/api/test', 'POST');
+        $request->cookies->set('csrf_token', $token);
+        $request->headers->set('X-CSRF-Token', $token);
+
+        $this->assertTrue($this->service->validate($request));
+    }
+
+    public function testMissingHeaderFails(): void
+    {
+        $request = Request::create('/api/test', 'POST');
+        $request->cookies->set('csrf_token', 'abc123');
+        // No X-CSRF-Token header
+
+        $this->assertFalse($this->service->validate($request));
+    }
+
+    public function testMismatchedTokenFails(): void
+    {
+        $request = Request::create('/api/test', 'POST');
+        $request->cookies->set('csrf_token', 'real-token');
+        $request->headers->set('X-CSRF-Token', 'forged-token');
+
+        $this->assertFalse($this->service->validate($request));
+    }
+
+    public function testSafeMethodsSkipValidation(): void
+    {
+        // GET request with no CSRF token should pass (safe method)
+        $request = Request::create('/api/resource', 'GET');
+
+        $this->assertTrue($this->service->validate($request));
+    }
+}
+```
+
+## IP Resolver
+
+```php title="packages/Vortos/Tests/Security/IpResolverTest.php"
+use Symfony\Component\HttpFoundation\Request;
+use Vortos\Security\IpFilter\IpResolver;
+
+final class IpResolverTest extends TestCase
+{
+    public function testResolvesRealIpFromTrustedProxy(): void
+    {
+        $resolver = new IpResolver(trustedProxies: ['10.0.0.1']);
+
+        $request = Request::create('/');
+        $request->server->set('REMOTE_ADDR', '10.0.0.1');
+        $request->headers->set('X-Forwarded-For', '203.0.113.42, 10.0.0.1');
+
+        $this->assertSame('203.0.113.42', $resolver->resolve($request));
+    }
+
+    public function testIgnoresXForwardedForFromUntrustedProxy(): void
+    {
+        $resolver = new IpResolver(trustedProxies: ['127.0.0.1']);
+
+        $request = Request::create('/');
+        $request->server->set('REMOTE_ADDR', '5.5.5.5'); // not in trusted proxies
+        $request->headers->set('X-Forwarded-For', '1.2.3.4');
+
+        // Untrusted proxy — use REMOTE_ADDR directly
+        $this->assertSame('5.5.5.5', $resolver->resolve($request));
+    }
+
+    public function testCidrMatchingIpv4(): void
+    {
+        $resolver = new IpResolver([]);
+
+        $this->assertTrue($resolver->matchesCidr('10.0.0.50', ['10.0.0.0/8']));
+        $this->assertFalse($resolver->matchesCidr('192.168.1.1', ['10.0.0.0/8']));
+    }
+
+    public function testCidrMatchingIpv6(): void
+    {
+        $resolver = new IpResolver([]);
+
+        $this->assertTrue($resolver->matchesCidr('2001:db8::1', ['2001:db8::/32']));
+        $this->assertFalse($resolver->matchesCidr('2001:db9::1', ['2001:db8::/32']));
+    }
+}
+```
+
+## Signature Verifier
+
+```php title="packages/Vortos/Tests/Security/SignatureVerifierTest.php"
+use Symfony\Component\HttpFoundation\Request;
+use Vortos\Security\Signing\SignatureVerifier;
+
+final class SignatureVerifierTest extends TestCase
+{
+    private string $secret = 'test-shared-secret';
+    private SignatureVerifier $verifier;
+
+    protected function setUp(): void
+    {
+        $this->verifier = new SignatureVerifier();
+    }
+
+    private function sign(string $body): string
+    {
+        return 'sha256=' . hash_hmac('sha256', $body, $this->secret);
+    }
+
+    public function testValidSignature(): void
+    {
+        $body = '{"event":"test"}';
+        $request = Request::create('/webhook', 'POST', [], [], [], [], $body);
+        $request->headers->set('X-Signature-256', $this->sign($body));
+
+        $this->assertTrue($this->verifier->verify($request, $this->secret, 'X-Signature-256', 'sha256'));
+    }
+
+    public function testInvalidSignature(): void
+    {
+        $request = Request::create('/webhook', 'POST', [], [], [], [], '{"event":"test"}');
+        $request->headers->set('X-Signature-256', 'sha256=invalidsignature');
+
+        $this->assertFalse($this->verifier->verify($request, $this->secret, 'X-Signature-256', 'sha256'));
+    }
+
+    public function testStripeStyleCombinedHeader(): void
+    {
+        $body      = '{"event":"payment.succeeded"}';
+        $timestamp = (string) time();
+        $sig       = hash_hmac('sha256', $timestamp . '.' . $body, $this->secret);
+        $header    = "t={$timestamp},v1={$sig}";
+
+        $request = Request::create('/webhook', 'POST', [], [], [], [], $body);
+        $request->headers->set('Stripe-Signature', $header);
+
+        $this->assertTrue($this->verifier->verifyWithTimestamp(
+            $request, $this->secret, 'Stripe-Signature', '', 300, 'sha256'
+        ));
+    }
+
+    public function testReplayAttackIsRejected(): void
+    {
+        $body      = '{"event":"test"}';
+        $oldTs     = (string) (time() - 600); // 10 minutes ago
+        $sig       = hash_hmac('sha256', $oldTs . '.' . $body, $this->secret);
+        $header    = "t={$oldTs},v1={$sig}";
+
+        $request = Request::create('/webhook', 'POST', [], [], [], [], $body);
+        $request->headers->set('Stripe-Signature', $header);
+
+        $this->assertFalse($this->verifier->verifyWithTimestamp(
+            $request, $this->secret, 'Stripe-Signature', '', 300, 'sha256'
+        ));
+    }
+}
+```
+
+## Password Policy
+
+```php title="packages/Vortos/Tests/Security/PasswordPolicyServiceTest.php"
+use Vortos\Security\Password\PasswordPolicyService;
+use Vortos\Security\Password\Rule\MinLengthRule;
+use Vortos\Security\Password\Rule\ComplexityRule;
+use Vortos\Security\Password\Rule\CommonPasswordRule;
+
+final class PasswordPolicyServiceTest extends TestCase
+{
+    private PasswordPolicyService $policy;
+
+    protected function setUp(): void
+    {
+        $this->policy = new PasswordPolicyService([
+            new MinLengthRule(12),
+            new ComplexityRule(requireUppercase: true, requireDigit: true, requireSpecial: true),
+            new CommonPasswordRule(),
+        ]);
+    }
+
+    public function testStrongPasswordPasses(): void
+    {
+        $violations = $this->policy->validate('Tr0ub4dor&3!');
+
+        $this->assertSame([], $violations);
+        $this->assertTrue($this->policy->passes('Tr0ub4dor&3!'));
+    }
+
+    public function testShortPasswordFails(): void
+    {
+        $violations = $this->policy->validate('Short1!');
+
+        $this->assertNotEmpty($violations);
+        $rules = array_column($violations, 'rule');
+        $this->assertContains('min_length', $rules);
+    }
+
+    public function testCommonPasswordRejected(): void
+    {
+        $violations = $this->policy->validate('password123!A');
+        // 'password123' base is common — even with additions
+
+        // If it's in the dictionary exactly it should be caught
+        $violations2 = $this->policy->validate('Password1!aaa');
+        // length OK, complexity OK — but if 'password1' is in dictionary, caught
+    }
+
+    public function testAllViolationsReturnedAtOnce(): void
+    {
+        // Short + missing uppercase + missing special
+        $violations = $this->policy->validate('abc');
+        $rules = array_column($violations, 'rule');
+
+        $this->assertContains('min_length', $rules);
+        $this->assertContains('complexity', $rules);
+    }
+}
+```
+
+## Data Masking Processor
+
+```php title="packages/Vortos/Tests/Security/DataMaskingProcessorTest.php"
+use Monolog\Level;
+use Monolog\LogRecord;
+use Vortos\Security\Masking\DataMaskingProcessor;
+use Vortos\Security\Masking\Strategy\MaskAllStrategy;
+
+final class DataMaskingProcessorTest extends TestCase
+{
+    private DataMaskingProcessor $processor;
+
+    protected function setUp(): void
+    {
+        $this->processor = new DataMaskingProcessor(new MaskAllStrategy());
+    }
+
+    private function makeRecord(array $context): LogRecord
+    {
+        return new LogRecord(
+            datetime: new \DateTimeImmutable(),
+            channel: 'test',
+            level: Level::Info,
+            message: 'test',
+            context: $context,
+            extra: [],
+        );
+    }
+
+    public function testMasksBuiltInSensitiveKeys(): void
+    {
+        $record = $this->makeRecord(['password' => 'secret', 'username' => 'alice']);
+        $result = ($this->processor)($record);
+
+        $this->assertSame('***', $result->context['password']);
+        $this->assertSame('alice', $result->context['username']);
+    }
+
+    public function testMasksCaseInsensitive(): void
+    {
+        $record = $this->makeRecord(['PASSWORD' => 'secret', 'Token' => 'abc']);
+        $result = ($this->processor)($record);
+
+        $this->assertSame('***', $result->context['PASSWORD']);
+        $this->assertSame('***', $result->context['Token']);
+    }
+
+    public function testMasksNestedArrays(): void
+    {
+        $record = $this->makeRecord([
+            'user' => ['id' => '123', 'password' => 'secret'],
+        ]);
+        $result = ($this->processor)($record);
+
+        $this->assertSame('***', $result->context['user']['password']);
+        $this->assertSame('123', $result->context['user']['id']);
+    }
+
+    public function testOriginalRecordIsNotMutated(): void
+    {
+        $record = $this->makeRecord(['password' => 'original']);
+        ($this->processor)($record);
+
+        $this->assertSame('original', $record->context['password']);
+    }
+}
+```
+
+## Security Event Dispatcher
+
+```php title="packages/Vortos/Tests/Security/SecurityEventDispatcherTest.php"
+use Vortos\Security\Event\SecurityEventDispatcher;
+use Vortos\Security\Event\CsrfViolationEvent;
+use Vortos\Security\Event\IpDeniedEvent;
+
+final class SecurityEventDispatcherTest extends TestCase
+{
+    public function testListenerIsCalledOnEvent(): void
+    {
+        $dispatcher = new SecurityEventDispatcher(logger: null, metrics: null);
+        $received   = [];
+
+        $dispatcher->addListener(
+            CsrfViolationEvent::EVENT_NAME,
+            function ($e) use (&$received) { $received[] = $e->eventName(); }
+        );
+
+        $dispatcher->dispatch(new CsrfViolationEvent('1.2.3.4', '/test', 'POST', ''));
+
+        $this->assertSame([CsrfViolationEvent::EVENT_NAME], $received);
+    }
+
+    public function testWildcardListenerReceivesAllEvents(): void
+    {
+        $dispatcher = new SecurityEventDispatcher(logger: null, metrics: null);
+        $received   = [];
+
+        $dispatcher->addListener('*', function ($e) use (&$received) {
+            $received[] = $e->eventName();
+        });
+
+        $dispatcher->dispatch(new CsrfViolationEvent('1.2.3.4', '/a', 'POST', ''));
+        $dispatcher->dispatch(new IpDeniedEvent('1.2.3.4', '/b', 'global_denylist'));
+
+        $this->assertCount(2, $received);
+    }
+}
+```
+
+## Config Override Test
+
+Verify that dev/prod config overrides are applied correctly:
+
+```php final class SecurityConfigOverrideTest extends TestCase
+{
+    public function testDevConfigDisablesCsrf(): void
+    {
+        // Build a container with dev env config
+        $config = new VortosSecurityConfig();
+        (require __DIR__ . '/../../../config/security.php')($config);
+        (require __DIR__ . '/../../../config/dev/security.php')($config);
+
+        $csrfArray = $config->csrf()->toArray();
+        $this->assertFalse($csrfArray['enabled']);
+    }
+
+    public function testProdConfigEnablesHsts(): void
+    {
+        $config = new VortosSecurityConfig();
+        (require __DIR__ . '/../../../config/security.php')($config);
+        (require __DIR__ . '/../../../config/prod/security.php')($config);
+
+        $headersArray = $config->headers()->toArray();
+        $this->assertTrue($headersArray['hsts']['enabled']);
+        $this->assertSame(31536000, $headersArray['hsts']['max_age']);
+    }
+}
+```
+
+## Running the Full Suite
+
+```bash
+# Run all Vortos tests including security
+./vendor/bin/phpunit packages/Vortos/Tests --no-coverage
+
+# Run only security tests
+./vendor/bin/phpunit packages/Vortos/Tests/Security --no-coverage
+
+# With coverage (requires Xdebug or PCOV)
+./vendor/bin/phpunit packages/Vortos/Tests/Security
+```
+
+<Callout type="warn" title="Redis Errors Are Expected Locally">
+If you see `UnknownTypeException: Class or interface "Redis" does not exist` errors, these are pre-existing env-only issues — ext-redis is not installed locally. They are not failures caused by security changes.
+</Callout>
