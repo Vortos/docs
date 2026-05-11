@@ -174,11 +174,14 @@ php bin/console vortos:dlq:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
 # process the most recently failed messages first (default: oldest first)
 php bin/console vortos:dlq:replay --latest
 
+# replay messages failed during a specific timestamp window
+php bin/console vortos:dlq:replay --failed-from="2026-05-11T10:00:00Z" --failed-to="2026-05-11T10:30:00Z"
+
 # combine flags freely
-php bin/console vortos:dlq:replay --latest --limit=10 --transport=user.events --dry-run
+php bin/console vortos:dlq:replay --latest --limit=10 --transport=user.events --failed-from="2026-05-11T10:00:00Z" --dry-run
 ```
 
-Filters can be combined — for example, `--transport=user.events --event-class="..."` replays only matching messages within that transport. `--id` always selects exactly one row regardless of other filters. `--latest` only affects ordering and works with all other flags.
+Filters can be combined — for example, `--transport=user.events --event-class="..."` replays only matching messages within that transport. `--failed-from` and `--failed-to` filter by `failed_at` and require full timestamps, not date-only values. `--id` always selects exactly one row regardless of other filters. `--latest` only affects ordering and works with all other flags.
 
 <Callout type="info" title="Concurrent Replay Safety">
 `vortos:dlq:replay` uses `SELECT ... FOR UPDATE SKIP LOCKED` when fetching failed messages. Running the command twice simultaneously is safe — each invocation locks a non-overlapping batch of rows. No message is ever replayed by two concurrent processes.

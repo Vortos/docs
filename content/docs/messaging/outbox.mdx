@@ -230,9 +230,14 @@ php bin/console vortos:outbox:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
 # process the most recently failed rows first (default: oldest first)
 php bin/console vortos:outbox:replay --latest
 
+# replay rows created during a specific timestamp window
+php bin/console vortos:outbox:replay --created-from="2026-05-11T10:00:00Z" --created-to="2026-05-11T10:30:00Z"
+
 # combine flags freely
-php bin/console vortos:outbox:replay --latest --limit=10 --transport=user.events --dry-run
+php bin/console vortos:outbox:replay --latest --limit=10 --transport=user.events --created-from="2026-05-11T10:00:00Z" --dry-run
 ```
+
+`--created-from` and `--created-to` filter outbox rows by `created_at` and require full timestamps, not date-only values. The outbox table does not store a separate permanent-failure timestamp, so this selects rows by when the original outbox message was created.
 
 ```
 Found 3 failed outbox row(s).

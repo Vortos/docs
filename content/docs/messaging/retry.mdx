@@ -174,15 +174,18 @@ public function userDlqTransport(): KafkaTransportDefinition
 Once the root cause of failures is fixed, use the CLI command to replay:
 
 ```bash
-php bin/console vortos:dlq:replay user.events
+php bin/console vortos:dlq:replay --transport=user.events
 ```
 
 Options:
 
 ```bash
-php bin/console vortos:dlq:replay user.events --limit=100
-php bin/console vortos:dlq:replay user.events --event-class="App\User\Domain\Event\UserRegisteredEvent"
-php bin/console vortos:dlq:replay user.events --from-date="2026-01-01" --to-date="2026-01-31"
+php bin/console vortos:dlq:replay --limit=100
+php bin/console vortos:dlq:replay --transport=user.events
+php bin/console vortos:dlq:replay --event-class="App\User\Domain\Event\UserRegisteredEvent"
+php bin/console vortos:dlq:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751
+php bin/console vortos:dlq:replay --failed-from="2026-05-11T10:00:00Z" --failed-to="2026-05-11T10:30:00Z"
+php bin/console vortos:dlq:replay --latest --limit=10 --transport=user.events --failed-from="2026-05-11T10:00:00Z" --dry-run
 ```
 
 Replayed messages are re-dispatched through the same consumer pipeline — they go through deserialization, handler execution, middleware, and retry again as if they were fresh messages.

@@ -111,9 +111,9 @@ Declares which domain event classes this producer routes. When `EventBus::dispat
 
 The name of the registered transport to produce to. Must match a transport defined with `#[RegisterTransport]` in the same or any other `#[MessagingConfig]` class.
 
-### `outbox(bool $enabled, string $table = 'outbox')`
+### `outbox(bool $enabled = true)`
 
-Whether to use the transactional outbox pattern. Defaults to `true`. See [Outbox Pattern](/docs/messaging/outbox) for full details.
+Whether to use the transactional outbox pattern. Defaults to `true`. The outbox table is configured globally in `VortosMessagingConfig`, not per producer. See [Outbox Pattern](/docs/messaging/outbox) for full details.
 
 ### `linger(int $ms)`
 
