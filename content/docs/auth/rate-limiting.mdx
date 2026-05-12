@@ -1,6 +1,6 @@
 ---
 title: Rate Limiting
-description: Per-user, per-IP, and global rate limiting with pluggable policies — applied before authentication so IP limits work even for anonymous requests.
+description: Per-user, per-IP, and global request throttling with compile-time validation, Redis counters, headers, Problem Details responses, and observability.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -8,173 +8,239 @@ import { Step, Steps } from 'fumadocs-ui/components/steps';
 
 # Rate Limiting
 
-Vortos provides attribute-driven rate limiting with Redis-backed counters. Rate limit policies are auto-discovered — implement the interface, add the attribute to your controller, and everything wires itself.
+Rate limits protect application availability. Use them for login protection, burst control, scraping prevention, expensive endpoints, and accidental client loops.
 
-<Callout type="info" title="Compile-Time Map">
-All `#[RateLimit]` attributes are scanned at compile time by `RateLimitCompilerPass`. At runtime, the middleware does a single array lookup — zero reflection, O(1) cost.
+Use [quotas](/docs/auth/quotas) for product allowances such as monthly exports or checkout orders.
+
+<Callout type="info" title="Runtime Cost">
+Rate limit attributes are scanned at compile time. Runtime enforcement does not reflect controller attributes; it reads a prebuilt route map.
 </Callout>
 
-## How It Works
+## Concepts
 
-`RateLimitMiddleware` runs as two separate listeners to handle scope ordering correctly:
+| Concept | Meaning |
+|---|---|
+| Policy | Returns a `RateLimitRule` for the current identity |
+| Rule | `limit` plus `windowSeconds` |
+| Scope | Bucket isolation: user, IP, or global |
+| Counter | Redis key incremented once per checked request |
 
+## Step-by-Step
+
+<Steps>
+<Step>
+Generate a policy:
+
+```bash
+php vortos make:rate-limit-policy Api -c Billing
 ```
-HTTP Request
-    │
-    ▼
-priority 7: RateLimitMiddleware (IP + Global scopes — before auth)
-    ├── Lookup controller in compile-time route map
-    ├── For each IP/Global rule: resolve policy, compute key, check Redis counter
-    ├── Counter within limit → increment and continue
-    └── Counter exceeded → 429 + Retry-After header
-    │
-    ▼
-priority 6: AuthMiddleware — validate token, set identity
-    │
-    ▼
-priority 4: RateLimitMiddleware (User scope — after auth)
-    ├── For each User rule: keyed on resolved user ID
-    ├── Counter within limit → increment and continue
-    └── Counter exceeded → 429 + Retry-After header
-```
+</Step>
 
-IP-scoped and Global-scoped limits run at priority 7 — before `AuthMiddleware` — so they protect unauthenticated routes such as `/api/auth/login`. User-scoped limits run at priority 4 — after auth — so the real user ID is available for per-user bucketing.
+<Step>
+Define limits:
 
-## Implement a Policy
+```php title="src/Billing/Application/Policy/ApiRateLimitPolicy.php"
+namespace App\Billing\Application\Policy;
 
-```php title="src/Billing/Infrastructure/SubscriptionRateLimitPolicy.php"
+use Vortos\Auth\Contract\UserIdentityInterface;
 use Vortos\Auth\RateLimit\Contract\RateLimitPolicyInterface;
 use Vortos\Auth\RateLimit\RateLimitRule;
-use Vortos\Auth\Contract\UserIdentityInterface;
 
-// Auto-discovered — no registration needed
-final class SubscriptionRateLimitPolicy implements RateLimitPolicyInterface
+final class ApiRateLimitPolicy implements RateLimitPolicyInterface
 {
     public function getLimit(UserIdentityInterface $identity): RateLimitRule
     {
-        return match($identity->getAttribute('plan') ?? 'free') {
+        return match ($identity->getAttribute('plan', 'free')) {
             'enterprise' => RateLimitRule::unlimited(),
-            'pro'        => new RateLimitRule(limit: 1000, windowSeconds: 60),
-            default      => new RateLimitRule(limit: 100, windowSeconds: 60),
+            'pro' => new RateLimitRule(limit: 1000, windowSeconds: 60),
+            default => new RateLimitRule(limit: 100, windowSeconds: 60),
         };
     }
 }
 ```
+</Step>
 
-## Apply to a Controller
+<Step>
+Apply the policy:
 
 ```php
+use App\Billing\Application\Policy\ApiRateLimitPolicy;
 use Vortos\Auth\RateLimit\Attribute\RateLimit;
-use Vortos\Auth\RateLimit\RateLimitScope;
 
-// Per-user rate limit
-#[RateLimit(SubscriptionRateLimitPolicy::class)]
-final class CreatePostController { ... }
-
-// Per-IP rate limit (applies even to anonymous requests)
-#[RateLimit(GlobalBurstPolicy::class, per: RateLimitScope::Ip)]
-final class SearchController { ... }
-
-// Stack multiple — both are checked, most restrictive wins
-#[RateLimit(SubscriptionRateLimitPolicy::class, per: RateLimitScope::User)]
-#[RateLimit(GlobalBurstPolicy::class, per: RateLimitScope::Ip)]
-final class ExportController { ... }
+#[RateLimit(ApiRateLimitPolicy::class)]
+final class CreateOrderController {}
 ```
+</Step>
+</Steps>
 
 ## Scopes
 
-| Scope | Redis Key | Use Case |
-|---|---|---|
-| `RateLimitScope::User` | `rl:user:{userId}:{controller}:{policy}` | Per-authenticated-user limits based on plan |
-| `RateLimitScope::Ip` | `rl:ip:{ip}:{controller}:{policy}` | Anonymous endpoint protection, abuse prevention |
-| `RateLimitScope::Global` | `rl:global:{controller}:{policy}` | Hard cap on total requests regardless of who |
+### User Scope
 
-## Rate Limit Rule
+Use for authenticated API usage.
 
 ```php
-use Vortos\Auth\RateLimit\RateLimitRule;
+use Vortos\Auth\RateLimit\RateLimitScope;
 
-// 100 requests per 60-second window
-new RateLimitRule(limit: 100, windowSeconds: 60)
-
-// Unlimited — skip the check entirely for this identity
-RateLimitRule::unlimited()
+#[RateLimit(ApiRateLimitPolicy::class, per: RateLimitScope::User)]
+final class CreateOrderController {}
 ```
 
-Return `RateLimitRule::unlimited()` from your policy for plan tiers that should not be rate-limited. The middleware skips the Redis check entirely when the rule is unlimited.
+Key shape:
 
-## Response on Limit Exceeded
-
+```txt
+rl:user:{userId}:{controller}:{policy}
 ```
-HTTP 429 Too Many Requests
+
+### IP Scope
+
+Use for unauthenticated or abuse-prone endpoints.
+
+```php
+#[RateLimit(LoginIpRateLimitPolicy::class, per: RateLimitScope::Ip)]
+final class LoginController {}
+```
+
+Key shape:
+
+```txt
+rl:ip:{clientIp}:{controller}:{policy}
+```
+
+IP limits run before authentication, so login and registration endpoints are covered.
+
+### Global Scope
+
+Use for protecting an endpoint as a whole.
+
+```php
+#[RateLimit(GlobalCheckoutRateLimitPolicy::class, per: RateLimitScope::Global)]
+final class CreateOrderController {}
+```
+
+Key shape:
+
+```txt
+rl:global:{controller}:{policy}
+```
+
+## Stacking Scopes
+
+All stacked rate limits must pass. The first exceeded rule returns `429`.
+
+```php
+#[RateLimit(LoginIpRateLimitPolicy::class, per: RateLimitScope::Ip)]
+#[RateLimit(LoginGlobalRateLimitPolicy::class, per: RateLimitScope::Global)]
+final class LoginController {}
+```
+
+For authenticated APIs:
+
+```php
+#[RateLimit(ApiRateLimitPolicy::class, per: RateLimitScope::User)]
+#[RateLimit(GlobalApiRateLimitPolicy::class, per: RateLimitScope::Global)]
+final class ExportController {}
+```
+
+## Middleware Order
+
+```txt
+priority 7: RateLimit IP + Global   before auth
+priority 6: AuthMiddleware          resolves identity
+priority 4: RateLimit User          after auth
+```
+
+This ordering avoids a common security bug: unauthenticated endpoints still get IP/global protection, while user limits get a real user ID.
+
+## Response Headers
+
+Rate-limited responses include:
+
+```http
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 42
+X-RateLimit-Reset: 1717200000
+```
+
+Exceeded responses also include:
+
+```http
 Retry-After: 47
+```
 
+## Limit Exceeded Response
+
+```http
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/problem+json
+Retry-After: 47
+```
+
+```json
 {
-  "error": "Too Many Requests",
-  "message": "Rate limit exceeded. Please slow down.",
-  "limit": 100,
-  "window": 60
+  "type": "https://docs.vortos.dev/errors/rate-limit-exceeded",
+  "title": "Rate Limit Exceeded",
+  "status": 429,
+  "detail": "Too many requests. Please retry after 47 seconds.",
+  "instance": "/api/v1/login",
+  "extensions": {
+    "policy": "App\\Billing\\Application\\Policy\\LoginIpRateLimitPolicy",
+    "scope": "ip",
+    "limit": 10,
+    "remaining": 0,
+    "reset_at": 1717200000,
+    "retry_after": 47
+  }
 }
 ```
 
-The `Retry-After` header contains the number of seconds until the window resets.
+## Configuration
 
-## Expired Subscription Example
-
-Rate limiting and feature access can work together to degrade access when a subscription expires:
-
-```php
-final class SubscriptionRateLimitPolicy implements RateLimitPolicyInterface
-{
-    public function __construct(
-        private SubscriptionRepository $subscriptions,
-    ) {}
-
-    public function getLimit(UserIdentityInterface $identity): RateLimitRule
-    {
-        $subscription = $this->subscriptions->findByUserId($identity->id());
-
-        // Expired — apply free-tier limits regardless of what plan they were on
-        if (!$subscription || $subscription->isExpired()) {
-            return new RateLimitRule(limit: 10, windowSeconds: 60);
-        }
-
-        return match($subscription->getPlan()) {
-            'pro'        => new RateLimitRule(limit: 1000, windowSeconds: 60),
-            'enterprise' => RateLimitRule::unlimited(),
-            default      => new RateLimitRule(limit: 100, windowSeconds: 60),
-        };
-    }
-}
+```php title="config/auth.php"
+return static function (VortosAuthConfig $config): void {
+    $config
+        ->rateLimitHeaders(true)
+        ->problemDetails(true);
+};
 ```
 
-## Multiple Policies on One Route
+## Observability
 
-When multiple `#[RateLimit]` attributes are stacked, all are evaluated in order. The first one that exceeds its limit returns 429 — remaining policies are not checked.
+Metrics:
 
-```php
-#[RateLimit(SubscriptionRateLimitPolicy::class, per: RateLimitScope::User)]
-#[RateLimit(IpAbusePolicy::class, per: RateLimitScope::Ip)]
-#[RateLimit(GlobalCapPolicy::class, per: RateLimitScope::Global)]
-final class SensitiveEndpointController { ... }
+```txt
+rate_limit_allowed_total{policy,scope,controller}
+rate_limit_blocked_total{policy,scope,controller}
 ```
 
-## Redis Key Format
+Logs are emitted on blocked requests. Tracing records deny events when tracing is configured.
 
-Rate limit counters use the following key format:
+Success paths only increment metrics by default. This keeps high-throughput endpoints efficient under FrankenPHP worker mode.
 
-```
-rl:{scope}:{identifier}:{controllerClass}:{policyClass}
-```
+## Security Notes
 
-Examples:
-```
-rl:user:user-123:App\Controller\ExportController:App\Policy\SubscriptionRateLimitPolicy
-rl:ip:192.168.1.1:App\Controller\SearchController:App\Policy\GlobalBurstPolicy
-```
+- Policies are validated at compile time.
+- Missing policies fail container compilation.
+- IP limits are not a substitute for authentication.
+- Never use high-cardinality labels such as user ID in metrics.
+- Do not return sensitive policy internals in custom response extensions.
 
-TTL is set to `windowSeconds` on the first increment. Redis auto-expires the key at the end of the window — no cron cleanup needed.
+## Troubleshooting
 
-<Callout type="warn" title="Redis Restart">
-Rate limit counters are ephemeral. A Redis restart resets all counters — users get a free burst until the window refills. This is acceptable for rate limiting. For hard security limits (lockouts), use the lockout system which supports a database-backed store.
-</Callout>
+### Rate limit never triggers
+
+Check Redis is configured. Rate limit middleware is registered only when Redis is available.
+
+Then verify the controller is discovered as a controller service and the attribute references the correct policy class.
+
+### Per-user limits behave like anonymous limits
+
+Use `RateLimitScope::User`, not `Ip`, and ensure the route is authenticated before user-scope enforcement.
+
+### `Retry-After` is zero
+
+The Redis key may have expired between the increment and TTL read. This is rare and safe. Clients should retry normally when `Retry-After` is zero.
+
+### Users behind one NAT are blocked together
+
+That is expected with IP scope. Use IP scope for abuse control and user scope for authenticated plan limits.

@@ -9,6 +9,7 @@
     "passwords",
     "token-storage",
     "testing",
+    "policy-limits",
     "rate-limiting",
     "feature-access",
     "quotas",

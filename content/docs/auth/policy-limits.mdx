@@ -1,0 +1,143 @@
+---
+title: Policy and Limit Architecture
+description: How Vortos separates authorization, ownership, feature access, rate limits, quotas, sessions, and audit concerns.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Policy and Limit Architecture
+
+Vortos separates security and product enforcement into small, explicit layers. Each layer answers a different question and runs at a different point in the request lifecycle.
+
+## Which Primitive Should I Use?
+
+| Need | Use |
+|---|---|
+| Is this user logged in? | Auth middleware |
+| Can this role/action access this resource? | Authorization policy |
+| Does this user own this specific resource? | Ownership policy |
+| Does this plan/tenant/cohort include this feature? | Feature access |
+| Is this client sending requests too quickly? | Rate limit |
+| Has this account consumed its business allowance? | Quota |
+| How many concurrent sessions may this identity have? | Session policy |
+| Should this action be recorded? | Audit logging |
+
+<Callout type="info" title="No Backward Compatibility During Alpha">
+Vortos is pre-stable. Ambiguous generator names are intentionally removed instead of kept as aliases. Use explicit commands such as `make:authorization-policy`, `make:quota-policy`, and `make:rate-limit-policy`.
+</Callout>
+
+## Request Lifecycle
+
+```txt
+priority 7: RateLimit IP + Global       protects anonymous and global traffic
+priority 6: AuthMiddleware              validates tokens and sets identity
+priority 5: TwoFactorMiddleware         enforces second factor when required
+priority 4: RateLimit User              applies authenticated user buckets
+priority 3: AuthorizationMiddleware     resource/action permission check
+priority 2: OwnershipMiddleware         resource owner check
+priority 1: FeatureAccessMiddleware     product entitlement check
+priority 0: QuotaMiddleware             business usage allowance check
+```
+
+This order is deliberate:
+
+- unauthenticated abuse is blocked before auth work
+- user buckets wait until identity exists
+- unauthorized users do not consume quota
+- feature-denied users do not consume quota
+- quota is consumed only for requests that passed earlier gates
+
+## Generators
+
+```bash
+php vortos make:authorization-policy Article -c Article
+php vortos make:ownership-policy Document -c Document
+php vortos make:feature-policy Subscription -c Billing
+php vortos make:rate-limit-policy Api -c Billing
+php vortos make:quota-policy Billing -c Billing
+php vortos make:quota-resolver Organization -c Billing --bucket=organization
+php vortos make:session-policy Subscription -c Billing
+```
+
+There is no `make:policy` command. Use the explicit generator for the policy type you are building.
+
+## Enterprise Response Contract
+
+Limit and entitlement failures use machine-readable responses.
+
+| Failure | Status | Content Type |
+|---|---:|---|
+| Feature denied | 403 | `application/problem+json` |
+| Payment required feature | 402 | `application/problem+json` |
+| Quota exceeded | 403 | `application/problem+json` |
+| Rate limit exceeded | 429 | `application/problem+json` |
+
+Quotas and rate limits use separate headers:
+
+```http
+X-Quota-Name
+X-Quota-Limit
+X-Quota-Remaining
+X-Quota-Reset
+```
+
+```http
+X-RateLimit-Limit
+X-RateLimit-Remaining
+X-RateLimit-Reset
+Retry-After
+```
+
+## Observability
+
+Enforcement happens in middleware, not inside policy classes. Middleware has the request, controller, identity, resolved bucket, response status, and failure reason, so it is the correct place to emit observability.
+
+Metrics are low-cardinality:
+
+```txt
+feature_access_allowed_total
+feature_access_denied_total
+rate_limit_allowed_total
+rate_limit_blocked_total
+quota_allowed_total
+quota_blocked_total
+quota_consumed_total
+```
+
+Logs are emitted for denies, blocks, unresolved subjects, and store failures. Successful requests do not produce logs by default.
+
+Tracing records denial and store-failure events when tracing is configured. Success paths avoid extra spans to keep FrankenPHP worker throughput predictable.
+
+## Configuration
+
+```php title="config/auth.php"
+use Vortos\Auth\Quota\QuotaFailureMode;
+
+return static function (VortosAuthConfig $config): void {
+    $config
+        ->quotaFailureMode(QuotaFailureMode::FailClosed)
+        ->quotaHeaders(true)
+        ->rateLimitHeaders(true)
+        ->problemDetails(true);
+};
+```
+
+## Failure Mode Guidance
+
+| Mode | Use When | Tradeoff |
+|---|---|---|
+| `FailClosed` | paid quotas, cost controls, sensitive operations | Redis outage blocks quota-protected requests |
+| `FailOpen` | availability-first non-critical allowances | Redis outage bypasses quota temporarily |
+
+Rate limits and quotas require Redis. Redis-backed counters are enforcement counters. For billing-grade usage, also write durable usage events to your application database.
+
+## Troubleshooting Checklist
+
+1. Run `php vortos list scaffolding` and confirm the expected generator exists.
+2. Run `php vortos list --raw` and confirm the runtime command list compiles.
+3. Check Redis is configured when using quotas or rate limits.
+4. Check controller services are discovered.
+5. Check policy/resolver classes implement the expected interface.
+6. Check resolver buckets are lowercase and low-cardinality.
+7. Check identity claims contain the subject ID your resolver expects.
+8. Check metrics labels do not include user IDs, emails, request IDs, or raw subject IDs.
