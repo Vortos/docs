@@ -7,13 +7,13 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 # Auto-Instrumentation
 
-When `MetricsPackage` is registered with a non-NoOp adapter, the framework automatically records metrics for HTTP, CQRS, messaging, cache, and persistence. No code changes are required.
+When `MetricsPackage` is registered with a non-NoOp adapter, the framework automatically records metrics for HTTP, CQRS, messaging, cache, persistence, security, rate limits, quotas, feature access, and feature flags. No code changes are required.
 
 ---
 
 ## HTTP
 
-`HttpMetricsListener` subscribes to `kernel.response` and records two metrics per request.
+`HttpMetricsListener` records request start time and then records metrics when the response is available.
 
 ### `{ns}_http_requests_total` — Counter
 
@@ -42,6 +42,17 @@ Observed (in milliseconds) after every response.
 Buckets: `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]` ms
 
 Use this metric to define SLAs: "p99 response time must stay under 500ms."
+
+### `{ns}_http_blocked_total` — Counter
+
+Incremented for rejected or low-value traffic that should stay cheap.
+
+| Label | Values |
+|---|---|
+| `reason` | `rate_limit`, `ip_filter`, `csrf`, `cors`, `signature`, `not_found` |
+| `status` | HTTP status code |
+
+Use this metric to detect scans, bot traffic, abuse spikes, and firewall/rate-limit pressure without paying for full trace enrichment on every rejected request.
 
 <Callout type="info" title="Sub-requests are not recorded">
 Internal Symfony sub-requests (e.g. ESI fragments, error pages rendered internally) are silently skipped. Only the primary request is recorded.
@@ -85,7 +96,7 @@ Use this to build an alert: `failures_total / commands_total > 0.01` (more than 
 
 ## Messaging
 
-`MessagingMetricsDecorator` wraps `EventBusInterface`.
+`MessagingMetricsDecorator` wraps event dispatch and message handling paths.
 
 ### `{ns}_messaging_events_dispatched_total` — Counter
 
@@ -95,44 +106,63 @@ Incremented every time an event is dispatched to the bus.
 |---|---|
 | `event` | `OrderPlaced` |
 
-### `{ns}_messaging_produced_total` — Counter
+### `{ns}_messaging_event_failures_total` — Counter
 
-Incremented for each event sent to a message broker (Kafka, etc.).
+Incremented when event dispatch or handling fails.
 
 | Label | Example |
 |---|---|
 | `event` | `OrderPlaced` |
-| `transport` | `kafka` |
 
-### `{ns}_messaging_consumed_total` — Counter
+### `{ns}_messaging_event_duration_ms` — Histogram
+
+Observed around event handling.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+
+### `{ns}_messaging_messages_consumed_total` — Counter
 
 Incremented for each event received from a broker.
 
 | Label | Example |
 |---|---|
 | `event` | `OrderPlaced` |
-| `transport` | `kafka` |
+| `consumer` | `orders` |
 
-### `{ns}_messaging_consume_duration_ms` — Histogram
+### `{ns}_messaging_message_retries_total` — Counter
+
+Incremented when a consumed message is retried.
+
+| Label | Example |
+|---|---|
+| `event` | `OrderPlaced` |
+| `consumer` | `orders` |
+
+### `{ns}_messaging_message_duration_ms` — Histogram
 
 Time from message receipt to handler completion.
 
 | Label | Example |
 |---|---|
 | `event` | `OrderPlaced` |
+| `consumer` | `orders` |
 
 Buckets: `[5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000]` ms
 
-### `{ns}_messaging_dead_letter_total` — Counter
+### Backlog gauges
 
-Incremented when a message is moved to the dead letter queue after all retries are exhausted.
+Queue and outbox modules can expose operational gauges:
 
-| Label | Example |
+| Metric | Meaning |
 |---|---|
-| `event` | `OrderPlaced` |
-| `reason` | `max_retries_exceeded` |
+| `{ns}_outbox_backlog_size` | pending outbox message count |
+| `{ns}_outbox_oldest_pending_age_seconds` | age of oldest pending outbox message |
+| `{ns}_dlq_backlog_size` | dead-letter queue size |
+| `{ns}_dlq_oldest_failed_age_seconds` | age of oldest failed message |
 
-This metric should alert immediately — a dead-lettered message requires manual intervention.
+Dead-letter gauges should alert quickly. A growing DLQ normally requires manual intervention.
 
 ---
 
@@ -188,6 +218,51 @@ Use p99 query duration to detect slow query regressions. Set an alert if p99 > 1
 
 ---
 
+## Policy limits and security
+
+Policy and limit middleware emit metrics only on meaningful enforcement points. Successful high-throughput paths avoid logs and extra trace spans by default.
+
+### Rate limits
+
+```txt
+{ns}_rate_limit_allowed_total{policy,scope,controller}
+{ns}_rate_limit_blocked_total{policy,scope,controller}
+```
+
+Blocked requests also mark the request as low-value telemetry and increment:
+
+```txt
+{ns}_http_blocked_total{reason="rate_limit",status="429"}
+```
+
+### Quotas
+
+```txt
+{ns}_quota_allowed_total{quota,bucket,period,controller}
+{ns}_quota_blocked_total{quota,bucket,period,controller}
+{ns}_quota_consumed_total{quota,bucket,period,controller}
+```
+
+Quota labels use the resolver bucket, not the raw subject ID. For example, use `bucket="organization"`, not `organization_id="org_123"`.
+
+### Feature access and flags
+
+```txt
+{ns}_feature_access_allowed_total{feature,controller}
+{ns}_feature_access_denied_total{feature,controller}
+{ns}_feature_flag_evaluations_total{flag,result}
+```
+
+### Security events
+
+```txt
+{ns}_security_events_total{reason}
+```
+
+Security-blocked requests also increment `{ns}_http_blocked_total` with reasons such as `ip_filter`, `csrf`, `cors`, or `signature`.
+
+---
+
 ## Cardinality — the most important concept in metrics
 
 Every unique combination of label values creates a separate time series. Labels multiply — if a metric has 3 labels each with 10 possible values, you have up to 1,000 time series for that one metric.
@@ -209,7 +284,15 @@ High cardinality is the most common mistake in metrics design. Every metrics sys
 
 **Never use IDs, emails, or free-text strings as label values.** If you need to query by user, use tracing (where you can attach any attribute to a single span) not metrics.
 
-The framework auto-instrumentation uses only low-cardinality values — method, route, status code, command short name, event short name. When you add custom metrics, apply the same discipline.
+The framework auto-instrumentation uses only low-cardinality values — method, route, status code, command short name, event short name, policy name, bucket name, and period. When you add custom metrics, apply the same discipline.
+
+Framework metrics use enum-backed label keys internally. This keeps framework instrumentation consistent and avoids ad hoc label strings in hot paths.
+
+## Blocked traffic trace dropping
+
+Rate-limited requests, security-blocked requests, and basic `404` responses are still counted, but full trace enrichment is skipped. Vortos records a cheap blocked counter and avoids building expensive telemetry for abuse traffic.
+
+This protects both CPU and observability spend during scans, crawler bursts, and deliberate rate-limit attacks.
 
 ---
 

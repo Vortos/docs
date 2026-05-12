@@ -8,7 +8,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 # Integrations
 
-Vortos outputs to open standards — structured JSON logs, Prometheus metrics, and OpenTelemetry traces. Any tool that speaks these standards works. This section covers step-by-step setup for the most common ones.
+Vortos outputs to open standards — structured JSON logs, Prometheus metrics, OpenTelemetry OTLP metrics, and OpenTelemetry traces. Any tool that speaks these standards works. This section covers step-by-step setup for the most common ones.
 
 ## The three pillars of observability
 
@@ -17,7 +17,7 @@ Before picking tools, it helps to understand what each pillar is for:
 | Pillar | What it answers | Vortos output |
 |---|---|---|
 | **Logs** | What happened and when | Structured JSON → stderr / log files |
-| **Metrics** | How much, how fast, how often | Prometheus exposition format or StatsD UDP |
+| **Metrics** | How much, how fast, how often | Prometheus pull, StatsD UDP, or OpenTelemetry OTLP push |
 | **Traces** | Why was this request slow | OpenTelemetry OTLP |
 
 The tools below consume one or more of these pillars. Some (Grafana, Datadog) consume all three.
@@ -49,7 +49,7 @@ If you want everything wired up locally in one command, start with the local sta
 Integration guides in this section focus on the external tool side — installation, accounts, and connection. For the Vortos configuration that feeds these tools, see:
 
 - [Logger configuration](/docs/logger) — alerting handlers (Sentry, Slack, email), channels, log format
-- [Metrics configuration](/docs/metrics) — adapter selection, Prometheus endpoint security, StatsD host
+- [Metrics configuration](/docs/metrics) — adapter selection, Prometheus endpoint security, StatsD host, OTLP metrics push
 - [Tracing configuration](/docs/tracing) — OpenTelemetry wiring, sampling, module disable
 
 <Callout type="info" title="No lock-in">

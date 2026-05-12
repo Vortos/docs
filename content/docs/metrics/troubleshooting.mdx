@@ -1,0 +1,177 @@
+---
+title: Metrics Troubleshooting
+description: Fix missing metrics, wrong adapters, OTLP endpoint mistakes, Prometheus storage issues, blocked traffic behavior, and cardinality problems.
+---
+
+# Metrics Troubleshooting
+
+Use this checklist when metrics are missing, delayed, too noisy, or too expensive.
+
+## First checks
+
+1. Confirm `MetricsPackage` is registered.
+2. Confirm the adapter is not `MetricsAdapter::NoOp`.
+3. Confirm `config/metrics.php` is loaded for the current environment.
+4. Confirm the metric name was declared if it is an application-owned metric.
+5. Confirm the labels passed at runtime exactly match the declared label names.
+6. Confirm the module was not disabled with `disableModule(...)`.
+
+## No metrics in development
+
+The default adapter is NoOp. That is intentional.
+
+```php
+$config->adapter(MetricsAdapter::Prometheus);
+```
+
+or:
+
+```php
+$config->adapter(MetricsAdapter::OpenTelemetry);
+```
+
+## Prometheus scrape returns empty or wrong values
+
+Check the `/metrics` endpoint is registered and reachable:
+
+```bash
+curl -H "Authorization: Bearer ${METRICS_TOKEN}" http://localhost/metrics
+```
+
+In FrankenPHP worker mode, do not use in-memory Prometheus storage. Each worker would hold separate counters and the scrape would see whichever worker handled that scrape.
+
+```php
+$config->prometheusStorageRedis(
+    prefix: 'metrics:',
+    host: $_ENV['REDIS_HOST'] ?? '127.0.0.1',
+    port: 6379,
+    password: $_ENV['REDIS_PASSWORD'] ?? '',
+);
+```
+
+Use APC storage for PHP-FPM on a single host, and Redis for FrankenPHP, multiple hosts, or any setup where workers must share metric state.
+
+## Prometheus endpoint returns 401 or 403
+
+In production, the endpoint must be protected by a bearer token or explicitly opened because the network already protects it.
+
+```php
+$config->prometheusEndpointToken($_ENV['METRICS_TOKEN'] ?? '');
+```
+
+or:
+
+```php
+$config->prometheusEndpointOpenAccess();
+```
+
+Only use open access behind a firewall, private network, reverse proxy allowlist, or service mesh policy.
+
+## OTLP metrics do not arrive
+
+Check the endpoint is a metrics endpoint:
+
+```txt
+http://otel-collector:4318/v1/metrics
+```
+
+Common mistakes:
+
+| Mistake | Fix |
+|---|---|
+| using `/v1/traces` | use `/v1/metrics` |
+| missing SDK/exporter | install `open-telemetry/sdk` and `open-telemetry/exporter-otlp` |
+| missing HTTP client | install `guzzlehttp/guzzle` or another PSR-18 client |
+| vendor auth header missing | use `newRelicOtlp(...)`, `datadogOtlp(...)`, or collector config |
+| collector only listens on localhost | bind collector HTTP receiver to `0.0.0.0:4318` in containers |
+
+## OTLP flush warnings appear in logs
+
+Vortos logs `metrics.otlp.flush_failed` when the OpenTelemetry exporter throws during flush. The request still succeeds.
+
+Fix the collector or endpoint, but do not raise the app timeout just to hide the warning. Keep the app timeout strict and move retry/backoff to the collector.
+
+## StatsD metrics do not arrive
+
+StatsD uses UDP. Check:
+
+- the agent host and port
+- UDP port exposure in Docker
+- firewall rules
+- DogStatsD non-local traffic setting when app and agent are in different containers
+
+```php
+$config
+    ->adapter(MetricsAdapter::StatsD)
+    ->statsDHost($_ENV['STATSD_HOST'] ?? '127.0.0.1')
+    ->statsDPort(8125);
+```
+
+UDP is fire-and-forget. If the agent is down, packets are dropped by design.
+
+## Metrics volume is too high
+
+Disable noisy modules:
+
+```php
+$config->disableModule(MetricsModule::Cache, MetricsModule::Persistence);
+```
+
+For StatsD, reduce sample rate:
+
+```php
+$config->statsDSampleRate(0.1);
+```
+
+For Prometheus with Redis storage, remember that high-volume counters can become high-volume Redis operations.
+
+## Cardinality exploded
+
+Every unique label combination creates a time series. Remove unbounded labels immediately.
+
+Do not use:
+
+- user ID
+- email
+- IP address
+- request ID
+- order ID
+- raw URL path
+- search query
+- exception message
+
+Use:
+
+- route name
+- status code
+- status family
+- command short name
+- event short name
+- plan name
+- bucket name
+
+## Blocked traffic metrics
+
+Rejected traffic is counted through:
+
+```txt
+{ns}_http_blocked_total{reason,status}
+```
+
+Rate-limited requests, security-blocked requests, and basic `404` responses also drop expensive trace enrichment. This keeps scans and abuse spikes from turning into a telemetry cost spike.
+
+## Logs contain dynamic data in the message
+
+The logging redactor protects structured `context` and `extra` arrays. It also escapes CRLF in the message string, but it does not regex-scan arbitrary message text for PII because that would add runtime cost.
+
+Use static messages and context:
+
+```php
+$logger->info('Login failed', ['email' => $email]);
+```
+
+Do not concatenate user input into the message:
+
+```php
+$logger->info('Login failed for ' . $email);
+```

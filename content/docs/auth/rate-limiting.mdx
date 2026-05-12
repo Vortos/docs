@@ -211,9 +211,12 @@ Metrics:
 ```txt
 rate_limit_allowed_total{policy,scope,controller}
 rate_limit_blocked_total{policy,scope,controller}
+http_blocked_total{reason,status}
 ```
 
 Logs are emitted on blocked requests. Tracing records deny events when tracing is configured.
+
+Rate-limited requests also mark the request as low-value telemetry. Vortos increments `http_blocked_total{reason="rate_limit",status="429"}` and skips expensive trace enrichment for the rejected request.
 
 Success paths only increment metrics by default. This keeps high-throughput endpoints efficient under FrankenPHP worker mode.
 

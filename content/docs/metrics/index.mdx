@@ -1,6 +1,6 @@
 ---
 title: Metrics
-description: Counters, gauges, and histograms across HTTP, CQRS, messaging, cache, and persistence — NoOp by default, Prometheus or StatsD when you need real numbers.
+description: Counters, gauges, and histograms across HTTP, CQRS, messaging, cache, persistence, policy limits, and security — NoOp by default, Prometheus pull, StatsD push, or OpenTelemetry OTLP push when you need real numbers.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -8,7 +8,7 @@ import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # Metrics
 
-`vortos-metrics` records runtime performance numbers across every major framework module. NoOp by default — zero overhead until you configure an adapter. When you switch to Prometheus or StatsD, counters, gauges, and histograms start flowing with no code changes required.
+`vortos-metrics` records runtime performance numbers across every major framework module. NoOp by default — zero overhead until you configure an adapter. When you switch to Prometheus, StatsD, or OpenTelemetry OTLP, counters, gauges, and histograms start flowing with no code changes required.
 
 ## What are metrics and why do they matter?
 
@@ -43,6 +43,12 @@ For the Prometheus adapter, also install the client library:
 
 ```bash
 composer require promphp/prometheus_client_php
+```
+
+For the OpenTelemetry OTLP metrics adapter, install the official OpenTelemetry packages and a PSR-18 HTTP client:
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp guzzlehttp/guzzle
 ```
 
 ## Package registration
@@ -104,6 +110,32 @@ return static function (VortosMetricsConfig $config): void {
 };
 ```
 
+### OpenTelemetry OTLP metrics push
+
+Use OTLP when you want vendor-neutral push metrics to an OpenTelemetry Collector, New Relic, Datadog, Honeycomb, or another OTLP-compatible backend.
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service(
+            name: 'checkout-api',
+            version: $_ENV['APP_VERSION'] ?? '',
+            environment: $_ENV['APP_ENV'] ?? 'prod',
+        )
+        ->otlpCollector(
+            endpoint: $_ENV['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'] ?? 'http://otel-collector:4318/v1/metrics',
+            timeoutMs: 200,
+        );
+};
+```
+
+The OTLP adapter uses the official OpenTelemetry SDK and exporter. It calls `forceFlush()` at request, command, and error lifecycle boundaries. It does not call `shutdown()` per request, so long-running FrankenPHP workers keep a live meter provider for the next request.
+
 ---
 
 ## Configuration reference
@@ -145,6 +177,15 @@ return static function (VortosMetricsConfig $config): void {
     $config->statsDHost('127.0.0.1')
            ->statsDPort(8125)
            ->statsDSampleRate(0.1);   // send 10% of metrics (reduces UDP volume)
+
+    // OpenTelemetry OTLP metrics settings
+    $config
+        ->service('checkout-api', version: $_ENV['APP_VERSION'] ?? '', environment: $_ENV['APP_ENV'] ?? 'prod')
+        ->otlpCollector('http://otel-collector:4318/v1/metrics', timeoutMs: 200);
+
+    // Direct vendor helpers (choose one instead of otlpCollector when pushing directly)
+    // $config->newRelicOtlp($_ENV['NEW_RELIC_LICENSE_KEY'] ?? '');
+    // $config->datadogOtlp($_ENV['DD_API_KEY'] ?? '', site: $_ENV['DD_SITE'] ?? 'datadoghq.com');
 
     // Silence high-cardinality or high-volume modules
     $config->disableModule(MetricsModule::Cache);
@@ -200,17 +241,35 @@ All of these are recorded without any code changes. To see the full label set fo
 |---|---|---|
 | `{ns}_http_requests_total` | Counter | HTTP |
 | `{ns}_http_request_duration_ms` | Histogram | HTTP |
+| `{ns}_http_blocked_total` | Counter | HTTP / Security |
 | `{ns}_cqrs_commands_total` | Counter | CQRS |
 | `{ns}_cqrs_command_duration_ms` | Histogram | CQRS |
 | `{ns}_cqrs_command_failures_total` | Counter | CQRS |
+| `{ns}_cqrs_queries_total` | Counter | CQRS |
+| `{ns}_cqrs_query_duration_ms` | Histogram | CQRS |
+| `{ns}_cqrs_query_failures_total` | Counter | CQRS |
 | `{ns}_messaging_events_dispatched_total` | Counter | Messaging |
-| `{ns}_messaging_produced_total` | Counter | Messaging |
-| `{ns}_messaging_consumed_total` | Counter | Messaging |
-| `{ns}_messaging_consume_duration_ms` | Histogram | Messaging |
-| `{ns}_messaging_dead_letter_total` | Counter | Messaging |
+| `{ns}_messaging_event_failures_total` | Counter | Messaging |
+| `{ns}_messaging_event_duration_ms` | Histogram | Messaging |
+| `{ns}_messaging_messages_consumed_total` | Counter | Messaging |
+| `{ns}_messaging_message_retries_total` | Counter | Messaging |
+| `{ns}_messaging_message_duration_ms` | Histogram | Messaging |
+| `{ns}_outbox_backlog_size` | Gauge | Messaging |
+| `{ns}_outbox_oldest_pending_age_seconds` | Gauge | Messaging |
+| `{ns}_dlq_backlog_size` | Gauge | Messaging |
+| `{ns}_dlq_oldest_failed_age_seconds` | Gauge | Messaging |
 | `{ns}_cache_operations_total` | Counter | Cache |
 | `{ns}_db_queries_total` | Counter | Persistence |
 | `{ns}_db_query_duration_ms` | Histogram | Persistence |
+| `{ns}_security_events_total` | Counter | Security |
+| `{ns}_rate_limit_allowed_total` | Counter | Rate Limit |
+| `{ns}_rate_limit_blocked_total` | Counter | Rate Limit |
+| `{ns}_quota_allowed_total` | Counter | Quota |
+| `{ns}_quota_blocked_total` | Counter | Quota |
+| `{ns}_quota_consumed_total` | Counter | Quota |
+| `{ns}_feature_access_allowed_total` | Counter | Feature Access |
+| `{ns}_feature_access_denied_total` | Counter | Feature Access |
+| `{ns}_feature_flag_evaluations_total` | Counter | Feature Flags |
 
 `{ns}` is the configured namespace (default: `vortos`).
 
@@ -219,7 +278,9 @@ All of these are recorded without any code changes. To see the full label set fo
 ## Module overview
 
 <Cards>
-  <Card title="Adapters" href="/docs/metrics/adapters" description="NoOp, Prometheus, StatsD — choosing the right adapter, multi-process storage for FrankenPHP." />
+  <Card title="Adapters" href="/docs/metrics/adapters" description="NoOp, Prometheus, StatsD, and OpenTelemetry OTLP — choosing pull or push for each runtime." />
+  <Card title="OpenTelemetry OTLP" href="/docs/metrics/opentelemetry-otlp" description="Vendor-neutral push metrics to an OTel Collector, New Relic, or Datadog with worker-safe flushing." />
   <Card title="Auto-Instrumentation" href="/docs/metrics/auto-instrumentation" description="What each module records, label design, cardinality, and how to disable noisy modules." />
   <Card title="Prometheus Endpoint" href="/docs/metrics/prometheus-endpoint" description="Securing the /metrics endpoint, scrape configuration, and Grafana dashboards." />
+  <Card title="Troubleshooting" href="/docs/metrics/troubleshooting" description="No data, wrong adapter, OTLP endpoint mistakes, Prometheus storage, blocked traffic, and cardinality issues." />
 </Cards>

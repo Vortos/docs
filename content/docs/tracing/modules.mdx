@@ -7,6 +7,8 @@ description: TracingModule enum — disable tracing for specific framework modul
 
 `ModuleAwareTracer` sits at the outermost layer of the decorator chain. It reads the `vortos.module` attribute from `startSpan()` calls and returns `NoOpSpan` immediately for disabled modules — the sampling check and inner tracer are never called.
 
+For framework-owned hot paths, Vortos also removes disabled instrumentation at container build time where possible. For example, disabling HTTP tracing removes the HTTP tracing subscriber instead of injecting it and checking a gate on every request.
+
 ## TracingModule Enum
 
 ```php
@@ -81,6 +83,12 @@ Spans without a `vortos.module` attribute always pass through — no module tag 
 | `Http` | Rarely | HTTP spans are often the most useful for debugging |
 | `Persistence` | Never in prod | DB query spans are gold for performance debugging |
 | `Messaging` | Never | Consumer spans are critical for message flow debugging |
+
+## Blocked traffic
+
+Rate-limited requests, security-blocked requests, and basic `404` responses are intentionally cheap. The request is counted by metrics through `http_blocked_total`, but expensive trace enrichment is skipped.
+
+This prevents bot scans and abuse traffic from creating high trace volume or vendor cost.
 
 ## Custom Spans with Module Tags
 

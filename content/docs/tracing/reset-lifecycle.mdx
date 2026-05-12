@@ -77,6 +77,19 @@ When a span ends normally, `OpenTelemetrySpan` detaches its own scope and tells 
 
 If code forgets to end a span, throws before cleanup, or extracts context without ending every nested span, `OpenTelemetryTracer::reset()` detaches whatever scopes remain.
 
+## Metrics flush vs shutdown
+
+OpenTelemetry metrics have a separate lifecycle:
+
+| Event | Action |
+|---|---|
+| request or command terminates | `forceFlush()` |
+| PHP process exits | `shutdown()` |
+
+`forceFlush()` exports pending metric data and keeps the provider usable for the next request. `shutdown()` permanently closes the provider and is only safe when the PHP process is exiting.
+
+In FrankenPHP worker mode, never call an OpenTelemetry provider's `shutdown()` at the end of a request. The next request would reuse a closed provider.
+
 ## Why this matters
 
 Without reset, a persistent worker can produce traces like:

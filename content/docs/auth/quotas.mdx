@@ -290,6 +290,8 @@ It logs denies, unresolved subjects, and Redis store failures to the security ch
 
 Success paths avoid extra logs and trace spans to keep FrankenPHP worker throughput predictable.
 
+Framework metrics use low-cardinality labels only. Resolver bucket names such as `user`, `organization`, or `workspace` are safe labels. Raw subject IDs such as `user_123`, `org_456`, emails, and request IDs are not safe metric labels.
+
 ## Security Rules
 
 - Resolver classes are validated at container compile time.

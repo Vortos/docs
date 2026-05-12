@@ -1,13 +1,23 @@
 ---
 title: Adapters
-description: NoOp, Prometheus, and StatsD — choosing the right metrics backend, storage backends for Prometheus in multi-process environments.
+description: NoOp, Prometheus, StatsD, and OpenTelemetry OTLP — choosing the right metrics backend, pull vs push, and worker-safe runtime behavior.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Metrics Adapters
 
-`vortos-metrics` ships three adapters. You switch between them in `config/metrics.php` with a single call — all auto-instrumentation works the same regardless of which adapter is active.
+`vortos-metrics` ships four adapters. You switch between them in `config/metrics.php` with a single call — all auto-instrumentation works the same regardless of which adapter is active.
+
+## Pull vs push
+
+| Model | Adapter | How data leaves the process | Best for |
+|---|---|---|---|
+| Pull | Prometheus | Prometheus scrapes `GET /metrics` | Self-hosted Prometheus and Grafana |
+| Push | StatsD | UDP packets to a local agent | DogStatsD, Telegraf, Graphite |
+| Push | OpenTelemetry OTLP | HTTP/protobuf to a collector or vendor endpoint | Vendor-neutral metrics, New Relic, Datadog, OTel Collector |
+
+Prometheus pull is excellent when your monitoring system can reach every app instance. OTLP push is better when your app should send to a local sidecar, collector, or managed vendor endpoint. StatsD is the simplest low-latency push path when a UDP agent is already part of your platform.
 
 ---
 
@@ -143,15 +153,109 @@ vortos.http_requests_total:1|c|#method:POST,route:orders.place,status:201
 
 ---
 
+## OpenTelemetry OTLP
+
+OpenTelemetry OTLP is the vendor-neutral push adapter. Vortos records metrics through `MetricsInterface`, bridges them to the official OpenTelemetry PHP SDK, then exports them as OTLP HTTP/protobuf.
+
+Vortos does not implement custom protobuf serialization. The adapter requires:
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp guzzlehttp/guzzle
+```
+
+### Enable OTLP
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service('checkout-api', version: $_ENV['APP_VERSION'] ?? '', environment: $_ENV['APP_ENV'] ?? 'prod')
+        ->otlp(
+            endpoint: $_ENV['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'] ?? 'http://otel-collector:4318/v1/metrics',
+            headers: [],
+            timeoutMs: 200,
+        );
+};
+```
+
+### Collector helper
+
+```php
+$config->otlpCollector(
+    endpoint: 'http://otel-collector:4318/v1/metrics',
+    timeoutMs: 200,
+);
+```
+
+### New Relic helper
+
+```php
+$config->newRelicOtlp(
+    licenseKey: $_ENV['NEW_RELIC_LICENSE_KEY'] ?? '',
+    timeoutMs: 200,
+);
+```
+
+### Datadog helper
+
+```php
+$config->datadogOtlp(
+    apiKey: $_ENV['DD_API_KEY'] ?? '',
+    site: $_ENV['DD_SITE'] ?? 'datadoghq.com',
+    timeoutMs: 200,
+);
+```
+
+Use the vendor helper only when your app pushes directly to the vendor. In larger deployments, prefer pushing to a local OpenTelemetry Collector and let the collector handle vendor credentials, retries, batching, and routing.
+
+### Lifecycle safety
+
+The OTLP adapter flushes at lifecycle boundaries:
+
+```txt
+HTTP request terminate -> forceFlush()
+console command terminate -> forceFlush()
+console command error -> forceFlush()
+process shutdown -> shutdown()
+```
+
+`forceFlush()` is per request or command. `shutdown()` is only registered for actual process exit. This distinction matters in FrankenPHP worker mode: calling `shutdown()` after request 1 would close the meter provider and break request 2.
+
+There is no `intervalMs` timer. PHP-FPM and FrankenPHP worker mode both use lifecycle-driven flushing instead of fake background timers.
+
+### Timeout and retry policy
+
+The OTLP transport uses a strict timeout. The default is `200ms`; configured values are clamped between `50ms` and `1000ms`.
+
+```php
+$config->otlpCollector(timeoutMs: 200);
+```
+
+Retries are disabled in the application process. If the collector or vendor endpoint is slow, Vortos drops that flush, writes a local warning if logging is available, and returns the worker to the pool. Monitoring must not degrade application availability.
+
+### Memory behavior
+
+The adapter caches OpenTelemetry instruments by metric name, not by label value. Label values are attached at record time. That keeps instrument caches bounded by your declared metric set.
+
+Gauges keep the last value per label set, so do not use unbounded labels such as user ID, email, IP address, request ID, order ID, or raw URL path.
+
+---
+
 ## Choosing an adapter
 
 | Scenario | Recommended adapter |
 |---|---|
 | Local development | NoOp (default) |
 | Production with Grafana / Prometheus | Prometheus + Redis storage |
-| Production with Datadog | StatsD (DogStatsD) |
+| Production with an OpenTelemetry Collector | OpenTelemetry OTLP |
+| Production with New Relic | OpenTelemetry OTLP |
+| Production with Datadog | OpenTelemetry OTLP or StatsD (DogStatsD) |
 | Production with Graphite | StatsD |
 | CI / testing | NoOp (default) |
-| FrankenPHP worker mode | Prometheus + Redis, or StatsD |
+| FrankenPHP worker mode | Prometheus + Redis, StatsD, or OpenTelemetry OTLP |
 
-For FrankenPHP specifically: both Prometheus+Redis and StatsD work correctly. Prometheus+Redis gives you the Grafana/Tempo exemplar integration. StatsD is simpler to set up if you already use Datadog.
+For FrankenPHP specifically: Prometheus requires Redis storage for correct cross-worker counters. StatsD works because UDP packets leave the worker immediately. OTLP works because Vortos flushes with `forceFlush()` at lifecycle boundaries and reserves `shutdown()` for actual process exit.

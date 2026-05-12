@@ -102,11 +102,14 @@ rate_limit_blocked_total
 quota_allowed_total
 quota_blocked_total
 quota_consumed_total
+http_blocked_total
 ```
 
 Logs are emitted for denies, blocks, unresolved subjects, and store failures. Successful requests do not produce logs by default.
 
 Tracing records denial and store-failure events when tracing is configured. Success paths avoid extra spans to keep FrankenPHP worker throughput predictable.
+
+Rejected traffic is also protected from telemetry amplification. Rate-limited requests, security blocks, and basic `404` responses increment a cheap `http_blocked_total{reason,status}` metric and skip expensive trace enrichment.
 
 ## Configuration
 

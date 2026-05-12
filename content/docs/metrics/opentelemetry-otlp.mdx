@@ -1,0 +1,278 @@
+---
+title: OpenTelemetry OTLP Metrics
+description: Push Vortos metrics to an OpenTelemetry Collector, New Relic, Datadog, or any OTLP-compatible backend without vendor SDK lock-in.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# OpenTelemetry OTLP Metrics
+
+OpenTelemetry OTLP metrics are the vendor-neutral push path for Vortos. Your application records counters, gauges, and histograms through `MetricsInterface`; Vortos bridges those records to the official OpenTelemetry PHP SDK and exports them over OTLP HTTP/protobuf.
+
+Use this when:
+
+- your platform already runs an OpenTelemetry Collector sidecar or daemon
+- you want to switch between Datadog, New Relic, Grafana Cloud, Honeycomb, or self-hosted storage without changing app code
+- your monitoring system cannot scrape every app instance over HTTP
+- you run in FrankenPHP worker mode and want lifecycle-safe push metrics
+
+## What Vortos does and does not do
+
+Vortos does:
+
+- use `open-telemetry/sdk` and `open-telemetry/exporter-otlp`
+- configure OTLP HTTP/protobuf export
+- flush with `forceFlush()` at request, command, and error boundaries
+- call `shutdown()` only when the PHP process exits
+- apply a strict export timeout so metrics cannot hang a worker
+- keep framework labels low-cardinality
+
+Vortos does not:
+
+- write a custom protobuf serializer
+- run a background timer in PHP
+- retry slow telemetry exports inside the request worker
+- use user IDs, emails, raw paths, or request IDs as metric labels
+
+## Step-by-step: Collector sidecar
+
+<Steps>
+<Step>
+Install the dependencies:
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp guzzlehttp/guzzle
+```
+</Step>
+
+<Step>
+Configure Vortos:
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service(
+            name: 'checkout-api',
+            version: $_ENV['APP_VERSION'] ?? '',
+            environment: $_ENV['APP_ENV'] ?? 'prod',
+        )
+        ->otlpCollector(
+            endpoint: $_ENV['OTEL_EXPORTER_OTLP_METRICS_ENDPOINT'] ?? 'http://otel-collector:4318/v1/metrics',
+            timeoutMs: 200,
+        );
+};
+```
+</Step>
+
+<Step>
+Run an OpenTelemetry Collector:
+
+```yaml title="otel-collector.yaml"
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+```
+
+```yaml title="docker-compose.yml"
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4318:4318"
+```
+</Step>
+
+<Step>
+Generate traffic and verify the collector receives metrics:
+
+```bash
+php vortos list
+curl http://localhost/health
+docker compose logs otel-collector
+```
+</Step>
+</Steps>
+
+## Direct push to New Relic
+
+```php title="config/metrics.php"
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service('checkout-api', version: $_ENV['APP_VERSION'] ?? '', environment: $_ENV['APP_ENV'] ?? 'prod')
+        ->newRelicOtlp($_ENV['NEW_RELIC_LICENSE_KEY'] ?? '', timeoutMs: 200);
+};
+```
+
+For production, prefer sending to a local collector and storing the license key in the collector config. Direct push is useful for simple deployments.
+
+## Direct push to Datadog
+
+```php title="config/metrics.php"
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service('checkout-api', version: $_ENV['APP_VERSION'] ?? '', environment: $_ENV['APP_ENV'] ?? 'prod')
+        ->datadogOtlp(
+            apiKey: $_ENV['DD_API_KEY'] ?? '',
+            site: $_ENV['DD_SITE'] ?? 'datadoghq.com',
+            timeoutMs: 200,
+        );
+};
+```
+
+Set `DD_SITE=datadoghq.eu` for the EU site, or another Datadog site value that matches your account.
+
+## Runtime lifecycle
+
+OTLP metrics are exported by lifecycle, not timer:
+
+| Runtime event | Vortos action |
+|---|---|
+| HTTP request terminates | `forceFlush()` |
+| console command terminates | `forceFlush()` |
+| console command errors | `forceFlush()` |
+| PHP process exits | `shutdown()` |
+
+<Callout type="warn" title="Do not shutdown per request">
+In FrankenPHP worker mode the PHP process handles many requests. Calling `shutdown()` after each request would close the OpenTelemetry meter provider and break later requests. Vortos calls `forceFlush()` per request and reserves `shutdown()` for process exit.
+</Callout>
+
+## Timeout and availability
+
+Telemetry must never make the application unavailable. The OTLP HTTP transport uses a strict timeout:
+
+```php
+$config->otlpCollector(timeoutMs: 200);
+```
+
+The timeout is clamped between `50ms` and `1000ms`. Retries are disabled in the application process. If the collector is down, slow, or unreachable, the flush is dropped and a local warning is logged when logging is available.
+
+If you need retries, backoff, queueing, or vendor failover, put them in the OpenTelemetry Collector. The app worker should fail fast.
+
+## Metric labels
+
+Framework metrics use enum-backed label keys internally. Application metrics still pass label values as arrays:
+
+```php
+$metrics->counter('orders_placed_total', [
+    'currency' => $order->currency(),
+    'channel' => $order->channel(),
+])->increment();
+```
+
+Keep labels low-cardinality. These are safe:
+
+- route name
+- HTTP method
+- HTTP status
+- command short name
+- event short name
+- plan name
+- currency
+
+These are not safe:
+
+- user ID
+- email
+- IP address
+- request ID
+- order ID
+- raw URL
+- search text
+
+When a user identifier is needed for trace attributes or logs, Vortos telemetry helpers hash it with `xxh128` for speed. Do not use that hash as a metric label.
+
+## Blocked traffic and trace dropping
+
+Rate-limited requests, security-blocked requests, and basic `404` traffic are intentionally cheap:
+
+- Vortos increments `{ns}_http_blocked_total{reason,status}`
+- full trace enrichment is skipped
+- the request can still be counted without generating high-cost telemetry
+
+Common `reason` values include:
+
+| Reason | Meaning |
+|---|---|
+| `rate_limit` | request rejected by rate limiting |
+| `ip_filter` | request rejected by IP filtering |
+| `csrf` | request rejected by CSRF protection |
+| `cors` | request rejected by CORS protection |
+| `signature` | request rejected by request signature verification |
+| `not_found` | response status was `404` |
+
+This protects CPU and observability spend during scans, bot traffic, and abuse spikes.
+
+## Troubleshooting
+
+### No metrics arrive
+
+Check the adapter is active:
+
+```php
+$config->adapter(MetricsAdapter::OpenTelemetry);
+```
+
+Then check the endpoint includes the metrics path:
+
+```txt
+http://otel-collector:4318/v1/metrics
+```
+
+`/v1/traces` is for traces, not metrics.
+
+### Container compilation fails
+
+Install the official packages:
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp guzzlehttp/guzzle
+```
+
+The OTLP adapter needs the SDK, the OTLP exporter, and a PSR-18 HTTP client.
+
+### Metrics appear locally but not in the vendor
+
+Send to a collector first and enable the collector `debug` exporter. If the collector sees the metrics, the app is working and the problem is in collector-to-vendor auth or exporter configuration.
+
+### FrankenPHP works on request 1 but not later requests
+
+Do not call the OpenTelemetry provider's `shutdown()` from application code. Vortos handles shutdown at process exit. Per request, only `forceFlush()` should run.
+
+### Collector outage slows requests
+
+Lower the timeout:
+
+```php
+$config->otlpCollector(timeoutMs: 100);
+```
+
+Keep retry logic in the collector, not the app worker.

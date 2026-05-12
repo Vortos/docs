@@ -3,7 +3,9 @@
   "pages": [
     "index",
     "adapters",
+    "opentelemetry-otlp",
     "auto-instrumentation",
-    "prometheus-endpoint"
+    "prometheus-endpoint",
+    "troubleshooting"
   ]
 }

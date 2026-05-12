@@ -1,6 +1,6 @@
 ---
 title: Datadog
-description: Send Vortos metrics via DogStatsD and traces via OpenTelemetry to Datadog — Agent setup and full APM configuration.
+description: Send Vortos metrics via OpenTelemetry OTLP or DogStatsD and traces via OpenTelemetry to Datadog — Agent setup and full APM configuration.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -9,10 +9,11 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 [Datadog](https://www.datadoghq.com) is a fully managed observability platform covering metrics, logs, and traces in one product. Vortos connects to Datadog in two ways:
 
+- **Metrics** via OpenTelemetry OTLP — Vortos pushes OTLP metrics directly to Datadog or to a Collector/Agent
 - **Metrics** via DogStatsD — the Datadog Agent accepts StatsD UDP datagrams and forwards them to Datadog
 - **Traces** via OpenTelemetry OTLP — the Datadog Agent accepts OTLP spans and maps them to Datadog APM traces
 
-You do not need to install a Datadog-specific SDK in your application — Vortos's standard StatsD and OpenTelemetry output is all that's needed.
+You do not need to install a Datadog-specific SDK in your application — Vortos's standard OTLP, StatsD, and OpenTelemetry output is all that's needed.
 
 ---
 
@@ -65,7 +66,40 @@ docker compose up -d datadog-agent
 
 ---
 
-## Step 3 — Configure Vortos metrics (StatsD → DogStatsD)
+## Step 3 — Configure Vortos metrics
+
+### Option A: OTLP metrics push
+
+Use this when you want one vendor-neutral metrics path across Datadog, New Relic, and an OpenTelemetry Collector.
+
+```bash
+composer require open-telemetry/sdk open-telemetry/exporter-otlp guzzlehttp/guzzle
+```
+
+```php title="config/metrics.php"
+use Vortos\Metrics\Config\MetricsAdapter;
+use Vortos\Metrics\DependencyInjection\VortosMetricsConfig;
+
+return static function (VortosMetricsConfig $config): void {
+    $config
+        ->adapter(MetricsAdapter::OpenTelemetry)
+        ->namespace('myapp')
+        ->service('checkout-api', version: $_ENV['APP_VERSION'] ?? '', environment: $_ENV['APP_ENV'] ?? 'prod')
+        ->datadogOtlp(
+            apiKey: $_ENV['DD_API_KEY'] ?? '',
+            site: $_ENV['DD_SITE'] ?? 'datadoghq.com',
+            timeoutMs: 200,
+        );
+};
+```
+
+For larger deployments, push to the local Datadog Agent or OpenTelemetry Collector instead of pushing directly to Datadog:
+
+```php
+$config->otlpCollector('http://datadog-agent:4318/v1/metrics', timeoutMs: 200);
+```
+
+### Option B: StatsD → DogStatsD
 
 ```php title="config/metrics.php"
 use Vortos\Metrics\Config\MetricsAdapter;
@@ -90,6 +124,10 @@ DD_AGENT_HOST=datadog-agent   # Docker service name, or 127.0.0.1 for same-host 
 Vortos uses the DogStatsD tag extension: `|#key:value,key:value`. This is natively supported by the Datadog Agent and maps directly to Datadog metric tags — no conversion needed.
 </Callout>
 
+<Callout type="info" title="OTLP lifecycle">
+The OTLP metrics adapter calls `forceFlush()` at request and command termination, and reserves `shutdown()` for actual process exit. This is safe for both PHP-FPM and FrankenPHP worker mode.
+</Callout>
+
 ---
 
 ## Step 4 — Verify metrics in Datadog
@@ -104,6 +142,8 @@ If the metric doesn't appear within 60 seconds:
 # Check the agent is receiving StatsD traffic
 docker compose exec datadog-agent agent status | grep DogStatsD
 ```
+
+For OTLP metrics, check the Agent or Collector logs first. If the collector sees the data but Datadog does not, the app is working and the issue is usually API key, site, or exporter configuration.
 
 ---
 

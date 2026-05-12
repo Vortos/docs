@@ -49,6 +49,20 @@ $logger->error('Payment failed', ['payment_id' => $id, 'amount' => $amount]);
 $logger->error("Payment {$id} for {$amount} failed");
 ```
 
+This is also a security rule. Vortos redacts structured `context` and `extra` arrays before a record leaves the process. It also escapes carriage returns and newlines in the message string to reduce log injection risk, but it does not scan arbitrary message text for PII at runtime. Runtime regex over every log message is too expensive for high-throughput workers.
+
+Use static messages and put all user-controlled values in context:
+
+```php
+$logger->info('Login failed', ['email' => $email]);
+```
+
+Do not concatenate or interpolate user input into the message:
+
+```php
+$logger->info('Login failed for ' . $email);
+```
+
 ---
 
 ## Installation
@@ -215,6 +229,29 @@ When `vortos-tracing` is active, every log record automatically gets a `trace_id
 All three records share the same `trace_id` — filter on it and you see the complete story of that request across every channel.
 
 This works transparently — no code changes needed. The `CorrelationIdProcessor` reads the current span ID from `TracingInterface` and injects it. When tracing is disabled (NoOpTracer), `currentCorrelationId()` returns `null` and the processor silently skips.
+
+## Redaction
+
+`RedactionProcessor` scrubs structured log data by key:
+
+- exact sensitive keys use a normalized lookup table
+- wildcard custom keys use regex fallback only when configured
+- nested arrays are processed recursively up to a fixed depth
+- message strings have `\r` and `\n` escaped to reduce CRLF log injection
+
+Default sensitive keys include passwords, tokens, authorization headers, API keys, private keys, email, phone, SSN, cookies, and client secrets.
+
+```json
+{
+  "message": "Login failed",
+  "context": {
+    "email": "[REDACTED]",
+    "ip": "203.0.113.10"
+  }
+}
+```
+
+Redaction is not a replacement for safe logging style. Treat the PSR-3 message as a static event name and put all dynamic values in context.
 
 ---
 
