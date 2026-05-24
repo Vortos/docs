@@ -125,19 +125,20 @@ Compression algorithm: `'snappy'`, `'lz4'`, `'gzip'`, `'zstd'`. Reduces network 
 
 ## Domain Events
 
-Domain events are plain PHP objects. The only requirement is that they implement `DomainEventInterface`:
+Domain events extend `DomainEvent` — the abstract base class that provides `aggregateId()`, `occurredAt()`, and `eventVersion()` automatically:
 
 ```php
-use Vortos\Messaging\Contract\DomainEventInterface;
-use Symfony\Component\Uid\UuidV7;
+use Vortos\Domain\Event\DomainEvent;
 
-final readonly class UserRegisteredEvent implements DomainEventInterface
+final readonly class UserRegisteredEvent extends DomainEvent
 {
     public function __construct(
-        public readonly UuidV7 $id,
+        string $aggregateId,
         public readonly string $email,
         public readonly string $name,
-    ) {}
+    ) {
+        parent::__construct($aggregateId);
+    }
 }
 ```
 

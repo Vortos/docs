@@ -1,6 +1,6 @@
 ---
 title: Projections
-description: Update read models from domain events — #[AsProjectionHandler], idempotency with upsert, multi-event handlers.
+description: Update read models from domain events — #[AsProjectionHandler], idempotency with upsert, EventEnvelope for metadata, multi-event handlers.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -16,29 +16,32 @@ Read side:    Kafka → Consumer → ProjectionHandler → ReadRepository → Mo
 
 ## Write a Projection Handler
 
-```php title="src/User/Infrastructure/Projection/UserProjectionHandler.php"
+```php title="src/User/Infrastructure/Messaging/Projection/UserProjection.php"
 use Vortos\Cqrs\Attribute\AsProjectionHandler;
+use Vortos\Messaging\Contract\EventEnvelope;
 
 #[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.read-model')]
-final class UserProjectionHandler
+final class UserProjection
 {
     public function __construct(
-        private UserReadRepository $readRepository,
+        private readonly UserReadRepository $readRepository,
     ) {}
 
-    public function __invoke(UserRegisteredEvent $event): void
+    public function __invoke(UserRegistered $event, EventEnvelope $envelope): void
     {
         // upsert — never insert (idempotency requirement)
-        $this->readRepository->upsert((string) $event->aggregateId(), [
-            '_id'       => (string) $event->aggregateId(),
+        $this->readRepository->upsert($envelope->aggregateId, [
+            '_id'       => $envelope->aggregateId,
             'email'     => $event->email,
             'name'      => $event->name,
             'status'    => 'active',
-            'createdAt' => $event->occurredAt()->format('c'),
+            'createdAt' => $envelope->occurredAt->format(\DateTimeInterface::ATOM),
         ]);
     }
 }
 ```
+
+The first parameter is your POPO event payload. `EventEnvelope` as a second parameter gives you the framework metadata — `aggregateId`, `occurredAt`, `aggregateVersion`, `metadata`, etc. If you only need the payload, omit `EventEnvelope`.
 
 ## #[AsProjectionHandler] Options
 
@@ -62,10 +65,10 @@ Kafka delivers at-least-once. The same event may arrive twice — on replay, on 
 
 ```php
 // CORRECT — upsert is safe to call twice with same data
-$this->readRepository->upsert($event->userId, ['_id' => $event->userId, ...]);
+$this->readRepository->upsert($envelope->aggregateId, ['_id' => $envelope->aggregateId, ...]);
 
 // WRONG — throws on second delivery
-$this->readRepository->insert(['_id' => $event->userId, ...]);
+$this->readRepository->insert(['_id' => $envelope->aggregateId, ...]);
 ```
 
 `MongoReadRepository::upsert()` uses `replaceOne` with `upsert: true` — inserts if not exists, replaces if exists. Calling it twice with the same data produces the same result.
@@ -77,25 +80,24 @@ Handle multiple event types in one projection handler using multiple attributes:
 ```php
 #[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.rm.created')]
 #[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.rm.name-updated')]
-final class UserReadModelHandler
+final class UserReadModelProjection
 {
-    public function __construct(private UserReadRepository $repo) {}
+    public function __construct(private readonly UserReadRepository $repo) {}
 
-    public function __invoke(UserRegisteredEvent|UserNameUpdatedEvent $event): void
+    public function __invoke(UserRegistered|UserNameUpdated $event, EventEnvelope $envelope): void
     {
-        if ($event instanceof UserRegisteredEvent) {
-            $this->repo->upsert((string) $event->aggregateId(), [
-                '_id'   => (string) $event->aggregateId(),
+        if ($event instanceof UserRegistered) {
+            $this->repo->upsert($envelope->aggregateId, [
+                '_id'   => $envelope->aggregateId,
                 'email' => $event->email,
                 'name'  => $event->name,
             ]);
             return;
         }
 
-        // Partial update for name change — load + modify + upsert
-        $doc = $this->repo->findById((string) $event->aggregateId()) ?? [];
+        $doc         = $this->repo->findById($envelope->aggregateId) ?? [];
         $doc['name'] = $event->newName;
-        $this->repo->upsert((string) $event->aggregateId(), $doc);
+        $this->repo->upsert($envelope->aggregateId, $doc);
     }
 }
 ```
@@ -132,3 +134,37 @@ final class AnalyticsProjectionHandler { ... }    // runs last
 ```
 
 Higher priority = runs first.
+
+## Sync Projections in Dev/Test
+
+In production, projections are updated asynchronously: the event flows through the outbox → Kafka → consumer worker before the read model is updated. In tests and local dev this latency means you cannot assert on read-model state immediately after dispatching a command — you would need arbitrary sleeps or polling.
+
+`SyncProjectionEventBusDecorator` solves this. In `dev` and `test` environments it wraps `EventBusInterface` and, after the real `dispatch()` returns, invokes all projection handlers for that event in-process synchronously. The read model is updated before `dispatch()` returns, so tests can assert on it immediately:
+
+```php
+// Test — read model is consistent immediately after dispatch
+$this->commandBus->dispatch(new RegisterUser('alice@example.com', 'Alice'));
+
+// No sleep, no polling — the projection already ran synchronously
+$user = $this->userReadRepository->findByEmail('alice@example.com');
+$this->assertNotNull($user);
+$this->assertSame('Alice', $user['name']);
+```
+
+### How It Is Registered
+
+`MessagingExtension` registers `SyncProjectionEventBusDecorator` automatically in `dev` and `test` environments. No configuration is needed.
+
+To opt out in dev when you want to test the real Kafka flow end-to-end, set:
+
+```bash
+VORTOS_SYNC_PROJECTIONS=false
+```
+
+### Error Handling
+
+Projection errors inside the decorator are logged and swallowed — the same way a real Kafka consumer handles transient failures before DLQ. This prevents a broken projection from masking the real domain error when a command fails.
+
+<Callout type="info" title="Production Only: Zero Impact">
+`SyncProjectionEventBusDecorator` is never active in production. It is gated by `kernel.env` and `VORTOS_SYNC_PROJECTIONS`. There is no performance or correctness impact on production deployments.
+</Callout>

@@ -93,14 +93,14 @@ Public responses only show per-check status. Detailed responses include latency,
 Vortos reads detail behavior from environment variables:
 
 ```bash
-HEALTH_DETAILS=debug
+HEALTH_DETAILS=never
 HEALTH_TOKEN=change-me
 HEALTH_EXPOSE_ERRORS=false
 ```
 
 | Variable | Default | Values | Meaning |
 |---|---|---|---|
-| `HEALTH_DETAILS` | `debug` | `debug`, `token`, `never`, `always` | Controls when detailed output is returned |
+| `HEALTH_DETAILS` | `never` | `never`, `token`, `debug`, `always` | Controls when detailed output is returned |
 | `HEALTH_TOKEN` | empty | any secret string | Required when detail access uses the token path |
 | `HEALTH_EXPOSE_ERRORS` | `false` | boolean | Allows raw exception messages outside dev/debug |
 
@@ -114,7 +114,7 @@ Policies:
 | `always` | Detailed output is always returned |
 
 <Callout type="warn" title="Production Default">
-Keep `HEALTH_DETAILS=debug` or `HEALTH_DETAILS=token` in production and set a strong `HEALTH_TOKEN`. Do not use `always` on a public network.
+The default is `never` — detailed output is disabled unless you explicitly set `HEALTH_DETAILS`. For monitored production systems, use `HEALTH_DETAILS=token` and set a strong `HEALTH_TOKEN`. Never use `always` on a public network.
 </Callout>
 
 ## Detailed Output
@@ -165,7 +165,7 @@ Raw exception messages are hidden outside `APP_ENV=dev` and `APP_DEBUG=true` unl
 | `database` | Persistence DBAL | Yes | Executes `SELECT 1` through Doctrine DBAL |
 | `redis` | Cache | Yes | Sends Redis `PING` |
 | `mongodb` | Persistence Mongo | Yes | Sends MongoDB admin `ping` |
-| `kafka` | Messaging | No | Fetches Kafka broker metadata when Kafka transports exist |
+| `kafka` | Messaging (Kafka driver) | No | Fetches Kafka broker metadata when Kafka transports exist |
 
 If a module is not active, its check is not registered.
 
@@ -244,6 +244,61 @@ final class PaymentGatewayHealthCheck implements HealthCheckInterface
 
 The compiler pass auto-registers attributed checks from `src/`. Framework modules register their own checks through their package extension.
 
+## CLI Health Check
+
+Run all registered health checks from the terminal with `vortos:health`:
+
+```bash
+php bin/console vortos:health
+```
+
+```
+VORTOS HEALTH
+────────────────────────────────────────────────────────────
+
+  [OK]     database              1.2ms
+  [OK]     redis                 0.8ms
+  [WARN]   kafka                 2.5ms  [non-critical]
+           broker metadata timeout
+
+────────────────────────────────────────────────────────────
+  2 passed  1 warned  0 failed
+```
+
+Exit code `0` when all critical checks pass, `1` when any critical check fails — compatible with CI pipelines and deployment gates.
+
+### Options
+
+```bash
+# run only critical checks
+php bin/console vortos:health --critical-only
+
+# machine-readable JSON output
+php bin/console vortos:health --format=json
+```
+
+JSON output:
+
+```json
+{
+    "status": "ok",
+    "checks": {
+        "database": {
+            "status": "ok",
+            "latency_ms": 1.2,
+            "critical": true
+        },
+        "redis": {
+            "status": "ok",
+            "latency_ms": 0.8,
+            "critical": true
+        }
+    }
+}
+```
+
+`status` is `ok` when all critical checks pass, `degraded` when any critical check fails. Optional degraded checks are reported but do not change the status to `degraded`.
+
 ## Deployment Examples
 
 Kubernetes:
@@ -273,4 +328,76 @@ Monitoring with details:
 curl -sf \
   -H "X-Health-Token: $HEALTH_TOKEN" \
   http://localhost:8000/health
+```
+
+## Pre-flight Diagnostics
+
+`vortos:doctor` checks configuration correctness before you boot — environment variables, module settings, and known misconfigurations. Unlike `vortos:health` (which probes live infrastructure), `vortos:doctor` checks things that are wrong before any external service is involved.
+
+```bash
+php bin/console vortos:doctor
+```
+
+```
+VORTOS DOCTOR
+────────────────────────────────────────────────────────────
+
+  [OK]     messaging.replay-secret       VORTOS_REPLAY_SECRET is configured
+  [WARN]   messaging.kafka-brokers       KAFKA_BROKERS is not set
+           Fix: Add KAFKA_BROKERS=localhost:9092 to your .env file.
+
+────────────────────────────────────────────────────────────
+  1 passed  1 warned  0 failed
+```
+
+Exit code `0` unless errors are present. Use `--fail-on-warning` to treat warnings as failures in CI:
+
+```bash
+php bin/console vortos:doctor --fail-on-warning
+```
+
+### Built-in Checks
+
+| Check | Module | What it checks |
+|---|---|---|
+| `messaging.replay-secret` | Messaging | `VORTOS_REPLAY_SECRET` is set and ≥ 32 characters |
+
+### Custom Checks
+
+Implement `DoctorCheckInterface` and add `#[AsDoctor]` to register it automatically:
+
+```php title="src/Payment/Infrastructure/Doctor/PaymentGatewayConfigCheck.php"
+use Vortos\Foundation\Doctor\Attribute\AsDoctor;
+use Vortos\Foundation\Doctor\Contract\DoctorCheckInterface;
+use Vortos\Foundation\Doctor\DoctorResult;
+
+#[AsDoctor]
+final class PaymentGatewayConfigCheck implements DoctorCheckInterface
+{
+    public function name(): string
+    {
+        return 'payment.gateway-key';
+    }
+
+    public function run(): DoctorResult
+    {
+        if (getenv('PAYMENT_GATEWAY_KEY') === false) {
+            return DoctorResult::error(
+                $this->name(),
+                'PAYMENT_GATEWAY_KEY is not set — payment processing will fail',
+                'Add PAYMENT_GATEWAY_KEY=<key> to your .env file.',
+            );
+        }
+
+        return DoctorResult::ok($this->name(), 'PAYMENT_GATEWAY_KEY is configured');
+    }
+}
+```
+
+The `run()` method must return a `DoctorResult` — never throw. Three factory methods cover all cases:
+
+```php
+DoctorResult::ok('check.name', 'Everything is fine');
+DoctorResult::warning('check.name', 'Optional thing missing', 'How to fix it');
+DoctorResult::error('check.name', 'Required thing broken', 'How to fix it');
 ```

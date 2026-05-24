@@ -16,7 +16,7 @@ All `#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` attributes are
 ## Implement an Ownership Policy
 
 ```php title="src/Document/Infrastructure/DocumentOwnershipPolicy.php"
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 use Vortos\Auth\Contract\UserIdentityInterface;
 use Vortos\Authorization\Ownership\Contract\OwnershipPolicyInterface;
 
@@ -154,7 +154,7 @@ When `isOwner()` returns false because the resource doesn't exist, the middlewar
 `#[RequiresOwnership]` and `#[RequiresOwnershipOrPermission]` can be placed on individual methods, not just the whole controller class:
 
 ```php
-#[ApiController]
+#[AsController]
 #[Route('/documents')]
 final class DocumentController
 {

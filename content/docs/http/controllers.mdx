@@ -1,26 +1,26 @@
 ---
 title: Controllers
-description: Write controllers with #[ApiController] and Symfony #[Route] — auto-discovered, auto-wired, service-injected.
+description: Write controllers with #[AsController] and Symfony #[Route] — auto-discovered, auto-wired, service-injected.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Controllers
 
-## #[ApiController]
+## #[AsController]
 
-Mark any class with `#[ApiController]` to register it as an HTTP controller:
+Mark any class with `#[AsController]` to register it as an HTTP controller:
 
 ```php title="src/User/Infrastructure/Http/GetUserController.php"
-use Symfony\Component\HttpFoundation\JsonResponse;
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\JsonResponse;
+use Vortos\Http\Request;
 use Symfony\Component\Routing\Attribute\Route;
-use Vortos\Http\Attribute\ApiController;
+use Vortos\Http\Attribute\AsController;
 use Vortos\Auth\Attribute\RequiresAuth;
 use Vortos\Auth\Identity\CurrentUserProvider;
 use Vortos\Cqrs\Query\QueryBusInterface;
 
-#[ApiController]
+#[AsController]
 #[Route('/users/{id}', methods: ['GET'])]
 #[RequiresAuth]
 final class GetUserController
@@ -43,9 +43,9 @@ final class GetUserController
 }
 ```
 
-## What #[ApiController] Does
+## What #[AsController] Does
 
-`#[ApiController]` is an autoconfiguration attribute. When detected, `HttpExtension` autoconfiguration:
+`#[AsController]` is an autoconfiguration attribute. When detected, `HttpExtension` autoconfiguration:
 - Sets the service as `public: true`
 - Adds the tag `vortos.api.controller`
 
@@ -83,7 +83,7 @@ Routes can be on the class or on individual methods:
 
 ```php
 // Class-level — single-action controller (recommended for simple cases)
-#[ApiController]
+#[AsController]
 #[Route('/users/{id}', methods: ['GET'])]
 final class GetUserController
 {
@@ -91,7 +91,7 @@ final class GetUserController
 }
 
 // Method-level — multi-action controller
-#[ApiController]
+#[AsController]
 #[Route('/users')]
 final class UserController
 {
@@ -117,7 +117,7 @@ final class UserController
 Inject any service in the constructor — `ContainerControllerResolver` resolves controllers from the container:
 
 ```php
-#[ApiController]
+#[AsController]
 #[Route('/documents', methods: ['POST'])]
 final class CreateDocumentController
 {
@@ -175,7 +175,7 @@ public function __invoke(Request $request): JsonResponse
 Stack security attributes on controllers freely:
 
 ```php
-#[ApiController]
+#[AsController]
 #[Route('/exports/bulk', methods: ['POST'])]
 #[RequiresAuth]
 #[RequiresPermission('exports.create.any')]

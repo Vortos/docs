@@ -1,0 +1,345 @@
+---
+title: Authorization Generators
+description: Generate resource policies, ownership checks, feature flags, rate limits, quotas, and session policies wired into the Vortos authorization layer.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Authorization Generators
+
+These commands generate the policy classes that enforce business rules around access control, resource ownership, feature availability, rate limiting, and quota management. Every generated class is auto-discovered by the framework.
+
+---
+
+## `vortos:make:authorization-policy`
+
+Generates a resource authorization policy — the class that decides whether a user can perform CRUD actions on a resource.
+
+```bash
+php bin/console vortos:make:authorization-policy <name> \
+    --context=<context> \
+    [--resource=<slug>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Policy name **without** the `Policy` suffix. E.g., `Athlete`, `Document`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--resource` / `-r` | Resource slug used in `#[AsPolicy]`. Defaults to lowercase plural of name. E.g., `Athlete` → `athletes`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:authorization-policy Athlete --context=Sport --resource=athletes
+```
+
+**Creates**
+
+```
+src/Sport/Application/Policy/AthletePolicy.php
+```
+
+**Generated class**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Sport\Application\Policy;
+
+use Vortos\Authorization\Attribute\AsPolicy;
+use Vortos\Authorization\Contract\PolicyInterface;
+use Vortos\Authorization\RoleVoter;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+#[AsPolicy(resource: 'athletes')]
+final class AthletePolicy implements PolicyInterface
+{
+    public function __construct(private readonly RoleVoter $roleVoter) {}
+
+    public function can(UserIdentityInterface $user, string $action, mixed $subject = null): bool
+    {
+        return match ($action) {
+            'list'   => $this->roleVoter->hasAnyRole($user, ['admin', 'viewer']),
+            'read'   => $this->roleVoter->hasAnyRole($user, ['admin', 'viewer']),
+            'create' => $this->roleVoter->hasRole($user, 'admin'),
+            'update' => $this->roleVoter->hasRole($user, 'admin'),
+            'delete' => $this->roleVoter->hasRole($user, 'admin'),
+            default  => false,
+        };
+    }
+}
+```
+
+Adjust the `match` arms to reflect your actual permission model. The `RoleVoter` also supports permission-based checks — see [Policies](/docs/authorization/policies).
+
+---
+
+## `vortos:make:ownership-policy`
+
+Generates an ownership policy — answers "does this user own this resource?"
+
+```bash
+php bin/console vortos:make:ownership-policy <name> --context=<context>
+```
+
+**Example**
+
+```bash
+php bin/console vortos:make:ownership-policy Document --context=Workspace
+```
+
+**Creates** `src/Workspace/Infrastructure/Policy/DocumentOwnershipPolicy.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Workspace\Infrastructure\Policy;
+
+use Vortos\Authorization\Contract\OwnershipPolicyInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Http\Request;
+
+final class DocumentOwnershipPolicy implements OwnershipPolicyInterface
+{
+    public function isOwner(UserIdentityInterface $user, string $resourceId): bool
+    {
+        // return true if $user owns the resource identified by $resourceId
+        return false;
+    }
+
+    public function getResourceIdFrom(Request $request): string
+    {
+        // extract the resource ID from the request (e.g., from route params)
+        return $request->attributes->get('id', '');
+    }
+}
+```
+
+---
+
+## `vortos:make:feature-policy`
+
+Generates a feature access policy — decides whether a user has access to a specific feature.
+
+```bash
+php bin/console vortos:make:feature-policy <name> --context=<context>
+```
+
+**Example**
+
+```bash
+php bin/console vortos:make:feature-policy Subscription --context=Billing
+```
+
+**Creates** `src/Billing/Application/Policy/SubscriptionFeaturePolicy.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Billing\Application\Policy;
+
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Auth\Contract\FeatureAccessPolicyInterface;
+
+final class SubscriptionFeaturePolicy implements FeatureAccessPolicyInterface
+{
+    public function canAccess(UserIdentityInterface $user, string $feature): bool
+    {
+        return match ($feature) {
+            'export'    => $user->hasTier('pro') || $user->hasTier('enterprise'),
+            'api-access' => $user->hasTier('enterprise'),
+            default     => false,
+        };
+    }
+}
+```
+
+---
+
+## `vortos:make:rate-limit-policy`
+
+Generates a rate limit policy — defines the request budget for a user.
+
+```bash
+php bin/console vortos:make:rate-limit-policy <name> --context=<context>
+```
+
+**Example**
+
+```bash
+php bin/console vortos:make:rate-limit-policy Api --context=Http
+```
+
+**Creates** `src/Http/Application/Policy/ApiRateLimitPolicy.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Application\Policy;
+
+use Vortos\Auth\Contract\RateLimitPolicyInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Auth\ValueObject\RateLimitRule;
+
+final class ApiRateLimitPolicy implements RateLimitPolicyInterface
+{
+    public function getLimit(UserIdentityInterface $user): RateLimitRule
+    {
+        // 100 requests per 60 seconds — adjust per user tier
+        return new RateLimitRule(requests: 100, windowSeconds: 60);
+    }
+}
+```
+
+---
+
+## `vortos:make:quota-policy`
+
+Generates a quota policy — controls how much of a resource a user may consume over a billing period.
+
+```bash
+php bin/console vortos:make:quota-policy <name> --context=<context>
+```
+
+**Example**
+
+```bash
+php bin/console vortos:make:quota-policy Storage --context=Billing
+```
+
+**Creates** `src/Billing/Application/Policy/StorageQuotaPolicy.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Billing\Application\Policy;
+
+use Vortos\Auth\Contract\QuotaPolicyInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Auth\ValueObject\QuotaRule;
+use Vortos\Auth\ValueObject\QuotaPeriod;
+
+final class StorageQuotaPolicy implements QuotaPolicyInterface
+{
+    public function getQuota(UserIdentityInterface $user, string $bucket, string $subject): QuotaRule
+    {
+        return new QuotaRule(limit: 1000, period: QuotaPeriod::Monthly);
+    }
+}
+```
+
+---
+
+## `vortos:make:quota-resolver`
+
+Generates a quota subject resolver — extracts the entity whose quota should be checked (e.g., an organisation ID, not a user ID).
+
+```bash
+php bin/console vortos:make:quota-resolver <name> \
+    --context=<context> \
+    [--bucket=<bucket>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Resolver name **without** the `QuotaResolver` suffix. E.g., `Organization`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--bucket` / `-b` | Low-cardinality bucket name used to scope the quota counter. Defaults to snake_case of name. Must match `[a-z0-9._-]+`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:quota-resolver Organization \
+    --context=Billing \
+    --bucket=organization
+```
+
+**Creates** `src/Billing/Infrastructure/Quota/OrganizationQuotaResolver.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Billing\Infrastructure\Quota;
+
+use Vortos\Auth\Contract\QuotaSubjectResolverInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+
+final class OrganizationQuotaResolver implements QuotaSubjectResolverInterface
+{
+    public function bucket(): string
+    {
+        return 'organization';
+    }
+
+    public function resolve(UserIdentityInterface $user): ?string
+    {
+        // return the subject ID — e.g., the organisation the user belongs to
+        return $user->getAttribute('organization_id');
+    }
+}
+```
+
+---
+
+## `vortos:make:session-policy`
+
+Generates a session limit policy — controls how many concurrent sessions a user may have, and what happens when the limit is exceeded.
+
+```bash
+php bin/console vortos:make:session-policy <name> --context=<context>
+```
+
+**Example**
+
+```bash
+php bin/console vortos:make:session-policy User --context=Auth
+```
+
+**Creates** `src/Auth/Application/Policy/UserSessionPolicy.php`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Auth\Application\Policy;
+
+use Vortos\Auth\Contract\SessionPolicyInterface;
+use Vortos\Auth\Contract\UserIdentityInterface;
+use Vortos\Auth\ValueObject\SessionLimitAction;
+
+final class UserSessionPolicy implements SessionPolicyInterface
+{
+    public function getMaxSessions(UserIdentityInterface $user): int
+    {
+        return 1; // single active session per user
+    }
+
+    public function onLimitExceeded(UserIdentityInterface $user): SessionLimitAction
+    {
+        // InvalidateOldest: log out the oldest session when a new one is created
+        // Reject: reject the new login attempt instead
+        return SessionLimitAction::InvalidateOldest;
+    }
+}
+```
+
+<Callout type="info" title="All Policy Types Are Auto-Discovered">
+Every generated policy class is discovered by its respective compiler pass at container compile time. No service registration or tagging is needed — implement the interface and annotate with the correct attribute (or implement the correct interface), and the framework wires it automatically.
+</Callout>

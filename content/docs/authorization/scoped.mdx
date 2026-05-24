@@ -24,7 +24,7 @@ AuthorizationMiddleware checks: does user-456 have 'documents.edit' in org:org-1
 A `ScopeResolverInterface` extracts the scope value from the current request. One resolver per scope name. All are auto-discovered.
 
 ```php title="src/Organization/Infrastructure/OrgScopeResolver.php"
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 use Vortos\Authorization\Scope\Contract\ScopeResolverInterface;
 
 // Auto-discovered — no registration needed

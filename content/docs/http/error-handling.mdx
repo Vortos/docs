@@ -1,6 +1,6 @@
 ---
 title: Error Handling
-description: ErrorController — JSON vs HTML responses, debug vs production mode, PublicExceptionInterface for safe error messages, log levels.
+description: ErrorController — DomainError mapping, JSON vs HTML responses, debug vs production mode, log levels.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -8,6 +8,75 @@ import { Callout } from 'fumadocs-ui/components/callout';
 # Error Handling
 
 `ErrorController` handles all uncaught exceptions. It decides the response format (JSON or HTML), the message to expose, and the log level based on the exception type and request headers.
+
+## Domain Errors
+
+The primary way to signal a named business failure is to throw a `DomainError`. `ErrorController` handles these before any other exception type.
+
+```php
+// Domain layer — declare the error
+#[HttpStatus(404)]
+final class UserNotFoundError extends DomainError
+{
+    public static function forId(string $id): self
+    {
+        return new self("User '{$id}' was not found.", context: ['userId' => $id]);
+    }
+
+    public function errorCode(): string { return 'USER_NOT_FOUND'; }
+}
+
+// Application layer — throw or return Result
+throw UserNotFoundError::forId($id);
+
+// HTTP layer — no extra handling needed; ErrorController catches it
+```
+
+When a `DomainError` reaches `ErrorController`, the JSON response is:
+
+```json
+{
+  "error": true,
+  "code": "USER_NOT_FOUND",
+  "message": "User '123' was not found.",
+  "context": {
+    "userId": "123"
+  }
+}
+```
+
+- `code` — the stable, machine-readable error code. Clients branch on this, not on `message`
+- `message` — human-readable, always shown (domain errors are safe to expose by design)
+- `context` — structured key/value pairs for UI or client SDK use
+
+The HTTP status code is read from `#[HttpStatus]` on the error class via reflection — result cached per class. If the attribute is absent, defaults to `422`.
+
+See [Domain Errors & Result](/docs/domain/errors) for the full guide on defining and using domain errors.
+
+---
+
+## HTTP Exceptions
+
+For infrastructure-level HTTP failures (routing, auth, method not allowed), Vortos provides typed HTTP exceptions:
+
+```php
+use Vortos\Http\Exception\NotFoundException;
+use Vortos\Http\Exception\UnauthorizedException;
+use Vortos\Http\Exception\ForbiddenException;
+use Vortos\Http\Exception\BadRequestException;
+
+throw new NotFoundException('Resource not found');   // 404
+throw new UnauthorizedException('Login required');   // 401
+throw new ForbiddenException('Access denied');       // 403
+```
+
+These all implement `HttpExceptionInterface` and return their specific status code.
+
+<Callout type="info" title="HTTP exceptions vs domain errors">
+Use `NotFoundException` when a route or resource literally does not exist at the HTTP layer (e.g., an unknown route). Use `UserNotFoundError` (a `DomainError`) when a user is looked up by ID and does not exist — that is a business outcome, not an HTTP infrastructure problem.
+</Callout>
+
+---
 
 ## JSON vs HTML
 
@@ -21,20 +90,11 @@ private function wantsJson(Request $request): bool
 }
 ```
 
-**API clients** that send `Content-Type: application/json` or `Accept: application/json` receive:
+API clients that send `Content-Type: application/json` or `Accept: application/json` receive JSON. Browser clients receive an HTML error page.
 
-```json
-{
-  "error": true,
-  "code": 404,
-  "message": "User not found",
-  "trace": []  // only in debug mode
-}
-```
+---
 
-**Browser clients** receive an HTML error page (from `View/error.html.php`).
-
-## Debug Mode
+## Debug vs Production
 
 Enable debug mode in your bootstrap:
 
@@ -42,100 +102,63 @@ Enable debug mode in your bootstrap:
 $container->setParameter('kernel.debug', $_ENV['APP_ENV'] === 'dev');
 ```
 
-In **debug mode** (`kernel.debug = true`):
-- Exception message is always shown (even for 500 errors)
-- Stack trace is included in JSON responses
+In **debug mode**:
+- Stack trace included in JSON responses as `"trace": [...]`
 - Code snippet shown in HTML error page (10 lines around the exception line)
+- All exception messages shown regardless of type
 
-In **production mode** (`kernel.debug = false`):
-- 5xx errors show a generic "Something went wrong" message
-- 4xx errors show the exception message (if `< 500`)
-- `PublicExceptionInterface` exceptions show their message regardless of status code
+In **production mode**:
+- `DomainError` messages are always shown (safe by design)
+- HTTP 4xx exception messages are shown
+- All other exceptions show `"Something went wrong, please try again later."`
 - No stack trace exposed
 
-## HTTP Status Codes
-
-`ErrorController` uses `HttpExceptionInterface` from Symfony:
-
-```php
-// These return their specific HTTP status code:
-use Symfony\Component\HttpKernel\Exception\NotFoundHttpException;
-use Symfony\Component\HttpKernel\Exception\UnauthorizedHttpException;
-use Symfony\Component\HttpKernel\Exception\ForbiddenHttpException;
-
-throw new NotFoundHttpException('User not found');   // 404
-throw new UnauthorizedHttpException('Bearer');        // 401
-
-// Any other exception → 500
-throw new \RuntimeException('Something broke');       // 500
-```
-
-## PublicExceptionInterface
-
-Implement `PublicExceptionInterface` to expose your exception message safely in production:
-
-```php
-use Vortos\Http\Contract\PublicExceptionInterface;
-
-final class UserNotFoundException extends \RuntimeException implements PublicExceptionInterface
-{
-    public function __construct(string $userId)
-    {
-        parent::__construct("User '{$userId}' not found.");
-    }
-}
-
-// This message is shown in production (not hidden behind generic message)
-throw new UserNotFoundException('user-123');
-// Response: {"error": true, "code": 500, "message": "User 'user-123' not found."}
-```
-
-Without `PublicExceptionInterface`, a non-HTTP exception in production returns:
-```json
-{
-  "error": true,
-  "code": 500,
-  "message": "Something went wrong, please try again later."
-}
-```
-
-<Callout type="warn" title="Never expose sensitive data in exception messages">
-Only implement `PublicExceptionInterface` on exceptions whose messages are safe to show users. Never include SQL errors, stack traces, internal service names, or user data in public exception messages.
-</Callout>
+---
 
 ## Log Levels
 
-`ErrorController` logs exceptions at different levels:
+`ErrorController` logs exceptions at different levels based on resolved HTTP status:
 
-| Exception Type | Status Code | Log Level |
+| Exception Type | Status | Log Level |
 |---|---|---|
+| `DomainError` | 5xx | `CRITICAL` |
+| `DomainError` | 4xx | `ERROR` |
 | `HttpExceptionInterface` | 5xx | `CRITICAL` |
 | `HttpExceptionInterface` | 4xx | `ERROR` |
 | Any other exception | — | `CRITICAL` |
 
-4xx errors (client errors) are logged as `ERROR` — they are expected. 5xx errors (server errors) are logged as `CRITICAL` — they require immediate attention.
+4xx errors are expected — clients made bad requests. 5xx errors require attention.
 
-## Register in Bootstrap
-
-`ErrorController` is registered automatically by `HttpExtension` with the configured debug flag:
-
-```php
-// In HttpExtension — already handled:
-$container->register(ErrorController::class, ErrorController::class)
-    ->setArguments(['%kernel.debug%'])
-    ->setPublic(true);
-```
-
-`ErrorListener` uses `ErrorController::class` as the error controller string — Symfony's `ErrorListener` calls it via the controller resolver when an exception occurs.
+---
 
 ## Custom Error Controller
 
-Replace `ErrorController` with your own implementation — register it in `config/services.php` before `HttpPackage` builds:
+Replace `ErrorController` with your own by registering it in `config/services.php`:
 
 ```php
-// Replace the default
 $services->set(ErrorController::class, MyErrorController::class)
     ->arg('$debug', '%kernel.debug%')
     ->arg('$logger', service(LoggerInterface::class))
     ->public();
+```
+
+Your controller must implement `ExceptionHandlerInterface`:
+
+```php
+interface ExceptionHandlerInterface
+{
+    public function handle(\Throwable $e, Request $request): ?Response;
+}
+```
+
+---
+
+## `PublicExceptionInterface`
+
+`PublicExceptionInterface` is a marker interface on non-domain, non-HTTP exceptions that tells `ErrorController` it is safe to show their message in production. It exists for edge cases where a plain exception needs to surface its message — prefer `DomainError` for all new code.
+
+```php
+use Vortos\Http\Contract\PublicExceptionInterface;
+
+final class LegacyException extends \RuntimeException implements PublicExceptionInterface {}
 ```

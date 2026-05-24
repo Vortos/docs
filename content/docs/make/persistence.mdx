@@ -1,0 +1,188 @@
+---
+title: Persistence Generators
+description: Generate PostgreSQL write repositories and MongoDB read repositories with the correct base classes and column maps.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Persistence Generators
+
+These commands generate the infrastructure layer repositories — the concrete classes that read and write your aggregates to the database.
+
+---
+
+## `vortos:make:write-repository`
+
+Generates a PostgreSQL write repository for an aggregate. Also generates the repository interface if it doesn't already exist.
+
+```bash
+php bin/console vortos:make:write-repository <aggregate> [--context=<context>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `aggregate` | Aggregate class name. PascalCase. E.g., `User`, `Order`. |
+| `--context` / `-c` | Bounded context folder name. Defaults to the aggregate name if omitted. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:write-repository User --context=User
+```
+
+**Creates**
+
+```
+src/User/Domain/User/Repository/UserRepositoryInterface.php  (skipped if already exists)
+src/User/Infrastructure/Repository/UserRepository.php
+```
+
+**`UserRepository.php`**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Infrastructure\Repository;
+
+use App\User\Domain\User\User;
+use App\User\Domain\User\UserId;
+use App\User\Domain\User\Repository\UserRepositoryInterface;
+use Vortos\PersistenceDbal\Write\PostgresWriteRepository;
+
+final class UserRepository extends PostgresWriteRepository implements UserRepositoryInterface
+{
+    protected function tableName(): string
+    {
+        return 'users';
+    }
+
+    protected function columnMap(): array
+    {
+        return [
+            'id'      => 'id',
+            'version' => 'version',
+            // add columns here
+        ];
+    }
+
+    protected function toRow(User $aggregate): array
+    {
+        return [
+            'id'      => (string) $aggregate->getId(),
+            'version' => $aggregate->getVersion(),
+            // map aggregate state to DB columns here
+        ];
+    }
+
+    protected function fromRow(array $row): User
+    {
+        return User::reconstruct(
+            UserId::fromString($row['id']),
+            (int) $row['version'],
+        );
+    }
+}
+```
+
+Fill in `columnMap`, `toRow`, and `fromRow` to match your aggregate's state. The base class handles `save`, `update`, `delete`, `findById`, and optimistic locking automatically once these three methods are implemented.
+
+<Callout type="info" title="ORM Variant">
+If `vortos/vortos-persistence-orm` is installed, the generator uses the ORM stub instead. The repository extends `OrmWriteRepository` and uses Doctrine ORM's entity manager rather than DBAL. The interface is unchanged.
+</Callout>
+
+<Callout type="warn" title="Never use batchUpdate for conflict-safe operations">
+`PostgresWriteRepository::batchUpdate()` silently skips rows with version conflicts rather than throwing `OptimisticLockException`. It is suitable only for last-write-wins bulk operations, not for conflict-safe aggregate updates.
+</Callout>
+
+---
+
+## `vortos:make:read-repository`
+
+Generates a MongoDB read repository — the read side of CQRS that serves query results.
+
+```bash
+php bin/console vortos:make:read-repository <aggregate> [--context=<context>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `aggregate` | Aggregate class name. PascalCase. E.g., `User`, `Order`. |
+| `--context` / `-c` | Bounded context folder name. Defaults to the aggregate name if omitted. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:read-repository User --context=User
+```
+
+**Creates**
+
+```
+src/User/Application/ReadModel/UserReadModel.php
+src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php
+```
+
+**`UserReadRepository.php`**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Infrastructure\Repository;
+
+use Vortos\PersistenceMongo\Read\MongoReadRepository;
+
+final class UserReadRepository extends MongoReadRepository
+{
+    protected function collectionName(): string
+    {
+        return 'users';
+    }
+
+    protected function fromDocument(array $document): array
+    {
+        return [
+            'id'    => $document['_id'],
+            // map MongoDB document fields to your read model shape
+        ];
+    }
+
+    protected function indexes(): array
+    {
+        return [
+            // define MongoDB indexes here
+            // ['key' => ['email' => 1], 'unique' => true],
+        ];
+    }
+}
+```
+
+Fill in `fromDocument` to transform MongoDB documents into your read model shape. The `indexes` method declares which indexes MongoDB should maintain — these are created automatically on startup.
+
+<Callout type="warn" title="Store _id as string UUID">
+MongoDB's `_id` field must always be stored as a string UUID, never as `ObjectId`. The `MongoReadRepository` base class enforces this for `save` and `upsert`. Do not cast `_id` to `ObjectId` in your repository — it will break cross-service event correlation.
+</Callout>
+
+### Projection handlers write, read repositories read
+
+The typical flow for a read model:
+
+```
+Event arrives from Kafka
+    └── ProjectionHandler::__invoke()
+            └── UserReadRepository::upsert(['_id' => $event->userId, ...])
+
+Query arrives via HTTP
+    └── GetUserByIdHandler::__invoke()
+            └── UserReadRepository::findOne(['_id' => $query->userId])
+                └── Returns plain array to controller
+```
+
+Use `upsert` in your projection handler (never `insert`) and `findOne` / `findMany` in your query handler.

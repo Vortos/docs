@@ -48,7 +48,7 @@ public function userProducer(): KafkaProducerDefinition
 {
     return KafkaProducerDefinition::create('user.events')
         ->transport('user.events')
-        ->publishes(UserRegisteredEvent::class)
+        ->publishes(UserRegistered::class)
         ->outbox(true);  // default — can be omitted
 }
 ```
@@ -69,23 +69,55 @@ You must create the outbox table in your database. Run this migration:
 
 ```sql
 CREATE TABLE vortos_outbox (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    transport   VARCHAR(255) NOT NULL,
-    event_class VARCHAR(512) NOT NULL,
-    payload     TEXT NOT NULL,
-    headers     JSONB NOT NULL DEFAULT '{}',
-    status      VARCHAR(20) NOT NULL DEFAULT 'pending',
-    attempt_count INT NOT NULL DEFAULT 0,
-    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
-    published_at TIMESTAMP,
-    next_attempt_at TIMESTAMP,
-    failure_reason TEXT
+    id                UUID          PRIMARY KEY,
+    transport_name    VARCHAR(255)  NOT NULL,
+    event_id          UUID          NOT NULL,
+    aggregate_id      VARCHAR(255)  NOT NULL,
+    aggregate_type    VARCHAR(512)  NOT NULL,
+    aggregate_version INTEGER       NOT NULL,
+    payload_type      VARCHAR(512)  NOT NULL,
+    schema_version    INTEGER       NOT NULL DEFAULT 1,
+    occurred_at       TIMESTAMP     NOT NULL,
+    correlation_id    VARCHAR(255),
+    causation_id      VARCHAR(255),
+    trace_id          VARCHAR(255),
+    metadata          JSONB,
+    payload           TEXT          NOT NULL,
+    status            VARCHAR(20)   NOT NULL DEFAULT 'pending',
+    attempt_count     INTEGER       NOT NULL DEFAULT 0,
+    created_at        TIMESTAMP     NOT NULL DEFAULT NOW(),
+    published_at      TIMESTAMP,
+    next_attempt_at   TIMESTAMP,
+    failure_reason    TEXT
 );
 
-CREATE INDEX idx_vortos_outbox_status_created
-    ON vortos_outbox (status, created_at)
+CREATE INDEX idx_vortos_outbox_status_next
+    ON vortos_outbox (status, next_attempt_at)
     WHERE status = 'pending';
+
+CREATE INDEX idx_vortos_outbox_aggregate_occurred
+    ON vortos_outbox (aggregate_id, occurred_at);
+
+CREATE INDEX idx_vortos_outbox_type_occurred
+    ON vortos_outbox (payload_type, occurred_at);
 ```
+
+**Column reference:**
+
+| Column | Description |
+|---|---|
+| `event_id` | UUID of the specific event dispatch |
+| `aggregate_id` | ID of the aggregate that raised the event |
+| `aggregate_type` | FQCN of the aggregate class |
+| `aggregate_version` | Version of the aggregate at time of event |
+| `payload_type` | FQCN of the POPO event class |
+| `schema_version` | Payload schema version (default 1) |
+| `occurred_at` | When the event was recorded by the aggregate |
+| `correlation_id` | Request correlation ID (from `Metadata`) |
+| `causation_id` | ID of the command/event that caused this event |
+| `trace_id` | Distributed trace ID |
+| `metadata` | Full `Metadata` JSON (tenantId, userId, custom fields) |
+| `payload` | JSON-serialized POPO |
 
 <Callout type="info" title="FOR UPDATE SKIP LOCKED">
 Both `fetchPending` (relay) and `fetchFailed` (replay) use `SELECT ... FOR UPDATE SKIP LOCKED`. Running multiple relay or replay workers in parallel is safe — each process locks the rows it is processing and other processes skip those rows entirely. No message is ever processed by two workers simultaneously.
@@ -204,6 +236,50 @@ $config->outbox()
 
 These defaults are production-ready for most workloads. Tune `maxAttempts` and the backoff values to match your Kafka SLA and downstream service recovery times.
 
+## Inspecting Outbox State
+
+Use `vortos:outbox:list` to inspect outbox rows without writing SQL:
+
+```bash
+# show all rows (pending + published + failed)
+php bin/console vortos:outbox:list
+
+# filter by status
+php bin/console vortos:outbox:list --status=failed
+php bin/console vortos:outbox:list --status=pending
+php bin/console vortos:outbox:list --status=published
+
+# filter by transport or event class
+php bin/console vortos:outbox:list --transport=user.events
+php bin/console vortos:outbox:list --event-class="App\\User\\Domain\\Event\\UserRegistered"
+
+# show most recently created first, limit to 20
+php bin/console vortos:outbox:list --latest --limit=20
+```
+
+Example output:
+
+```
+Found 2 outbox row(s) (failed).
+
+  failed   UserRegistered  →  user.events    2min ago   agg: agg-001...  attempts: 5
+           id: 019d4784-7b26-78a6-ba36-3b74ce5ad751
+           reason: Connection refused
+
+  pending  OrderPlaced     →  orders.placed  5s ago     agg: agg-002...  attempts: 0
+           id: 019d4785-93cf-78a6-ba36-3b74ce5ad752
+
+Tip: vortos:outbox:show <id> for full row details · vortos:outbox:replay to reset failed rows
+```
+
+Use `vortos:outbox:show <id>` for the full row — payload, all timestamps, metadata, and correlation IDs:
+
+```bash
+php bin/console vortos:outbox:show 019d4784-7b26-78a6-ba36-3b74ce5ad751
+```
+
+---
+
 ## Replaying Failed Outbox Rows
 
 When a relay attempt exhausts `maxAttempts`, the row is marked `status = 'failed'` and will not be picked up by the relay again. Use `vortos:outbox:replay` to reset these rows back to pending so the relay will retry them:
@@ -212,8 +288,11 @@ When a relay attempt exhausts `maxAttempts`, the row is marked `status = 'failed
 # inspect what will be replayed without making changes
 php bin/console vortos:outbox:replay --dry-run
 
-# replay all failed rows
+# replay all failed rows (prompts for confirmation)
 php bin/console vortos:outbox:replay
+
+# skip the confirmation prompt (safe for CI / cron)
+php bin/console vortos:outbox:replay --force
 
 # replay up to 50 rows (default: 50)
 php bin/console vortos:outbox:replay --limit=50
@@ -222,7 +301,7 @@ php bin/console vortos:outbox:replay --limit=50
 php bin/console vortos:outbox:replay --transport=user.events
 
 # replay only a specific event class
-php bin/console vortos:outbox:replay --event-class="App\\User\\Domain\\Event\\UserCreatedEvent"
+php bin/console vortos:outbox:replay --event-class="App\\User\\Domain\\Event\\UserRegistered"
 
 # replay a single specific row by ID
 php bin/console vortos:outbox:replay --id=019d4784-7b26-78a6-ba36-3b74ce5ad751

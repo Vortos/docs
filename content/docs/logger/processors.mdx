@@ -1,0 +1,199 @@
+---
+title: Processors
+description: The four built-in Monolog processors — what they add to every log record, how they are ordered, and how to configure each one.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Processors
+
+Monolog processors run on every log record before it reaches a handler. They add structured fields to the record's `extra` array — data like trace IDs, file locations, service metadata, and request context. Vortos ships four processors and applies them in a fixed order.
+
+## Processor Execution Order
+
+Processors are added in reverse push order, so they execute as follows:
+
+```
+1. IntrospectionProcessor      adds file, line, class, function
+2. CorrelationIdProcessor      adds trace_id (when tracing is active)
+3. RequestContextProcessor     adds http, user, tenant context
+4. StructuredLogProcessor      adds ECS/OTel service fields
+5. RedactionProcessor          redacts sensitive values   ← runs last
+```
+
+Redaction always runs last — it operates on the complete record including fields added by earlier processors.
+
+---
+
+## IntrospectionProcessor
+
+Adds the source location of the log call to every record.
+
+**Fields added to `extra`:**
+
+```json
+{
+  "file":     "src/User/Application/RegisterUserHandler.php",
+  "line":     42,
+  "class":    "App\\User\\Application\\RegisterUserHandler",
+  "function": "__invoke"
+}
+```
+
+**Configuration:**
+
+```php
+$config->introspection(bool $enabled = true);
+```
+
+Enabled by default in `dev`. Disabled by default in `prod` — file/line lookup traverses the call stack and adds overhead at high throughput.
+
+---
+
+## CorrelationIdProcessor
+
+Injects the active OpenTelemetry trace ID into every log record. When combined with a tracing backend (Jaeger, Tempo), you can jump from a log line to the exact trace that produced it.
+
+**Fields added to `extra`:**
+
+```json
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+}
+```
+
+When `vortos-tracing` is not active or the current request has no active span, the processor silently skips — no `trace_id` field is added.
+
+**Configuration:**
+
+```php
+$config->correlationId(bool $enabled = true);
+```
+
+Enabled by default when `vortos-tracing` is installed.
+
+---
+
+## RequestContextProcessor
+
+Adds HTTP request and user identity context to every record produced during a request. In a FrankenPHP worker where a single PHP process handles many requests sequentially, this processor reads fresh context per-record — it does not cache the request at startup.
+
+**Fields added to `extra`:**
+
+```json
+{
+  "http": {
+    "method":       "POST",
+    "path":         "/users",
+    "client_ip":    "203.0.113.10",
+    "user_agent":   "Mozilla/5.0 ..."
+  },
+  "user": {
+    "id":        "usr_01hx...",
+    "tenant_id": "org_01hy..."
+  }
+}
+```
+
+`user.id` and `user.tenant_id` are populated only when a `UserIdentityInterface` is available in the current request context. Outside HTTP requests (console commands, worker processes), the `http` block is omitted.
+
+**Configuration:**
+
+```php
+$config->requestContext(bool $enabled = true);
+```
+
+Enabled by default.
+
+---
+
+## StructuredLogProcessor
+
+Adds Elastic Common Schema (ECS) and OpenTelemetry-compatible service fields to every record. Log aggregators that understand ECS (Kibana, Datadog) use these fields for automatic service grouping and environment filtering.
+
+**Fields added to `extra`:**
+
+```json
+{
+  "service.name":            "myapp",
+  "service.version":         "1.2.0",
+  "deployment.environment":  "production",
+  "event.dataset":           "myapp.app",
+  "log.logger":              "app"
+}
+```
+
+**Configuration:**
+
+```php
+$config->structured(bool $enabled = true);
+$config->service(string $name, string $version = '', string $environment = '');
+```
+
+Set your service name, version, and environment before the container compiles:
+
+```php
+return static function (VortosLoggingConfig $config): void {
+    $config->structured(true);
+    $config->service(
+        name:        $_ENV['APP_NAME'] ?? 'myapp',
+        version:     $_ENV['APP_VERSION'] ?? '',
+        environment: $_ENV['APP_ENV'] ?? 'prod',
+    );
+};
+```
+
+---
+
+## RedactionProcessor
+
+Scrubs sensitive values from the `context` and `extra` arrays before any record reaches a handler. Runs last — after all other processors have added their fields — to catch values introduced by any processor.
+
+**Default redacted keys:**
+
+```
+password, passwd, secret, token, access_token, refresh_token,
+authorization, api_key, apikey, private_key, client_secret,
+email, phone, ssn, cookie, set_cookie
+```
+
+**Behaviour:**
+
+- Exact key match — `O(1)` lookup against a normalized set
+- Nested arrays — scanned recursively up to a fixed depth
+- Message string — `\r` and `\n` escaped to mitigate CRLF log injection
+- Wildcard custom keys — regex fallback, only applied when custom keys are configured
+
+**Example:**
+
+Input record context:
+```json
+{
+  "email":    "alice@example.com",
+  "password": "hunter2",
+  "ip":       "203.0.113.10"
+}
+```
+
+After redaction:
+```json
+{
+  "email":    "[REDACTED]",
+  "password": "[REDACTED]",
+  "ip":       "203.0.113.10"
+}
+```
+
+**Configuration:**
+
+```php
+// Enable/disable redaction (enabled by default)
+$config->redaction(bool $enabled = true);
+
+// Add custom keys to the redaction list
+$config->redaction(true, ['card_number', 'iban', 'national_id']);
+```
+
+<Callout type="warn" title="Redaction Is Not a Safety Net">
+Redaction catches structured context keys. It does not scan free-text message strings. If you concatenate sensitive data into the message string — `$logger->info("User {$email} logged in")` — it will not be redacted. Always use structured context and static message strings.
+</Callout>

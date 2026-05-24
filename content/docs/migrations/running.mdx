@@ -45,6 +45,30 @@ If the existing schema is correct, run:
 
 This prevents duplicate table errors and avoids hiding drift behind `IF NOT EXISTS`.
 
+## Post-Deploy Verification
+
+After deployment, run `migrate:verify` to confirm the live schema matches what the migrations say it should:
+
+```bash
+php vortos migrate:verify
+```
+
+```
+  ✔ App\Migrations\Version20260505114121
+  ✔ App\Migrations\Version20260507083200
+
+All 2 executed migration(s) verified — schema is clean.
+```
+
+Exit code `0` means every executed framework migration's tables and columns are present. Exit code `1` means drift — the output lists exactly what is missing:
+
+```
+  ✘ App\Migrations\Version20260505114121  [partial]
+      missing table:  role_permissions
+```
+
+Add `--json` for machine-readable output in CI pipelines. Only framework module migrations are verified — user-authored migrations are skipped.
+
 ## Locking
 
 On PostgreSQL, `vortos:migrate` uses an advisory lock so two deployment runners cannot migrate at the same time.

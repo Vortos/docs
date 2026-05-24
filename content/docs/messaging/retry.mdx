@@ -87,17 +87,40 @@ All retries wait the same duration. Use for predictable, low-frequency events wh
 
 ```php
 RetryPolicy::exponential(
-    attempts: int,           // maximum number of retry attempts
-    initialDelayMs: int,     // delay before first retry (ms)
-    maxDelayMs: int = 30000, // maximum delay cap (ms)
-    jitter: bool = true,     // randomize delay to prevent thundering herd
+    attempts: int,               // maximum number of retry attempts
+    initialDelayMs: int,         // delay before first retry (ms)
+    maxDelayMs: int = 30000,     // maximum delay cap (ms)
+    maxReplayLimit: int = 10,    // hard discard after this many DLQ replays
+    jitter: bool = true,         // randomize delay to prevent thundering herd
 ): RetryPolicy
 
 RetryPolicy::fixed(
-    attempts: int,   // maximum number of retry attempts
-    delayMs: int,    // fixed delay between each retry (ms)
+    attempts: int,            // maximum number of retry attempts
+    delayMs: int,             // fixed delay between each retry (ms)
+    maxReplayLimit: int = 10, // hard discard after this many DLQ replays
 ): RetryPolicy
 ```
+
+### `maxReplayLimit`
+
+Every time a message is replayed via `vortos:dlq:replay`, the `x-vortos-global-replays` header is incremented. Before invoking the handler, `ConsumerRunner` compares this counter against `maxReplayLimit`. If the counter exceeds the limit, the message is **hard-discarded** — logged at `ERROR` and silently acknowledged without running any handler or writing another dead letter entry.
+
+This prevents a permanently broken message from cycling through the dead letter store indefinitely:
+
+```
+First processing attempt → fails
+    Retries exhausted → dead-lettered (x-vortos-global-replays: 0)
+
+vortos:dlq:replay run 1 → re-produced with x-vortos-global-replays: 1
+    Handler fails again → dead-lettered (replays: 1)
+
+... (repeated up to maxReplayLimit) ...
+
+vortos:dlq:replay run 11 → x-vortos-global-replays: 11 > limit (10)
+    Hard discard — logged, offset committed, no new DLQ entry
+```
+
+The default limit is `10`. Set it higher for messages that are likely to require many manual replay cycles (e.g., during prolonged outages), or lower for events where repeated failure indicates a structural problem that needs code-level intervention.
 
 ## Kafka Offset and Retry
 

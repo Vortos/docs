@@ -11,23 +11,59 @@ Use this order in production deployments:
 php vortos migrate:publish
 php vortos migrate:status --json
 php vortos migrate --force --no-interaction
+
+# Optional: verify schema integrity after deployment (exits non-zero on drift)
+php vortos migrate:verify
 ```
 
 If status or migrate reports compatible existing schema:
 
 ```bash
-php vortos migrate:adopt Version20260505114121 --verify --dry-run
-php vortos migrate:adopt Version20260505114121 --verify --force
+php vortos migrate:adopt --all-compatible --dry-run
+php vortos migrate:adopt --all-compatible --force
 php vortos migrate --force --no-interaction
 ```
+
+If you have raw SQL user migrations that need adopting:
+
+```bash
+php vortos migrate:adopt --all-compatible --dry-run
+# Review the unverified migrations listed in the output, confirm schema is correct
+php vortos migrate:adopt --all-compatible --allow-unverified --force
+php vortos migrate --force --no-interaction
+```
+
+If you accidentally adopted a wrong migration:
+
+```bash
+php vortos migrate:unadopt Version20260505114121 --force
+```
+
+## CI Schema Verification
+
+`migrate:verify` checks every executed framework migration against the live database schema and exits non-zero if any drift is detected. Run it after a deployment as a post-deploy smoke test:
+
+```bash
+# exits 0 — all executed framework migrations match the live schema
+php vortos migrate:verify
+
+# exits 1 — drift found, lists which migrations and what is missing
+php vortos migrate:verify
+
+# machine-readable output for CI pipelines
+php vortos migrate:verify --json
+```
+
+Only framework module migrations are checked — user-authored migrations are skipped because Vortos has no schema definition for them. If drift is detected after a deployment, the output tells you which migration and which tables or columns are missing.
 
 ## Rules
 
 - Do not run `migrate:fresh` in production.
-- Do not use `migrate:baseline` unless transitioning a fully verified existing database.
 - Do not use `--no-lock` in production.
 - Do not edit old migration classes after they have shipped.
 - Always run `migrate:status` before `migrate` when investigating schema problems.
+- Always run `--dry-run` before adopting in production.
+- Run `migrate:verify` as a post-deploy check to catch schema drift early.
 
 ## Duplicate Table Errors
 

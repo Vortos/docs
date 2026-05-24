@@ -1,154 +1,172 @@
 ---
 title: Read Repositories
-description: Implement MongoReadRepository for query-optimised read models with cursor pagination, index management, and bulk write operations.
+description: Implement typed read repositories backed by MongoDB or PostgreSQL, with cursor pagination and bulk write operations.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Read Repositories
 
-`MongoReadRepository` is the abstract base for all read-side query repositories. Extend it and implement three methods — all standard CRUD operations, cursor pagination, index management, and bulk writes are provided free.
+The read side in Vortos is intentionally separate from the write side. Write repositories own domain aggregates and transactional consistency. Read repositories own query models — flat, denormalised structures optimised for how the UI asks for data.
 
-## Required: Store `_id` as String UUID
+In DDD + CQRS, the read model is an application-layer concern, not a domain concern. Read models live in `Application/ReadModel/`, repositories live in `Infrastructure/Persistence/`.
 
-Always store the `_id` field as a string UUID (UuidV7). Never use MongoDB's `ObjectId` for documents that have UuidV7 identities. Mixing types causes silent type mismatch bugs when querying by ID.
+Vortos provides two abstract base classes depending on your read store:
 
-```php
-// CORRECT — _id is a string
-['_id' => 'user-019d4784-7b26-...', 'email' => 'alice@example.com']
+| Base class | Read store | When to use |
+|---|---|---|
+| `MongoReadRepository` | MongoDB | Self-contained document projections, high read throughput, frequent schema changes |
+| `DbalReadRepository` | PostgreSQL | Complex joins or CTEs, single-database setups, full-text search with `pg_trgm` |
 
-// WRONG — _id is an ObjectId
-['_id' => new ObjectId(), 'email' => 'alice@example.com']
+---
+
+## MongoDB Read Repositories
+
+### Why MongoDB for reads?
+
+The read side exists to serve query handlers as efficiently as possible without the constraints of a normalised write schema. MongoDB is a natural fit when your read model is a single self-contained document — the document is already the query answer.
+
+### Step 1 — Create the read model
+
+The read model is a pure typed DTO. No framework imports, no database annotations — it represents the application's view of an entity, not the infrastructure that stores it:
+
+```php title="src/User/Application/ReadModel/UserReadModel.php"
+final readonly class UserReadModel
+{
+    public function __construct(
+        public string $id,
+        public string $email,
+        public string $name,
+        public string $status,
+        public ?string $createdAt,
+    ) {}
+}
 ```
 
-## Implement the Three Methods
+### Step 2 — Create the repository
 
-```php title="src/User/Infrastructure/Repository/UserReadRepository.php"
+The repository is the MongoDB-aware class. Declare the collection name and indexes here — alongside the queries that use them:
+
+```php title="src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php"
+use App\User\Application\ReadModel\UserReadModel;
 use Vortos\PersistenceMongo\Read\MongoReadRepository;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoCollection;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
 
+/**
+ * @extends MongoReadRepository<UserReadModel>
+ */
+#[MongoCollection('users')]
+#[MongoIndex(key: ['email' => 1], unique: true)]
+#[MongoIndex(key: ['createdAt' => -1, '_id' => -1])]
 final class UserReadRepository extends MongoReadRepository
 {
-    // 1. Collection name
-    protected function collectionName(): string
+    protected function fromDocument(array $doc): UserReadModel
     {
-        return 'users';
-    }
-
-    // 2. Raw MongoDB document → your shape
-    protected function fromDocument(array $doc): array
-    {
-        return [
-            'id'        => $doc['_id'],
-            'email'     => $doc['email'],
-            'name'      => $doc['name'],
-            'createdAt' => $doc['createdAt'],
-        ];
-    }
-
-    // 3. Index definitions
-    protected function indexes(): array
-    {
-        return [
-            ['key' => ['email' => 1], 'options' => ['unique' => true]],
-            ['key' => ['createdAt' => -1, '_id' => -1], 'options' => []],
-        ];
+        return new UserReadModel(
+            id:        $doc['_id'],
+            email:     $doc['email'] ?? '',
+            name:      $doc['name'] ?? '',
+            status:    $doc['status'] ?? 'active',
+            createdAt: $doc['createdAt'] ?? null,
+        );
     }
 }
 ```
 
-## Register the Repository
+`fromDocument()` receives the raw BSON document cast to an array and returns your typed read model. The `@extends` PHPDoc annotation gives IDEs and PHPStan full type inference — `findById()` returns `?UserReadModel`, `findByCriteria()` returns `UserReadModel[]`.
+
+### Step 3 — Register
 
 ```php title="config/services.php"
-use MongoDB\Client;
-
-$services->set(UserReadRepository::class)
-    ->arg('$client', service(Client::class))
-    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
-    ->tag('vortos.read_repository')  // required for vortos:setup:persistence
-    ->public();
+$services->set(UserReadRepository::class);
 ```
 
-The `vortos.read_repository` tag registers the repository for index management via `vortos:setup:persistence`.
+`MongoReadRepositoryAutowirePass` injects `MongoDB\Client` and the database name automatically. No manual argument wiring needed.
 
-## Built-In Operations
+### Step 4 — Generate with make command
 
-### `findById(string $id): ?array`
+```bash
+php bin/console vortos:make:read-repository User
+```
+
+Generates both files at once, then you fill in the fields.
+
+### Required: Store `_id` as string UUID
+
+Always store `_id` as a string UUID (UuidV7). Mixing with MongoDB `ObjectId` causes silent type mismatch bugs when querying by ID.
+
+```php
+// CORRECT
+['_id' => 'user-019d4784-...', 'email' => 'alice@example.com']
+
+// WRONG
+['_id' => new ObjectId(), 'email' => 'alice@example.com']
+```
+
+### Built-In Operations
+
+All methods return your typed read model — `UserReadModel`, not `array`.
+
+#### `findById(string $id): ?UserReadModel`
 
 ```php
 $user = $userReadRepository->findById('user-019d...');
-// Returns null if not found
+// null if not found
 ```
 
-### `findByCriteria(array $criteria, array $sort, int $limit, ?string $cursor): array`
+#### `findByCriteria(array $criteria, array $sort, int $limit, ?string $cursor): UserReadModel[]`
 
 ```php
-// Simple filter
-$activeUsers = $userReadRepository->findByCriteria(['status' => 'active']);
-
-// With sort and limit
 $recent = $userReadRepository->findByCriteria(
-    criteria: ['role' => 'admin'],
+    criteria: ['status' => 'active'],
     sort: ['createdAt' => 'desc'],
     limit: 20,
 );
 ```
 
-Criteria is flat key-value — exact equality matching. For complex queries (range filters, `$in`, aggregation), use the protected `collection()` method.
+#### `findPage(...): PageResult<UserReadModel>`
 
-### `findPage(array $criteria, int $limit, ?string $cursor, array $sort): PageResult`
+See the [Pagination](/docs/persistence/pagination) page.
 
-See the [Pagination](/docs/persistence/pagination) page for full details.
-
-### `countByCriteria(array $criteria): int`
+#### `countByCriteria(array $criteria): int`
 
 ```php
 $count = $userReadRepository->countByCriteria(['status' => 'active']);
 ```
 
 <Callout type="warn" title="count() is Expensive">
-`countByCriteria()` uses `countDocuments()` which scans all matching documents. On large collections without a supporting index this is expensive. Prefer `hasMore` from `PageResult` for pagination UI — avoid count unless you need the exact total.
+`countByCriteria()` scans all matching documents. On large collections without a supporting index this is expensive. Prefer `hasMore` from `PageResult` for pagination UI.
 </Callout>
 
-### `upsert(string $id, array $document): void`
-
-Insert or replace a single document:
+#### `upsert(string $id, array $document): void`
 
 ```php
 $userReadRepository->upsert('user-123', [
     '_id'       => 'user-123',
     'email'     => 'alice@example.com',
     'name'      => 'Alice',
+    'status'    => 'active',
     'createdAt' => (new \DateTimeImmutable())->format('c'),
 ]);
 ```
 
-### `bulkUpsert(array $documents): void`
-
-Insert or replace multiple documents in a single bulk write:
+#### `bulkUpsert(array $documents): void` / `bulkDelete(array $ids): void`
 
 ```php
 $userReadRepository->bulkUpsert([
-    ['_id' => 'user-1', 'email' => 'alice@example.com', 'name' => 'Alice'],
-    ['_id' => 'user-2', 'email' => 'bob@example.com', 'name' => 'Bob'],
+    ['_id' => 'user-1', 'email' => 'alice@example.com'],
+    ['_id' => 'user-2', 'email' => 'bob@example.com'],
 ]);
+
+$userReadRepository->bulkDelete(['user-1', 'user-2']);
 ```
 
-More efficient than calling `upsert()` in a loop. Each document must contain `_id`.
+### Custom Queries
 
-### `bulkDelete(array $ids): void`
-
-```php
-$userReadRepository->bulkDelete(['user-1', 'user-2', 'user-3']);
-```
-
-Single `deleteMany` operation.
-
-## Custom Queries
-
-Use the protected `collection()` method for queries beyond `findByCriteria()`:
+Use the protected `collection()` method for anything beyond `findByCriteria()`:
 
 ```php
-// Range filter
 public function findByEmailDomain(string $domain): array
 {
     $cursor = $this->collection()->find([
@@ -161,102 +179,200 @@ public function findByEmailDomain(string $domain): array
     );
 }
 
-// Aggregation pipeline
 public function countByRole(): array
 {
-    $pipeline = [
+    return iterator_to_array($this->collection()->aggregate([
         ['$group' => ['_id' => '$role', 'count' => ['$sum' => 1]]],
         ['$sort' => ['count' => -1]],
-    ];
-
-    return iterator_to_array($this->collection()->aggregate($pipeline));
-}
-
-// Text search (requires text index)
-public function search(string $query): array
-{
-    $cursor = $this->collection()->find([
-        '$text' => ['$search' => $query],
-    ]);
-
-    return array_map(
-        fn($doc) => $this->fromDocument((array) $doc),
-        iterator_to_array($cursor),
-    );
+    ]));
 }
 ```
 
-## Index Management
+---
 
-Declare indexes in `indexes()`. They are created by `vortos:setup:persistence` — safe to run on every deploy:
+## PostgreSQL Read Repositories
 
-```php
-protected function indexes(): array
+### When to use PostgreSQL for reads
+
+- Your team operates a single PostgreSQL instance and does not want to run MongoDB
+- Your read model spans multiple aggregates and needs a JOIN or CTE
+- You need full-text search backed by `pg_trgm` or `tsvector`
+
+### Step 1 — Create the read model
+
+Same as MongoDB — a pure DTO in `Application/ReadModel/`. The read model does not know what database stores it:
+
+```php title="src/Billing/Application/ReadModel/InvoiceReadModel.php"
+final readonly class InvoiceReadModel
 {
-    return [
-        // Unique index on email
-        ['key' => ['email' => 1], 'options' => ['unique' => true]],
-
-        // Compound index for common query + sort
-        ['key' => ['status' => 1, 'createdAt' => -1], 'options' => []],
-
-        // Descending sort with _id tiebreaker (recommended for pagination)
-        ['key' => ['createdAt' => -1, '_id' => -1], 'options' => []],
-
-        // Sparse index (only indexes documents where field exists)
-        ['key' => ['deletedAt' => 1], 'options' => ['sparse' => true]],
-
-        // Text index for full-text search
-        ['key' => ['name' => 'text', 'bio' => 'text'], 'options' => []],
-
-        // TTL index (auto-delete documents after N seconds)
-        ['key' => ['expiresAt' => 1], 'options' => ['expireAfterSeconds' => 0]],
-    ];
+    public function __construct(
+        public string $id,
+        public string $customerId,
+        public int $totalCents,
+        public string $status,
+        public string $issuedAt,
+    ) {}
 }
 ```
 
-Key direction: `1` = ascending, `-1` = descending.
+### Step 2 — Create the repository
 
-Run index setup:
+```php title="src/Billing/Infrastructure/Persistence/Dbal/InvoiceReadRepository.php"
+use App\Billing\Application\ReadModel\InvoiceReadModel;
+use Vortos\PersistenceDbal\Read\DbalReadRepository;
+
+/**
+ * @extends DbalReadRepository<InvoiceReadModel>
+ */
+final class InvoiceReadRepository extends DbalReadRepository
+{
+    protected function tableName(): string
+    {
+        return 'invoice_read_models';
+    }
+
+    protected function fromRow(array $row): InvoiceReadModel
+    {
+        return new InvoiceReadModel(
+            id:         $row['id'],
+            customerId: $row['customer_id'],
+            totalCents: (int) $row['total_cents'],
+            status:     $row['status'],
+            issuedAt:   $row['issued_at'],
+        );
+    }
+}
+```
+
+### Step 3 — Indexes live in SQL migrations
+
+Unlike MongoDB, there is no attribute system for DBAL indexes. Declare the table and indexes in a normal SQL migration:
+
+```sql
+CREATE TABLE invoice_read_models (
+    id          VARCHAR(36)  NOT NULL PRIMARY KEY,
+    customer_id VARCHAR(36)  NOT NULL,
+    total_cents BIGINT       NOT NULL DEFAULT 0,
+    status      VARCHAR(32)  NOT NULL,
+    issued_at   TIMESTAMPTZ  NOT NULL
+);
+
+CREATE INDEX idx_invoice_rm_customer ON invoice_read_models (customer_id);
+CREATE INDEX idx_invoice_rm_status   ON invoice_read_models (status, issued_at DESC);
+```
 
 ```bash
-php bin/console vortos:setup:persistence
-
-# Output:
-#   ✔ Indexes ensured (3): users
-#   ✔ Indexes ensured (2): orders
+php bin/console vortos:migrate --force
 ```
+
+### Built-In Operations
+
+#### `upsert(string $id, array $data): void`
+
+PostgreSQL `INSERT ... ON CONFLICT (id) DO UPDATE SET`. Pass data **without** `id` — it is the first argument:
+
+```php
+$invoiceReadRepository->upsert($event->invoiceId, [
+    'customer_id' => $event->customerId,
+    'total_cents' => $event->totalCents,
+    'status'      => 'open',
+    'issued_at'   => $event->occurredAt()->format('c'),
+]);
+```
+
+#### `delete(string $id): void`
+
+```php
+$invoiceReadRepository->delete($event->invoiceId);
+```
+
+All other operations (`findById`, `findByCriteria`, `findPage`, `countByCriteria`) work identically to the MongoDB version — returning typed read models.
+
+### Custom Queries
+
+Use the protected `query()` method — returns a `QueryBuilder` pre-configured with `SELECT * FROM {table}`:
+
+```php
+public function findWithCustomerName(string $customerId): array
+{
+    return $this->query()
+        ->select('i.*, c.name AS customer_name')
+        ->join('i', 'customer_read_models', 'c', 'i.customer_id = c.id')
+        ->where('i.customer_id = :cid')
+        ->setParameter('cid', $customerId)
+        ->fetchAllAssociative();
+}
+```
+
+---
 
 ## Projections in Event Handlers
 
-The most common way to populate read repositories is via projection handlers:
+Both repository types are populated from projection handlers that react to domain events:
 
 ```php
 use Vortos\Cqrs\Attribute\AsProjectionHandler;
+use Vortos\Cqrs\Projection\ProjectionHandlerInterface;
 
-#[AsProjectionHandler]
-final class UserProjectionHandler
+#[AsProjectionHandler(consumer: 'user.events', handlerId: 'user.registered.project')]
+final class UserProjection implements ProjectionHandlerInterface
 {
     public function __construct(
-        private UserReadRepository $readRepository,
+        private readonly UserReadRepository $readRepository,
     ) {}
 
     public function __invoke(UserRegisteredEvent $event): void
     {
-        $this->readRepository->upsert($event->userId, [
-            '_id'       => $event->userId,
+        $this->readRepository->upsert($event->aggregateId(), [
+            '_id'       => $event->aggregateId(),   // MongoDB: include _id in document
             'email'     => $event->email,
             'name'      => $event->name,
-            'createdAt' => $event->occurredAt()->format('c'),
+            'status'    => 'active',
+            'createdAt' => $event->occurredAt()->format(\DateTimeInterface::ATOM),
         ]);
-    }
-
-    public function onUserNameUpdated(UserNameUpdatedEvent $event): void
-    {
-        // For partial updates, load + modify + upsert
-        $doc = $this->readRepository->findById($event->userId) ?? [];
-        $doc['name'] = $event->newName;
-        $this->readRepository->upsert($event->userId, $doc);
     }
 }
 ```
+
+For `DbalReadRepository`, omit `_id` from the data — pass it as the first argument instead:
+
+```php
+$this->readRepository->upsert($event->aggregateId(), [
+    'customer_id' => $event->customerId,
+    'total_cents' => $event->totalCents,
+    'status'      => 'open',
+    'issued_at'   => $event->occurredAt()->format('c'),
+]);
+```
+
+---
+
+## Query Handlers
+
+The query handler receives the repository and calls it. Return type is fully typed:
+
+```php
+use App\User\Application\ReadModel\UserReadModel;
+
+#[AsQueryHandler]
+final class GetUserByIdQueryHandler
+{
+    public function __construct(
+        private readonly UserReadRepository $repository,
+    ) {}
+
+    public function __invoke(GetUserByIdQuery $query): Result
+    {
+        /** @var UserReadModel|null $user */
+        $user = $this->repository->findById($query->userId);
+
+        if ($user === null) {
+            return Result::fail(new UserNotFoundError(...));
+        }
+
+        return Result::ok($user);
+    }
+}
+```
+
+`UserReadModel` has public readonly properties — `json_encode()` serializes them automatically, so `JsonResponse($user)` in the controller works without any manual conversion.

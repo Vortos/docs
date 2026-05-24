@@ -9,43 +9,60 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 ## Define a Command
 
-Commands extend `AbstractCommand` — a readonly class with a default `idempotencyKey()` returning `null`. Override it to enable idempotency.
+Commands implement `CommandInterface` (or extend the convenience base `AbstractCommand`). The interface requires one method: `idempotencyKey(): ?string`. `AbstractCommand` provides a default returning `null` so you only override it when you need idempotency.
 
-```php title="src/User/Application/Command/RegisterUser.php"
-use Vortos\Domain\Command\AbstractCommand;
+```php title="src/User/Application/Command/RegisterUserCommand.php"
+use Vortos\Domain\Command\CommandInterface;
 
-final readonly class RegisterUser extends AbstractCommand
+final readonly class RegisterUserCommand implements CommandInterface
 {
     public function __construct(
-        public string $email,
-        public string $name,
-        public string $password,
+        public readonly string $name,
+        public readonly string $email,
+        public readonly string $password,
+        private readonly ?string $idempotencyKey = null,
     ) {}
+
+    public function idempotencyKey(): ?string
+    {
+        return $this->idempotencyKey;
+    }
+}
+```
+
+Or extend `AbstractCommand` when you don't need idempotency at all:
+
+```php
+use Vortos\Domain\Command\AbstractCommand;
+
+final readonly class DeleteUserCommand extends AbstractCommand
+{
+    public function __construct(public string $userId) {}
+    // idempotencyKey() inherited — returns null
 }
 ```
 
 ## Write a Handler
 
-```php title="src/User/Application/RegisterUserHandler.php"
+```php title="src/User/Application/Command/RegisterUserHandler.php"
 use Vortos\Cqrs\Attribute\AsCommandHandler;
 
 #[AsCommandHandler]
 final class RegisterUserHandler
 {
     public function __construct(
-        private UserRepository $users,
-        private PasswordHasherInterface $hasher,
+        private readonly UserWriteRepository $repository,
     ) {}
 
-    public function __invoke(RegisterUser $command): User
+    public function __invoke(RegisterUserCommand $command): User
     {
         $user = User::register(
-            email: new Email($command->email),
-            name: $command->name,
-            passwordHash: $this->hasher->hash($command->password),
+            name:          $command->name,
+            email:         $command->email,
+            plainPassword: $command->password,
         );
 
-        $this->users->save($user);
+        $this->repository->save($user);
 
         return $user; // Return aggregate — bus dispatches its domain events
     }
@@ -54,13 +71,15 @@ final class RegisterUserHandler
 
 ### What the CommandBus Does Automatically
 
-1. Checks idempotency — if key already processed, skips silently (or throws in strict mode)
-2. Opens `UnitOfWork` transaction
-3. Calls `$handler($command)`
-4. Calls `$result->pullDomainEvents()` on the returned aggregate
-5. Dispatches each event to `EventBus` (writes to outbox inside the transaction)
-6. Commits
-7. Marks idempotency key as processed
+1. Validates the command (if a `VortosValidator` is wired) — throws `ValidationException` before opening a transaction
+2. Checks idempotency — if key already processed, returns `null` silently (or throws in strict mode)
+3. Opens `UnitOfWork` transaction
+4. Calls `$result = $handler($command)` — return value is threaded through
+5. Calls `$result->pullDomainEvents()` on the returned aggregate
+6. Dispatches each event to `EventBus` (writes to outbox inside the transaction)
+7. Commits
+8. Marks idempotency key as processed
+9. Returns `$result` to the caller
 
 Your handler only does domain logic and saves. Never call `beginTransaction()`, `commit()`, or `dispatch()` inside a handler.
 
@@ -70,26 +89,42 @@ Return the aggregate from your handler so the bus can pull and dispatch domain e
 
 ## Dispatch from a Controller
 
+`dispatch()` returns `mixed` — whatever the handler returns. Capture it when you need the aggregate ID or other data from the handler:
+
 ```php
 use Vortos\Cqrs\Command\CommandBusInterface;
 
 final class RegisterUserController
 {
-    public function __construct(private CommandBusInterface $commandBus) {}
+    public function __construct(private readonly CommandBusInterface $commandBus) {}
 
-    public function register(Request $request): JsonResponse
+    public function __invoke(Request $request): JsonResponse
     {
-        $data = $request->toArray();
+        $dto = RegisterUserRequest::fromRequest($request, $this->validator);
 
-        $this->commandBus->dispatch(new RegisterUser(
-            email: $data['email'],
-            name: $data['name'],
-            password: $data['password'],
+        /** @var User $user */
+        $user = $this->commandBus->dispatch(new RegisterUserCommand(
+            name:           $dto->name,
+            email:          $dto->email,
+            password:       $dto->password,
+            idempotencyKey: $request->headers->get('Idempotency-Key'),
         ));
 
-        return new JsonResponse(['status' => 'created'], 201);
+        return new JsonResponse([
+            'id'    => (string) $user->getId(),
+            'name'  => $user->getName(),
+            'email' => (string) $user->getEmail(),
+        ], 201);
     }
 }
+```
+
+If you do not need the return value, discard it:
+
+```php
+$this->commandBus->dispatch(new DeleteUser($id));
+return new JsonResponse(null, 204);
+```
 ```
 
 ## Handler Discovery — Inferred from __invoke()
@@ -180,7 +215,7 @@ final class RegisterUserHandler
     {
         $user = User::register($command->email, $command->name);
         $this->users->save($user);
-        return $user;
+        return $user; // returned to caller via dispatch()
     }
 }
 ```

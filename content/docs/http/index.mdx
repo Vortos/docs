@@ -8,7 +8,7 @@ import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # HTTP
 
-`vortos-http` provides the HTTP layer built on Symfony's `HttpKernel`. Controllers are discovered via `#[ApiController]` and `#[Route]` attributes at compile time. Event subscribers are wired automatically. No YAML, no XML.
+`vortos-http` provides the HTTP layer built on Symfony's `HttpKernel`. Controllers are discovered via `#[AsController]` and `#[Route]` attributes at compile time. Event subscribers are wired automatically. No YAML, no XML.
 
 ## Architecture
 
@@ -84,12 +84,12 @@ Three compiler passes run at container build time:
 |---|---|---|
 | `HttpListenerCompilerPass` | 100 | Enables RouterListener when routes are on |
 | `RegisterEventSubscribersPass` | 90 | Wires all `kernel.event_subscriber` tagged services to EventDispatcher |
-| `RouteCompilerPass` | 80 | Scans `#[ApiController]` classes for `#[Route]` attributes, builds RouteCollection |
+| `RouteCompilerPass` | 80 | Scans `#[AsController]` classes for `#[Route]` attributes, builds RouteCollection |
 
 ## Module Overview
 
 <Cards>
-  <Card title="Controllers" href="/docs/http/controllers" description="#[ApiController], #[Route], service injection, response types." />
+  <Card title="Controllers" href="/docs/http/controllers" description="#[AsController], #[Route], service injection, response types." />
   <Card title="Routing" href="/docs/http/routing" description="Attribute-based routing — how RouteCompilerPass discovers and builds routes at compile time." />
   <Card title="Error Handling" href="/docs/http/error-handling" description="ErrorController, PublicExceptionInterface, JSON vs HTML responses, debug mode." />
   <Card title="Event Subscribers" href="/docs/http/event-subscribers" description="How EventSubscriberInterface implementations are auto-wired to the dispatcher." />

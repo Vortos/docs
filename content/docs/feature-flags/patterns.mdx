@@ -42,7 +42,7 @@ GET /api/flags
 ```php title="src/Shared/Infrastructure/Flags/UserFlagContextResolver.php"
 use Vortos\FeatureFlags\FlagContext;
 use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 
 final class UserFlagContextResolver implements FlagContextResolverInterface
 {
@@ -133,7 +133,7 @@ This is wrong because the controller is now doing application logic. It also mea
 
 ```php title="src/Checkout/Representation/Controller/CheckoutConfigController.php"
 // ✅ Controller is a thin adapter — one route, one stable response shape
-#[ApiController]
+#[AsController]
 #[Route('/api/checkout/config', methods: ['GET'])]
 #[RequiresAuth]
 final class CheckoutConfigController
@@ -229,7 +229,7 @@ export function HeroBanner({ headline, imageUrl, ctaText }: HeroBannerProps) {
 The built-in `/api/flags` returns all flags. Write a filtering wrapper to expose only the ones the frontend should know about:
 
 ```php title="src/Shared/Representation/Controller/FrontendFlagsController.php"
-#[ApiController]
+#[AsController]
 #[Route('/api/flags', name: 'app.flags', methods: ['GET'])]
 final class FrontendFlagsController
 {

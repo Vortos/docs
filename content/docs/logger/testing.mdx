@@ -1,0 +1,130 @@
+---
+title: Testing
+description: How to use NullLogger in unit tests and capture log output in integration tests.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing
+
+## Unit Tests — NullLogger
+
+For unit tests where you don't care about log output, inject a `NullLogger`. It satisfies `LoggerInterface` and discards everything silently:
+
+```php
+use Psr\Log\NullLogger;
+
+final class RegisterUserHandlerTest extends TestCase
+{
+    public function test_registers_user(): void
+    {
+        $handler = new RegisterUserHandler(
+            repository: new InMemoryUserRepository(),
+            logger:     new NullLogger(),
+        );
+
+        $handler(new RegisterUser(email: 'alice@example.com'));
+
+        // assert domain state — log output doesn't matter
+    }
+}
+```
+
+`NullLogger` is part of `psr/log` — no additional package needed.
+
+## Integration Tests — Capturing Logs
+
+For tests that need to assert a specific log entry was produced, use Monolog's `TestHandler`:
+
+```php
+use Monolog\Handler\TestHandler;
+use Monolog\Level;
+use Monolog\Logger;
+
+final class DeadLetterWriterTest extends TestCase
+{
+    public function test_logs_critical_on_dead_letter(): void
+    {
+        $handler = new TestHandler();
+        $logger  = new Logger('test', [$handler]);
+
+        $writer = new DeadLetterWriter(
+            connection: $this->createMock(Connection::class),
+            logger:     $logger,
+        );
+
+        $writer->write(
+            transportName: 'user.events',
+            eventClass:    UserRegisteredEvent::class,
+            handlerId:     'user.registered',
+            payload:       '{}',
+            headers:       [],
+            failureReason: 'Connection refused',
+            exceptionClass: \RuntimeException::class,
+            attemptCount:  4,
+        );
+
+        $this->assertTrue($handler->hasCriticalThatContains('dead-lettered'));
+    }
+}
+```
+
+### TestHandler Assertions
+
+| Method | What it checks |
+|---|---|
+| `hasRecords(Level)` | Any record at this level |
+| `hasDebug(string)` / `hasInfo(string)` / `hasWarning(string)` / `hasError(string)` / `hasCritical(string)` | Exact message at level |
+| `hasDebugThatContains(string)` / `hasErrorThatContains(string)` / etc. | Message containing substring |
+| `hasRecordThatMatches(pattern, Level)` | Regex match on message |
+| `getRecords()` | All captured records as arrays |
+
+## Swapping the Driver in Tests
+
+If your test suite registers services using `LoggerInterface`, configure the test environment to use a `NullLogger` globally. Add `config/test/logging.php`:
+
+```php title="config/test/logging.php"
+use Monolog\Level;
+use Vortos\Logger\Config\LogChannel;
+use Vortos\Logger\DependencyInjection\VortosLoggingConfig;
+
+return static function (VortosLoggingConfig $config): void {
+    // Silence all framework channels in tests
+    $config->disableChannel(
+        LogChannel::Http,
+        LogChannel::Cqrs,
+        LogChannel::Messaging,
+        LogChannel::Cache,
+        LogChannel::Query,
+    );
+
+    // Raise the minimum level for the app channel so only CRITICAL leaks through
+    $config->channel(LogChannel::App, Level::Critical);
+};
+```
+
+This keeps test output clean without requiring every test to inject a `NullLogger` manually.
+
+<Callout type="info" title="Buffer Flushing in Tests">
+If buffering is enabled (`$config->buffer(true)`), records are flushed at the end of the HTTP/console lifecycle — which does not happen in PHPUnit. Use `TestHandler` (which bypasses buffering) or disable buffering in the test config:
+
+```php
+$config->buffer(false);
+```
+</Callout>
+
+## Asserting No Unexpected Logs
+
+Sometimes the important assertion is that a code path did *not* log an error:
+
+```php
+$handler = new TestHandler();
+$logger  = new Logger('test', [$handler]);
+
+// run the code under test
+
+$this->assertFalse(
+    $handler->hasErrorRecords(),
+    'Expected no errors but got: ' . json_encode($handler->getRecords())
+);
+```

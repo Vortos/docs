@@ -1,0 +1,274 @@
+---
+title: Domain Errors & Result
+description: DomainError — structured, typed failure as a first-class domain concept. Result<T> — explicit success/failure without hidden control flow.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Domain Errors & Result
+
+In DDD, a failure is not a surprise — it is a named business outcome. A user not being found, a seat being already taken, a payment being declined: these are domain facts, not infrastructure accidents. Vortos models them with two primitives: `DomainError` and `Result<T>`.
+
+## Why Domain Errors Belong in the Domain Layer
+
+PHP exceptions exist for unexpected runtime failures: a database connection dropped, a malformed response from a third-party API. They are infrastructure concerns.
+
+Domain errors are different. When a user tries to register with an email that already exists, that is not unexpected — it is a defined business scenario. Modeling it as a plain `\Exception` buries the intent inside a stack trace and forces callers to guess what went wrong from an exception class name.
+
+`DomainError` makes the failure explicit:
+
+- It has a **stable machine-readable error code** (`USER_ALREADY_EXISTS`) that becomes part of your API contract
+- It carries **structured context** (`['email' => 'alice@example.com']`) that clients can act on
+- It declares its **HTTP status** via an attribute — `#[HttpStatus(409)]` — right next to the class definition, not scattered across controllers
+- It is still **throwable** — no new control flow to learn
+
+## The Two Primitives
+
+### `DomainError`
+
+```php
+abstract class DomainError extends \RuntimeException
+{
+    public function errorCode(): string { ... } // auto-derived, override if needed
+    public function context(): array { ... }
+}
+```
+
+Every domain error in your application extends this. It is a `RuntimeException`, so it can be thrown or caught anywhere PHP exceptions work. `errorCode()` is auto-derived from the class name — `UserNotFoundError` → `USER_NOT_FOUND` — so you never need to write it unless you want a non-standard code.
+
+### `Result<T>`
+
+```php
+final class Result
+{
+    public static function ok(mixed $value): self
+    public static function fail(DomainError $error): self
+    public function isOk(): bool
+    public function isFailure(): bool
+    public function unwrap(): mixed       // throws the DomainError if failure
+    public function error(): DomainError  // throws LogicException if ok
+    public function map(callable $fn): self
+}
+```
+
+`Result` is a container that holds either a success value or a `DomainError`. It is the return type of operations that can fail in a domain-defined way. Returning `Result` makes failure visible in the method signature — callers cannot ignore it.
+
+---
+
+## Step-by-Step: Creating a Domain Error
+
+### 1. Generate
+
+```bash
+php bin/console vortos:make:domain-error UserNotFound --context=User --aggregate=User --status=404
+```
+
+This creates `src/User/Domain/User/Error/UserNotFoundError.php`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Domain\User\Error;
+
+use Vortos\Domain\Error\DomainError;
+use Vortos\Domain\Error\HttpStatus;
+
+#[HttpStatus(404)]
+final class UserNotFoundError extends DomainError
+{
+    public static function because(string $reason): self
+    {
+        return new self($reason);
+    }
+}
+```
+
+The error code is auto-derived: `UserNotFoundError` → `USER_NOT_FOUND`. No `errorCode()` needed.
+
+### 2. Add a Named Constructor
+
+The generated `because(string $reason)` constructor is a starting point. Replace or extend it with constructors that make the call site read like a sentence and carry structured context:
+
+```php
+#[HttpStatus(404)]
+final class UserNotFoundError extends DomainError
+{
+    public static function forId(string $id): self
+    {
+        return new self(
+            "User '{$id}' was not found.",
+            context: ['userId' => $id],
+        );
+    }
+}
+```
+
+The `context` array is passed to `DomainError`'s constructor and returned by `context()`. It is included in the JSON error response so clients can act on it without parsing the message string.
+
+### 3. Use It
+
+**Option A — Throw directly.** Use this when there is one clear failure case and you want the simplest call site:
+
+```php
+// In a command handler:
+public function __invoke(RegisterUserCommand $command): User
+{
+    if ($this->repository->findByEmail(new Email($command->email)) !== null) {
+        throw new UserAlreadyExistsError(
+            "Email '{$command->email}' is already registered.",
+            context: ['email' => $command->email],
+        );
+    }
+
+    $user = User::register($command->name, $command->email, $command->password);
+    $this->repository->save($user);
+
+    return $user;
+}
+```
+
+**Option B — Return `Result`.** Use this when you want the failure to be visible in the handler's return type, forcing the caller to acknowledge both paths:
+
+```php
+// In a query handler:
+public function __invoke(GetUserQuery $query): Result
+{
+    $user = $this->repository->findById($query->userId);
+
+    if ($user === null) {
+        return Result::fail(new UserNotFoundError(
+            "User '{$query->userId}' not found.",
+            context: ['userId' => $query->userId],
+        ));
+    }
+
+    return Result::ok($user);
+}
+```
+
+The controller unwraps the result — `unwrap()` either returns the value or throws the `DomainError`, which the `ErrorController` then catches:
+
+```php
+// In the controller:
+public function __invoke(string $id): JsonResponse
+{
+    $user = $this->queryBus->ask(new GetUserQuery(userId: $id))->unwrap();
+
+    return new JsonResponse($user);
+}
+```
+
+---
+
+## Throw vs Return `Result` — When to Use Which
+
+| | Throw directly | Return `Result` |
+|---|---|---|
+| Call site | Simple, no unwrap needed | Explicit — caller must call `unwrap()` or check `isFailure()` |
+| Failure visibility | Hidden in the method body | Visible in the return type |
+| Multiple failure paths | Gets verbose | Can chain with `map()` |
+| Query handlers | Fine | Preferred — makes "no result" a named outcome |
+| Command handlers | Natural fit | Useful when commands produce values callers need |
+
+The rule of thumb: **queries return `Result`**, **commands throw**. Queries answer a question that may have no answer — the absence is a domain fact worth naming. Commands express intent that can be rejected — throwing communicates that rejection loudly.
+
+---
+
+## `#[HttpStatus]` and HTTP Mapping
+
+The `#[HttpStatus(int)]` attribute declares the HTTP status code the error maps to. You set it once, on the class:
+
+```php
+#[HttpStatus(409)]
+final class UserAlreadyExistsError extends DomainError { ... }
+```
+
+`ErrorController` reads it via reflection (result cached per class at runtime) and uses it as the response status. No switch statements in controllers, no mapping tables in config.
+
+If you omit `#[HttpStatus]`, the default is `422 Unprocessable Entity`.
+
+**Standard mappings:**
+
+| Scenario | Status |
+|---|---|
+| Resource not found | `404` |
+| Conflict / already exists | `409` |
+| Business rule violation | `422` |
+| Precondition not met | `412` |
+| Forbidden by business rule | `403` |
+
+---
+
+## JSON Error Response Shape
+
+When a `DomainError` reaches `ErrorController`, the JSON response is:
+
+```json
+{
+  "error": true,
+  "code": "USER_NOT_FOUND",
+  "message": "User '123' was not found.",
+  "context": {
+    "userId": "123"
+  }
+}
+```
+
+- `code` — your stable error code. This is the field clients should branch on, not `message`
+- `message` — human-readable. Suitable for logging and developer debugging, not for display in production UI
+- `context` — structured key/value pairs. Safe to pass to UI components that need to highlight specific fields
+
+In production, messages from `DomainError` are always shown — they are safe by design. In development, the response also includes `"trace": [...]`.
+
+---
+
+## Error Code Conventions
+
+Error codes are generated from your class name automatically by `make:domain-error`:
+
+```
+UserNotFound       → USER_NOT_FOUND
+OrderAlreadyPaid   → ORDER_ALREADY_PAID
+InvalidCouponCode  → INVALID_COUPON_CODE
+```
+
+Follow these conventions to keep error codes stable and predictable:
+
+- **SCREAMING_SNAKE_CASE** — matches common API conventions
+- **Noun-first** — `USER_NOT_FOUND`, not `NOT_FOUND_USER`
+- **Specific** — `ORDER_ITEM_OUT_OF_STOCK`, not `STOCK_ERROR`
+- **Never change a published code** — clients depend on it. If the concept changes, add a new error class
+
+<Callout type="warn" title="Error codes are API contracts">
+Once a client is using `USER_NOT_FOUND` to branch their UI logic, renaming it breaks them silently. Treat error codes with the same stability guarantees as endpoint paths.
+</Callout>
+
+---
+
+## `Result` API Reference
+
+```php
+// Create
+Result::ok($value)          // wraps a success value
+Result::fail($domainError)  // wraps a failure
+
+// Inspect
+$result->isOk()             // bool
+$result->isFailure()        // bool
+
+// Extract
+$result->unwrap()           // returns value, or throws the DomainError
+$result->error()            // returns DomainError, or throws LogicException if ok
+
+// Transform
+$result->map(fn($v) => ...)  // applies fn to value if ok, passes failure through
+```
+
+`map()` is useful for chaining transformations without unwrapping early:
+
+```php
+return $this->queryBus->ask(new GetUserQuery($id))
+    ->map(fn(array $user) => array_pick($user, ['id', 'name', 'email']));
+```

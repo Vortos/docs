@@ -1,127 +1,165 @@
 ---
 title: Domain Events
-description: DomainEvent — immutable facts about what happened, schema versioning with eventVersion(), and the DomainEventInterface contract.
+description: Pure POPO domain events and the EventEnvelope wrapper — immutable facts about what happened, separated from framework metadata.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Domain Events
 
-Domain events are immutable records of something that happened in the domain. They are named in the past tense and carry the aggregate ID that raised them.
+Domain events are immutable records of something that happened in the domain. They are named in the past tense and carry only business data — no base class, no framework dependency.
 
 ## Define an Event
 
-```php title="src/User/Domain/Event/UserRegisteredEvent.php"
-use Vortos\Domain\Event\DomainEvent;
-
-final readonly class UserRegisteredEvent extends DomainEvent
+```php title="src/User/Domain/User/Event/UserRegistered.php"
+final readonly class UserRegistered
 {
     public function __construct(
-        string $aggregateId,           // passes to DomainEvent base
-        public readonly string $email,
-        public readonly string $name,
-    ) {
-        parent::__construct($aggregateId);
-    }
-}
-```
-
-`DomainEvent` is `abstract readonly` — all subclasses must be `readonly`. Events are immutable facts — no setters, no mutable state.
-
-## DomainEventInterface
-
-All domain events implement `DomainEventInterface`:
-
-```php
-interface DomainEventInterface
-{
-    public function aggregateId(): string;         // which aggregate raised this
-    public function occurredAt(): \DateTimeImmutable; // when it happened
-    public function eventVersion(): int;           // schema version (default: 1)
-}
-```
-
-## occurredAt
-
-Set automatically by `DomainEvent` base constructor — `new \DateTimeImmutable()` at construction time. You never set it explicitly:
-
-```php
-$event = new UserRegisteredEvent('user-123', 'alice@example.com', 'Alice');
-$event->occurredAt(); // \DateTimeImmutable — moment of construction
-```
-
-## eventVersion — Schema Versioning
-
-`eventVersion()` returns `1` by default. Override when your event's payload shape changes in a breaking way:
-
-```php
-// Version 1 — original shape
-final readonly class UserRegisteredEvent extends DomainEvent
-{
-    public function __construct(string $aggregateId, public string $email) {
-        parent::__construct($aggregateId);
-    }
-    // eventVersion() returns 1 (default)
-}
-
-// Version 2 — added name field (breaking change)
-final readonly class UserRegisteredEvent extends DomainEvent
-{
-    public function __construct(
-        string $aggregateId,
         public string $email,
-        public string $name,  // new field
-    ) {
-        parent::__construct($aggregateId);
-    }
-
-    public function eventVersion(): int { return 2; }
+        public string $name,
+    ) {}
 }
 ```
 
-Consumers check `eventVersion()` to route to the correct handler version. This enables forward compatibility — consumers that understand version 2 can handle new events; consumers that only understand version 1 can use an upcaster.
+That is the entire event. No imports, no base class, no `aggregateId`, no `occurredAt`. Those are framework concerns that live on `EventEnvelope` — not on the payload.
+
+**Rules enforced at compile time (F1–F5):**
+
+| Rule | Requirement |
+|---|---|
+| F1 | `final` |
+| F2 | `readonly` |
+| F3 | All properties constructor-promoted |
+| F4 | No extra methods beyond `__construct` |
+| F5 | No base class or interface |
+
+Violating any rule throws a descriptive error at container build time — never in production.
+
+## EventEnvelope
+
+`EventEnvelope` is the wrapper the framework creates around your POPO when an event is recorded. It carries all identity and timing metadata:
+
+```php
+final readonly class EventEnvelope
+{
+    public string             $eventId;
+    public string             $aggregateId;
+    public string             $aggregateType;
+    public int                $aggregateVersion;
+    public string             $payloadType;      // FQCN of the POPO
+    public int                $schemaVersion;
+    public \DateTimeImmutable $occurredAt;
+    public object             $payload;          // your POPO
+    public Metadata           $metadata;
+}
+```
+
+`Metadata` carries cross-cutting context:
+
+```php
+final readonly class Metadata
+{
+    public ?string $correlationId;
+    public ?string $causationId;
+    public ?string $traceId;
+    public ?string $tenantId;
+    public ?string $userId;
+    public array   $custom;
+}
+```
+
+You never construct `EventEnvelope` yourself. `AggregateRoot::recordEvent()` does it automatically.
+
+## Recording Events in Aggregates
+
+Pass the POPO directly to `recordEvent()` — no `aggregateId` argument needed:
+
+```php
+final class User extends AggregateRoot
+{
+    public static function register(string $email, string $name): self
+    {
+        $user = new self(UserId::generate());
+        $user->email = $email;
+        $user->name  = $name;
+
+        $user->recordEvent(new UserRegistered(
+            email: $email,
+            name:  $name,
+        ));
+
+        return $user;
+    }
+}
+```
+
+`recordEvent()` wraps the POPO in an `EventEnvelope`, sets `aggregateId` from `$this->getId()`, `occurredAt` to now, and queues it for dispatch. The `CommandBus` pulls the envelopes after the handler returns and writes them to the outbox — inside the same transaction as the aggregate save.
+
+## Reading Envelope Data in Handlers
+
+Handlers that need identity or timing metadata declare `EventEnvelope` as a second parameter:
+
+```php
+#[AsEventHandler(handlerId: 'user.registered.audit', consumer: 'user.events')]
+final class AuditHandler
+{
+    public function __invoke(UserRegistered $event, EventEnvelope $envelope): void
+    {
+        // business data from the POPO
+        $email = $event->email;
+
+        // framework metadata from the envelope
+        $aggregateId = $envelope->aggregateId;
+        $occurredAt  = $envelope->occurredAt;
+        $version     = $envelope->aggregateVersion;
+    }
+}
+```
+
+If your handler only needs the business data, omit `EventEnvelope` entirely:
+
+```php
+public function __invoke(UserRegistered $event): void
+{
+    $this->mailer->send($event->email);
+}
+```
 
 ## Naming Convention
 
-Domain events are named in past tense: `UserRegistered`, `OrderPlaced`, `PaymentFailed`. They describe a fact that occurred, not an intent.
+Domain events are named in past tense with **no `Event` suffix**:
 
 ```
 UserRegistered      ✔
 OrderPlaced         ✔
 PaymentCharged      ✔
 
+UserRegisteredEvent ✗ (suffix is redundant — the namespace already scopes it)
 RegisterUser        ✗ (imperative — that is a command)
-PlaceOrder          ✗ (imperative — that is a command)
 ```
 
-## Recording Events in Aggregates
+## Schema Versioning
+
+`schemaVersion` on `EventEnvelope` starts at `1`. Consumers can filter by version using the `version` parameter on `#[AsEventHandler]`:
 
 ```php
-final class User extends AggregateRoot
+// Only handles version 1 payloads
+#[AsEventHandler(handlerId: 'user.registered.v1', consumer: 'user.events', version: 1)]
+final class HandleV1Registration
 {
-    public function deactivate(): void
-    {
-        if ($this->status === 'inactive') return; // idempotent guard
+    public function __invoke(UserRegistered $event): void { ... }
+}
 
-        $this->status = 'inactive';
-
-        $this->recordEvent(new UserDeactivatedEvent(
-            aggregateId: (string) $this->id,
-        ));
-    }
+// Only handles version 2 payloads (added 'phone' field)
+#[AsEventHandler(handlerId: 'user.registered.v2', consumer: 'user.events', version: 2)]
+final class HandleV2Registration
+{
+    public function __invoke(UserRegistered $event): void { ... }
 }
 ```
 
-Events are recorded inside command methods. The `CommandBus` pulls them after the handler returns and writes them to the outbox — inside the same transaction as the aggregate save.
-
 <Callout type="warn" title="Events Are Facts, Not Commands">
-Domain events describe what happened — they do not describe what should happen next. A `UserDeactivatedEvent` says "the user was deactivated". What happens in response (send email, cancel subscriptions) is handled by event handlers in other bounded contexts.
+Domain events describe what happened — they do not describe what should happen next. A `UserDeactivated` event says "the user was deactivated". What happens in response (send email, cancel subscriptions) is handled by event handlers in other bounded contexts.
 
-Never add business logic to an event's constructor. Events carry data only.
+Never add business logic to an event constructor. Events carry data only.
 </Callout>
-
-## DomainEventInterface vs DomainEvent
-
-`DomainEventInterface` is defined in `vortos-domain` so aggregates can record events without depending on any infrastructure. `DomainEvent` is the abstract base class providing `aggregateId()`, `occurredAt()`, and `eventVersion()`.
-
-Always extend `DomainEvent` for your events — `DomainEventInterface` alone is for special cases where the base class behaviour must be replaced.

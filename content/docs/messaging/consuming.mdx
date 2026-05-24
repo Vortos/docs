@@ -28,7 +28,7 @@ final class SendWelcomeEmailHandler
         private readonly MailerInterface $mailer,
     ) {}
 
-    public function __invoke(UserRegisteredEvent $event): void
+    public function __invoke(UserRegistered $event): void
     {
         $this->mailer->send(
             to: $event->email,
@@ -46,9 +46,9 @@ At container compile time, `HandlerDiscoveryCompilerPass` runs and:
 
 1. Finds all services tagged `vortos.event_handler` (set automatically by the attribute autoconfiguration in `MessagingExtension`)
 2. Reflects the class to find the handler method and its first parameter type
-3. Validates that the parameter implements `DomainEventInterface` — throws at compile time if not
-4. Builds a descriptor array containing the service ID, method name, priority, idempotency flag, and event class
-5. Stores descriptors in the `vortos.handlers` container parameter, keyed by `[consumerName][eventClass]`
+3. Validates that the first parameter is a `final` class (the POPO event payload) — throws at compile time if not
+4. Builds a descriptor array containing the service ID, method name, priority, idempotency flag, payload type, and optional `EventEnvelope` injection flag
+5. Stores descriptors in the `vortos.handlers` container parameter, keyed by `[consumerName][payloadType]`
 6. Populates `vortos.handler_locator` (a Symfony `ServiceLocator`) with all handler services for lazy resolution at runtime
 
 ```
@@ -57,20 +57,22 @@ HandlerDiscoveryCompilerPass
     └── Scans tagged services
         └── Builds handler descriptor:
             {
-                handlerId: 'user.registered.send-welcome-email',
-                serviceId: 'App\...\SendWelcomeEmailHandler',
-                method: '__invoke',
-                consumer: 'user.events',
-                eventClass: 'App\...\UserRegisteredEvent',
-                priority: 0,
-                idempotent: false,
+                handlerId:       'user.registered.send-welcome-email',
+                serviceId:       'App\...\SendWelcomeEmailHandler',
+                method:          '__invoke',
+                consumer:        'user.events',
+                payloadType:     'App\User\Domain\Event\UserRegistered',
+                injectEnvelope:  true,   // true if EventEnvelope is second param
+                priority:        0,
+                idempotent:      false,
             }
 
 Runtime:
 ConsumerRunner::handleMessage()
-    └── HandlerRegistry::getHandlers('user.events', UserRegisteredEvent::class)
+    └── HandlerRegistry::getHandlers('user.events', 'App\...\UserRegistered')
         └── Returns [descriptor1, descriptor2, ...]
             └── For each descriptor: handlerLocator->get(serviceId)
+                └── calls handler($payload) or handler($payload, $envelope)
 ```
 
 ## Attribute Reference
@@ -139,32 +141,93 @@ final class UpdateAnalyticsHandler
 If any handler in the chain throws an exception, the entire message fails — none of the subsequent handlers run, and the offset is not committed. The message is retried from the beginning of the handler chain. By default (`idempotent: false`), handlers that already succeeded before the failure are skipped on retry — the cache key set after their first success prevents them running again. If your handler must always run even on retry (e.g. a pure upsert), set `idempotent: true`.
 </Callout>
 
+## EventEnvelope — Metadata in Handlers
+
+Declare `EventEnvelope` as a second parameter to access aggregate identity, timing, and cross-cutting metadata without any header attributes:
+
+```php
+use Vortos\Messaging\Contract\EventEnvelope;
+
+#[AsEventHandler(handlerId: 'user.registered.audit', consumer: 'user.events')]
+final class AuditUserRegistrationHandler
+{
+    public function __invoke(UserRegistered $event, EventEnvelope $envelope): void
+    {
+        $aggregateId      = $envelope->aggregateId;
+        $occurredAt       = $envelope->occurredAt;
+        $correlationId    = $envelope->metadata->correlationId;
+        $tenantId         = $envelope->metadata->tenantId;
+    }
+}
+```
+
+`EventEnvelope` is the preferred way to access metadata — it is type-safe and gives you everything in one place.
+
 ## Header Injection
 
-Handlers can receive metadata from message headers as additional parameters using injection attributes:
+For cases where you need individual values as typed parameters (useful for handlers that only need one or two fields), use injection attributes. There are two kinds: built-in attributes for standard Vortos fields, and a generic `#[Header]` attribute for any raw Kafka header.
+
+### Built-in header attributes
 
 ```php
 use Vortos\Messaging\Attribute\Header\MessageId;
 use Vortos\Messaging\Attribute\Header\CorrelationId;
 use Vortos\Messaging\Attribute\Header\Timestamp;
+use Vortos\Messaging\Attribute\Header\CausationId;
+use Vortos\Messaging\Attribute\Header\TraceId;
+use Vortos\Messaging\Attribute\Header\TenantId;
+use Vortos\Messaging\Attribute\Header\UserId;
 
 #[AsEventHandler(handlerId: 'user.registered.audit', consumer: 'user.events')]
 final class AuditUserRegistrationHandler
 {
     public function __invoke(
-        UserRegisteredEvent $event,
-        #[MessageId] string $messageId,
-        #[CorrelationId] string $correlationId,
-        #[Timestamp] DateTimeImmutable $occurredAt,
+        UserRegistered $event,
+        #[MessageId]     string            $messageId,
+        #[CorrelationId] string            $correlationId,
+        #[Timestamp]     DateTimeImmutable $occurredAt,
+        #[TenantId]      ?string           $tenantId,
+        #[UserId]        ?string           $userId,
+        #[CausationId]   ?string           $causationId,
+        #[TraceId]       ?string           $traceId,
+    ): void {}
+}
+```
+
+| Attribute | Source | Type |
+|---|---|---|
+| `#[MessageId]` | `EventEnvelope::$eventId` | `string` |
+| `#[CorrelationId]` | `EventEnvelope::$metadata->correlationId` | `string` |
+| `#[Timestamp]` | `EventEnvelope::$occurredAt` | `DateTimeImmutable` |
+| `#[CausationId]` | `EventEnvelope::$metadata->causationId` | `?string` |
+| `#[TraceId]` | `EventEnvelope::$metadata->traceId` | `?string` |
+| `#[TenantId]` | `EventEnvelope::$metadata->tenantId` | `?string` |
+| `#[UserId]` | `EventEnvelope::$metadata->userId` | `?string` |
+
+### `#[Header]` — arbitrary header injection
+
+Use `#[Header('header-name')]` to inject any raw Kafka message header directly into a handler parameter. The value is extracted from the raw headers array carried by `HeadersStamp` on the envelope:
+
+```php
+use Vortos\Messaging\Attribute\Header\Header;
+
+#[AsEventHandler(handlerId: 'order.placed.process', consumer: 'orders')]
+final class ProcessOrderHandler
+{
+    public function __invoke(
+        OrderPlacedEvent $event,
+        #[Header('x-tenant-id')] ?string $tenantId,
+        #[Header('x-source-region')] ?string $region,
     ): void {
-        // $messageId — unique ID of this message dispatch
-        // $correlationId — trace ID propagated across services
-        // $occurredAt — when the event was dispatched
+        // $tenantId — from the raw 'x-tenant-id' Kafka header
+        // $region   — from the raw 'x-source-region' Kafka header
     }
 }
 ```
 
-These are resolved from the Symfony Messenger envelope stamps — no additional configuration required.
+If the header is not present on the message, the injected value is `null`. Declare the parameter as `?string` to make this explicit.
+
+`#[Header]` is resolved at compile time by `HandlerDiscoveryCompilerPass` — the parameter descriptor is stored alongside the event type, with no runtime reflection.
 
 ## Registering a Consumer
 
@@ -244,20 +307,31 @@ Example output:
 ```
 Found 2 consumer(s).
 
-▶ user.events
-  Group ID:    user-service
-  Parallelism: 1
+▶ user.events  [kafka]
+  Group:       user-service
   Transport:   user.events
-  Handlers (2):
-    - user.registered.send-welcome-email  →  UserRegisteredEvent  (priority: 0)
-    - user.deleted.cleanup                →  UserDeletedEvent     (priority: 0)
+  Config:      parallelism: 1   batch: 10   ttl: 86400s
+  Retry:       exponential · 3 attempts · 500ms initial · 30000ms cap
+  DLQ:         user.events.dlq
 
-▶ orders.placed
-  Group ID:    order-service
-  Parallelism: 4
-  Transport:   orders.placed
+  Handlers (3):
+    UserRegistered  (App\User\Domain\Event\UserRegistered)
+      ├ user.registered.send-welcome-email    priority:   0   idempotent: no   (dedup on — duplicates skipped)
+      └ user.registered.audit                priority:  10   idempotent: no   (dedup on — duplicates skipped)
+
+    UserDeleted  (App\User\Domain\Event\UserDeleted)
+      └ user.deleted.cleanup                  priority:   0   idempotent: yes  (no dedup — always runs)
+
+▶ notifications.internal  [in-process]
+  Group:       —
+  Transport:   —
+  Config:      parallelism: 1   batch: 1    ttl: —
+  Retry:       —
+  DLQ:         —
+
   Handlers (1):
-    - order.placed.reserve-inventory  →  OrderPlacedEvent  (priority: 100)
+    OrderPlaced  (App\Order\Domain\Event\OrderPlaced)
+      └ order.placed.push-notification        priority:   0   idempotent: no   (dedup on — duplicates skipped)
 ```
 
 ## Consumer Pipeline Internals
@@ -268,9 +342,9 @@ When a message arrives from Kafka, `ConsumerRunner::handleMessage()` runs the fo
 
 <Step>
 
-### Extract event class
+### Extract payload type
 
-Read the `event_class` header from the message. If missing, reject the message immediately — it cannot be routed.
+Read the `payload_type` header from the message (the FQCN of the POPO event class). If missing, reject the message immediately — it cannot be routed.
 
 </Step>
 
@@ -278,9 +352,9 @@ Read the `event_class` header from the message. If missing, reject the message i
 
 ### Resolve handlers
 
-Call `HandlerRegistry::getHandlers($consumerName, $eventClass)` to look up all handler descriptors for this consumer and event class, sorted by priority descending.
+Call `HandlerRegistry::getHandlers($consumerName, $payloadType)` to look up all handler descriptors for this consumer and payload type, sorted by priority descending.
 
-If no handlers are registered, the message is acknowledged and discarded — it is not an error (the consumer simply doesn't handle this event class). This step also acts as a security gate: messages claiming an `event_class` that has no registered handlers are dropped before any deserialization or object construction occurs.
+If no handlers are registered, the message is acknowledged and discarded — it is not an error (the consumer simply doesn't handle this payload type). This step also acts as a security gate: messages claiming a `payload_type` that has no registered handlers are dropped before any deserialization or object construction occurs.
 
 </Step>
 
@@ -309,6 +383,132 @@ If all handlers succeeded, call `$consumer->acknowledge($message)` — Kafka off
 </Step>
 
 </Steps>
+
+## Dev: Live Message Inspection
+
+`vortos:kafka:tail` streams Vortos events from a Kafka transport to the terminal in real time. It uses a temporary consumer group so it never interferes with your application's consumer offsets.
+
+```bash
+# tail latest messages on the user.events transport
+php bin/console vortos:kafka:tail user.events
+
+# read from the beginning of the topic
+php bin/console vortos:kafka:tail user.events --from-beginning
+
+# stop after 20 messages
+php bin/console vortos:kafka:tail user.events --limit=20
+
+# override broker address (otherwise resolved from the transport DSN)
+php bin/console vortos:kafka:tail user.events --brokers=localhost:9092
+```
+
+Default output — one compact line per message:
+
+```
+Tailing transport: user.events  (topic: user-events, group: vortos-debug-a3f9c2)
+Waiting for messages... Ctrl+C to stop.
+
+14:32:01  UserRegistered     agg: usr_019d4784-7b26...  schema: 1  corr: abc-123-def
+          {"email":"alice@example.com","name":"Alice"}
+
+14:32:04  UserDeleted        agg: usr_019d4785-93cf...  schema: 1  corr: def-456-ghi
+          {"reason":"account_closed"}
+
+^C  Stopped. 2 message(s) read.
+```
+
+Add `-v` for partition, offset, Kafka timestamp, and all headers formatted line by line:
+
+```bash
+php bin/console vortos:kafka:tail user.events -v
+```
+
+```
+14:32:01  UserRegistered     agg: usr_019d4784-7b26...  schema: 1  corr: abc-123-def
+          partition: 2   offset: 4821   timestamp: 2026-05-22T14:32:01Z
+          headers:
+            payload_type:      App\User\Domain\Event\UserRegistered
+            schema_version:    1
+            correlation_id:    abc-123-def
+            causation_id:      cmd_019d4784-7b26...
+            trace_id:          trace_abc123
+          payload:
+            {"email":"alice@example.com","name":"Alice"}
+```
+
+The command requires the `rdkafka` PHP extension. Broker address is resolved from `--brokers`, then the registered transport DSN, then the `KAFKA_BROKERS` env var.
+
+Payloads are passed through `PayloadSanitizerInterface` before display, so any PII masking rules you have configured for the dead letter queue are applied automatically.
+
+## Dev: Live Consumer Activity
+
+There are two ways to observe live per-handler activity for a consumer. Both are non-production only.
+
+### Option A — `--tail` flag (same process)
+
+Pass `--tail` to `vortos:consume` to print activity directly to the terminal from the same process:
+
+```bash
+php bin/console vortos:consume user-consumer --tail
+```
+
+No Redis required. The worker runs normally and prints each message as it is processed. Ctrl+C stops the worker.
+
+### Option B — `vortos:consumer:tail` (observe a running worker)
+
+`vortos:consumer:tail` attaches to an already-running `vortos:consume` worker without starting a second consumer or competing for Kafka partitions.
+
+<Callout type="warn">This command requires the Redis cache driver and is not registered in production (`kernel.env = prod`).</Callout>
+
+**How it works:**
+
+1. `vortos:consumer:tail` sets a Redis key `vortos:tail-ctrl:{name}` (TTL 300s) and subscribes to `vortos:tail:{name}`
+2. The running worker's `ConsumerTailControlHook` polls for that key before each handler — when it finds it, it activates tail mode
+3. While active, the worker publishes per-handler events to the `vortos:tail:{name}` Redis pub/sub channel (ephemeral — nothing stored)
+4. `vortos:consumer:tail` renders events in real time as they arrive
+5. Ctrl+C deletes the Redis key — the worker deactivates on the next handler and publishes `stream_end`
+
+```bash
+# Terminal 1 — start the worker (keeps running normally)
+php bin/console vortos:consume user-consumer
+
+# Terminal 2 — observe it
+php bin/console vortos:consumer:tail user-consumer
+```
+
+```
+Tailing consumer: user-consumer (PID 12345)
+Waiting for messages... Ctrl+C to stop.
+
+14:32:01  UserRegistered     agg: usr_019d4784-7b26...  corr: abc-123-def
+  ├ SendWelcomeEmailHandler::__invoke    OK      22.0ms
+  └ SyncCrmHandler::__invoke             OK       8.3ms
+
+14:32:04  UserDeleted        agg: usr_019d4785-93cf...  corr: def-456-ghi
+  └ DeleteUserHandler::__invoke          OK       5.1ms
+
+14:32:09  OrderPlaced        agg: ord_019d4785-a1b2...  corr: xyz-789-abc
+  ├ ReserveInventoryHandler::__invoke    OK      14.2ms
+  ├ SendConfirmationEmailHandler::__invoke  SKIP     —    (idempotent)
+  └ NotifyFulfillmentHandler::__invoke   FAIL    31.7ms  Connection refused
+```
+
+Each message prints a header line (event type, aggregate ID, correlation ID) followed by one indented row per handler showing the handler name, outcome, and latency. The tree characters (├/└) mark whether more handlers follow.
+
+Possible outcomes per handler:
+
+| Outcome | Meaning |
+|---------|---------|
+| `OK` | Handler executed and committed on the first attempt |
+| `OK (retried)` | Handler eventually succeeded after one or more retry attempts |
+| `SKIP` | Duplicate message — idempotency key already set, handler skipped |
+| `DISCARD` | Replay limit exceeded — message discarded without running |
+| `DLQ` | All retries exhausted — written to dead letter store |
+| `RETRY` | Intermediate retry attempt failed — handler will be retried |
+
+<Callout type="info">Redis pub/sub is ephemeral — messages published while no subscriber is listening are lost. There is no backlog or persistence.</Callout>
+
+Unlike `vortos:kafka:tail` (raw Kafka bytes), both tail modes run the full consumer pipeline — deserialization, middleware, handlers, retry — and report the outcome per handler. Use `vortos:kafka:tail` to inspect what's on the topic; use the tail options to watch your handlers run.
 
 ## Kafka and Requeue
 

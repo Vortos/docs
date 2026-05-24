@@ -1,0 +1,149 @@
+---
+title: Customizing Stubs
+description: Override any framework stub with your own project template — your version always wins.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Customizing Stubs
+
+Every `vortos:make:*` command renders a stub template before writing the file. Stubs live inside each module's `Resources/stubs/` directory. You can override any stub by placing a file with the same name in your project's `stubs/` directory — your version always takes priority.
+
+## How Resolution Works
+
+When a command needs a stub, `StubScanner` checks two locations:
+
+```
+1. {project-root}/stubs/{stub-name}.stub       ← your project override (wins)
+2. {module}/Resources/stubs/{stub-name}.stub   ← framework default (fallback)
+```
+
+If your override exists, the framework stub is never read. If your override does not exist, the framework default is used. This means you can override individual stubs without forking the package.
+
+## Creating an Override
+
+1. Find the stub name for the command you want to customise. The name is the hyphenated identifier used internally — for example, `entity`, `command`, `event-handler`.
+
+2. Create `stubs/` in your project root if it doesn't exist:
+
+```bash
+mkdir -p stubs
+```
+
+3. Copy the framework stub as a starting point:
+
+```bash
+# Stubs live in the installed package, e.g.:
+cp vendor/vortos/vortos-domain/Resources/stubs/entity.stub stubs/entity.stub
+```
+
+4. Edit `stubs/entity.stub` to match your project conventions.
+
+The next time you run `vortos:make:entity`, your stub is used.
+
+## Stub Variable Syntax
+
+All stubs use double-curly-brace placeholders: `{{VariableName}}`. Each command passes a fixed set of variables. The table below lists every placeholder and which commands provide it.
+
+| Placeholder | Provided by | Description |
+|---|---|---|
+| `{{Namespace}}` | All | PHP namespace for the generated class |
+| `{{ClassName}}` | All | Class name |
+| `{{HttpStatus}}` | domain-error | HTTP status code (e.g. `404`, `409`) |
+| `{{ErrorCode}}` | domain-error | SCREAMING_SNAKE_CASE error code (e.g. `USER_NOT_FOUND`) |
+| `{{TableName}}` | entity, write-repository | SQL table name (snake_case plural) |
+| `{{CollectionName}}` | read-repository | MongoDB collection name |
+| `{{ConsumerName}}` | consumer, projection-handler, messaging-config | Kafka consumer name |
+| `{{HandlerId}}` | consumer, projection-handler | Unique handler ID (dot.case) |
+| `{{EventImport}}` | consumer, projection-handler | Full `use` statement for the event class |
+| `{{EventType}}` | projection-handler | Short event class name |
+| `{{EventClass}}` | consumer | Full FQCN of the event |
+| `{{EventShortClass}}` | consumer | Short name of the event |
+| `{{TransportName}}` | messaging-config | Kafka transport name |
+| `{{TopicName}}` | messaging-config | Kafka topic name |
+| `{{GroupId}}` | messaging-config | Kafka consumer group ID |
+| `{{Priority}}` | middleware | Middleware execution priority |
+| `{{HookAttribute}}` | hook | Attribute class name (e.g., `BeforeDispatch`) |
+| `{{Resource}}` | authorization-policy | Resource slug |
+| `{{Bucket}}` | quota-resolver | Quota bucket name |
+| `{{AttributeKey}}` | quota-resolver | Identity attribute key |
+| `{{RoutePrefix}}` | controller | HTTP route path |
+| `{{RouteName}}` | controller | HTTP route name |
+| `{{RouteMethod}}` | controller | HTTP method |
+| `{{AggregateNamespace}}` | write-repository | Namespace of the aggregate class |
+| `{{AggregateClass}}` | write-repository | Aggregate class name |
+| `{{Idempotent}}` | consumer | `true` or `false` |
+
+## Example: Adding a Constructor Body to Commands
+
+The default `command.stub` generates an empty constructor. If every command in your project needs a specific set of properties, override it:
+
+```php title="stubs/command.stub"
+<?php
+
+declare(strict_types=1);
+
+namespace {{Namespace}}\Application\Command\{{ClassName}};
+
+use Vortos\Domain\Command\AbstractCommand;
+
+final class {{ClassName}} extends AbstractCommand
+{
+    public function __construct(
+        public readonly string $actorId,
+        // add command properties here
+    ) {}
+}
+```
+
+Every `vortos:make:command` invocation will now include `$actorId` in the generated command.
+
+## Example: Adding Strict Type Annotations
+
+Override `value-object.stub` to include PHPStan/Psalm annotations:
+
+```php title="stubs/value-object.stub"
+<?php
+
+declare(strict_types=1);
+
+namespace {{Namespace}}\Domain\ValueObject;
+
+/** @psalm-immutable */
+final readonly class {{ClassName}}
+{
+    private function __construct(private string $value) {}
+
+    /** @pure */
+    public static function fromString(string $value): self
+    {
+        return new self($value);
+    }
+
+    public function equals(self $other): bool
+    {
+        return $this->value === $other->value;
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
+}
+```
+
+## Listing Available Framework Stubs
+
+All stubs are discoverable by looking in the installed packages:
+
+```bash
+find vendor/vortos -name "*.stub" -path "*/Resources/stubs/*" | sort
+```
+
+<Callout type="info" title="Stubs Are Per-Module">
+Stubs are owned by the module they belong to — `entity.stub` lives in `vortos-domain`, `command.stub` lives in `vortos-cqrs`, `event-handler.stub` in `vortos-messaging`. When you copy a stub to override it, check which package owns it so you copy the right file.
+</Callout>
+
+## Sharing Stubs Across Teams
+
+Commit your `stubs/` directory to source control. Everyone on the team picks up your overrides automatically — the resolution logic checks the project root `stubs/` directory at runtime, so no configuration is needed beyond the file being present.

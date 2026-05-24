@@ -117,19 +117,19 @@ The client passes `?cursor=<nextCursor>` on subsequent requests to load the next
 
 ## How Cursor Encoding Works (Internal)
 
-The cursor is a base64-encoded JSON object containing the sort field values of the last item on the current page, plus `_id` as a tiebreaker:
+The cursor contains the sort field values of the last item on the current page, plus `_id` as a tiebreaker. It is HMAC-signed to prevent tampering:
 
 ```
 Last item on page: { _id: 'user-5', createdAt: '2026-04-27T10:00:00Z' }
 Sort: ['createdAt' => 'desc']
 
-Cursor content: {"createdAt": "2026-04-27T10:00:00Z", "_id": "user-5"}
-Encoded cursor: base64("{"createdAt":"2026-04-27T10:00:00Z","_id":"user-5"}")
+Cursor payload: {"createdAt":"2026-04-27T10:00:00Z","_id":"user-5"}
+Encoded cursor: base64(payload).hmac_sha256(payload, VORTOS_CURSOR_SECRET)
 ```
 
-On the next request, the cursor is decoded and converted to a MongoDB `$gt` filter (ascending) or `$lt` filter (descending) for each sort field.
+On the next request, the cursor signature is verified before decoding. An invalid or tampered cursor is rejected with an exception. The decoded values are then converted to a MongoDB `$gt` filter (ascending sort) or `$lt` filter (descending sort) for each sort field. Only fields present in the current sort are allowed in the cursor — extra keys are rejected.
 
-You never need to understand this — just pass `nextCursor` back verbatim.
+You never need to understand this — just pass `nextCursor` back verbatim. The cursor format is opaque and not guaranteed to be stable across framework versions.
 
 ## InMemory Pagination
 

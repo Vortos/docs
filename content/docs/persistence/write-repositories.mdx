@@ -27,12 +27,12 @@ The `id` column stores your aggregate's UUID as a string. The `version` column i
 
 ## Implement the Four Methods
 
-```php title="src/User/Infrastructure/Repository/UserRepository.php"
+```php title="src/User/Infrastructure/Database/UserWriteRepository.php"
 use Doctrine\DBAL\Types\Types;
 use Vortos\Domain\Aggregate\AggregateRoot;
 use Vortos\PersistenceDbal\Write\DbalWriteRepository;
 
-final class UserRepository extends DbalWriteRepository
+final class UserWriteRepository extends DbalWriteRepository
 {
     // 1. Table name
     protected function tableName(): string
@@ -40,14 +40,15 @@ final class UserRepository extends DbalWriteRepository
         return 'users';
     }
 
-    // 2. Column → DBAL type map (must include version)
+    // 2. Column → DBAL type map (must include id, version, and all domain columns)
     protected function columnMap(): array
     {
         return [
-            'id'      => Types::STRING,
-            'email'   => Types::STRING,
-            'name'    => Types::STRING,
-            'version' => Types::INTEGER,
+            'id'            => Types::STRING,
+            'name'          => Types::STRING,
+            'email'         => Types::STRING,
+            'password_hash' => Types::STRING,
+            'version'       => Types::INTEGER,
         ];
     }
 
@@ -56,10 +57,11 @@ final class UserRepository extends DbalWriteRepository
     {
         /** @var User $aggregate */
         return [
-            'id'      => (string) $aggregate->getId(),
-            'email'   => (string) $aggregate->getEmail(),
-            'name'    => $aggregate->getName(),
-            'version' => $aggregate->getVersion(),
+            'id'            => (string) $aggregate->getId(),
+            'name'          => $aggregate->getName(),
+            'email'         => (string) $aggregate->getEmail(),
+            'password_hash' => $aggregate->getPasswordHash(),
+            'version'       => $aggregate->getVersion(),
         ];
     }
 
@@ -67,10 +69,11 @@ final class UserRepository extends DbalWriteRepository
     protected function fromRow(array $row): AggregateRoot
     {
         return User::reconstruct(
-            UserId::fromString($row['id']),
-            new Email($row['email']),
-            $row['name'],
-            (int) $row['version'],
+            id:           UserId::fromString($row['id']),
+            email:        new Email($row['email']),
+            name:         $row['name'],
+            passwordHash: $row['password_hash'],
+            version:      (int) $row['version'],
         );
     }
 }
@@ -84,44 +87,65 @@ final class UserRepository extends DbalWriteRepository
 final class User extends AggregateRoot
 {
     private function __construct(
-        private UserId $id,
-        private Email $email,
+        private readonly UserId $id,
+        private readonly Email $email,
         private string $name,
-        private int $restoredVersion = 0,
+        private string $passwordHash,
     ) {}
 
-    // For new aggregates (version starts at 0)
-    public static function register(Email $email, string $name): self
+    // For new aggregates — generates ID, records domain event
+    public static function register(string $name, string $email, string $plainPassword): self
     {
-        $user = new self(UserId::generate(), $email, $name);
-        $user->recordEvent(new UserRegisteredEvent((string) $user->id, (string) $email));
+        $id   = UserId::generate();
+        $user = new self(
+            id:           $id,
+            email:        new Email($email),
+            name:         $name,
+            passwordHash: password_hash($plainPassword, PASSWORD_BCRYPT),
+        );
+        $user->recordEvent(new UserRegisteredEvent(
+            aggregateId: (string) $id,
+            email:       $email,
+            name:        $name,
+        ));
         return $user;
     }
 
-    // For loading from database (version restored from DB)
-    public static function reconstruct(UserId $id, Email $email, string $name, int $version): self
-    {
-        $user = new self($id, $email, $name);
-        // Restore version so optimistic locking works on next save()
-        for ($i = 0; $i < $version; $i++) {
-            $user->incrementVersion();
-        }
+    // For loading from database — restores version for optimistic locking
+    public static function reconstruct(
+        UserId $id,
+        Email $email,
+        string $name,
+        string $passwordHash,
+        int $version,
+    ): self {
+        $user = new self(
+            id:           $id,
+            email:        $email,
+            name:         $name,
+            passwordHash: $passwordHash,
+        );
+        $user->restoreVersion($version);
         return $user;
     }
 
     public function getId(): UserId { return $this->id; }
+    public function getEmail(): Email { return $this->email; }
+    public function getName(): string { return $this->name; }
+    public function getPasswordHash(): string { return $this->passwordHash; }
 }
 ```
 
 ## Register the Repository
 
-```php title="config/services.php"
-use Doctrine\DBAL\Connection;
+`DbalWriteRepository` subclasses are discovered and wired automatically — no manual service registration is needed. The `services.php` default configuration autowires everything under `src/` (excluding the `Domain/` layer):
 
-$services->set(UserRepository::class)
-    ->arg('$connection', service(Connection::class))
-    ->public();
+```php title="config/services.php"
+$services->load('App\\', '../src/')
+    ->exclude(['../src/*/Domain/']);
 ```
+
+`UserWriteRepository` is picked up automatically and its `Connection` dependency is injected by type.
 
 ## Built-In Operations
 
@@ -159,7 +183,7 @@ Applies optimistic locking on delete. Throws `OptimisticLockException` if the ag
 
 ## Custom Queries
 
-Use the protected `connection()` method for queries beyond `findById()`:
+Use the protected `connection()` method for queries beyond `findById()`. The underlying DBAL `Connection` field is `private` — subclasses must go through `connection()`, never `$this->connection`. This keeps the resolution strategy an internal detail of the base class:
 
 ```php
 public function findByEmail(Email $email): ?User

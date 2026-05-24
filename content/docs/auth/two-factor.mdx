@@ -32,7 +32,7 @@ This ensures the user is authenticated before 2FA is checked, and 2FA is verifie
 ## Implement a Verifier
 
 ```php title="src/Auth/TotpVerifier.php"
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 use Vortos\Auth\Contract\UserIdentityInterface;
 use Vortos\Auth\TwoFactor\Contract\TwoFactorVerifierInterface;
 

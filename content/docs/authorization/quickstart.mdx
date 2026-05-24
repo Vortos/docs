@@ -140,9 +140,9 @@ This writes to `user_roles`, increments the user's authorization version, invali
 ```php title="src/Athlete/Http/UpdateAthleteController.php"
 use Symfony\Component\Routing\Attribute\Route;
 use Vortos\Authorization\Attribute\RequiresPermission;
-use Vortos\Http\Attribute\ApiController;
+use Vortos\Http\Attribute\AsController;
 
-#[ApiController]
+#[AsController]
 final class UpdateAthleteController
 {
     #[Route('/athletes/{id}', methods: ['PATCH'])]

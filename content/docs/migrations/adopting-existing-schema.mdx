@@ -1,11 +1,11 @@
 ---
 title: Adopting Existing Schema
-description: Use migrate:adopt to mark verified existing module schema as executed without broad baselining.
+description: Use migrate:adopt to mark existing schema as executed without running SQL, and migrate:unadopt to recover from a wrong adoption.
 ---
 
 # Adopting Existing Schema
 
-Use adoption when schema objects already exist but the migration is not tracked in `vortos_migrations`.
+Use adoption when schema objects already exist but the migration is not tracked in `vortos_migrations`. This happens in brownfield projects where SQL was applied manually before using Vortos.
 
 ## Adopt One Migration
 
@@ -34,16 +34,73 @@ php vortos migrate:adopt --all-compatible --dry-run
 php vortos migrate:adopt --all-compatible --force
 ```
 
-This only adopts pending module migrations whose owned schema exists and verifies as compatible.
+By default this includes both framework module migrations and your own user-authored migrations.
 
-## Adopt vs Baseline
+Framework module migrations are verified against the live schema before adoption — if the schema does not match, they are blocked.
 
-Prefer adoption in production.
+User-authored migrations that declare schema using the Doctrine Schema API (`$schema->createTable(...)`) are also auto-verified. Migrations that use raw SQL (`$this->addSql(...)`) cannot be auto-verified and require `--allow-unverified`.
+
+## Framework-Only Adoption
+
+To restrict adoption to verified framework module migrations only, pass `--module-only`:
+
+```bash
+php vortos migrate:adopt --all-compatible --module-only
+```
+
+## Raw SQL Migrations (Unverified)
+
+If your migrations use raw `addSql()`, Vortos cannot verify the schema automatically. These are blocked by default:
+
+```
+  Unverified migration(s) — raw SQL, cannot auto-verify:
+
+    App\Migrations\Version20260506093012
+
+  Vortos cannot verify these migrations. Manually confirm your schema is
+  correct, then re-run with --allow-unverified:
+
+    php vortos migrate:adopt --all-compatible --allow-unverified
+```
+
+Once you have confirmed the schema is correct:
+
+```bash
+php vortos migrate:adopt --all-compatible --allow-unverified
+```
+
+After adoption, the output shows recovery instructions in case you discover a mismatch later.
+
+## Recovering from a Wrong Adoption
+
+If you adopted a migration incorrectly, remove the tracking record with `migrate:unadopt`:
+
+```bash
+# Remove a specific migration tracking record
+php vortos migrate:unadopt Version20260506093012
+
+# Remove the latest executed migration tracking record
+php vortos migrate:unadopt
+
+# Skip confirmation prompt
+php vortos migrate:unadopt Version20260506093012 --force
+```
+
+`migrate:unadopt` does **not** touch the schema — it only removes the row from `vortos_migrations`. After unadopting, the migration becomes pending again:
+
+```bash
+# Re-apply the migration via SQL
+php vortos migrate
+
+# Or re-adopt if the schema is already correct
+php vortos migrate:adopt Version20260506093012 --verify
+```
 
 | Command | Use Case |
 |---|---|
 | `migrate:adopt VERSION --verify` | Mark one verified migration as executed |
-| `migrate:adopt --all-compatible` | Mark all verified compatible module migrations |
-| `migrate:baseline` | Mark all pending migrations as executed during one-time transition |
-
-`baseline` is broad. It should only be used when every pending migration has already been physically applied and reviewed.
+| `migrate:adopt --all-compatible` | Mark all compatible migrations (framework + user Schema API) |
+| `migrate:adopt --all-compatible --allow-unverified` | Include raw SQL user migrations |
+| `migrate:adopt --all-compatible --module-only` | Framework migrations only |
+| `migrate:unadopt VERSION` | Remove a specific migration tracking record |
+| `migrate:unadopt` | Remove the latest migration tracking record |

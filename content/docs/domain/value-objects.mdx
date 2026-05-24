@@ -19,32 +19,24 @@ abstract readonly class ValueObject
 }
 ```
 
-`ValueObject` is `readonly` — all subclasses must be `readonly`.
+`ValueObject` is `abstract readonly` — subclasses that extend it must also be `readonly`. Simple value objects can skip the base class entirely and just implement `\Stringable` (see the `Email` example below).
 
 ## Define a Value Object
 
-```php title="src/User/Domain/ValueObject/Email.php"
-use Vortos\Domain\ValueObject\ValueObject;
-
-final readonly class Email extends ValueObject
+```php title="src/User/Domain/User/ValueObjects/Email.php"
+final class Email implements \Stringable
 {
-    private function __construct(private string $value) {}
+    private readonly string $value;
 
-    // Factory method — validates before constructing
-    public static function fromString(string $email): self
+    public function __construct(string $value)
     {
-        $normalized = strtolower(trim($email));
+        $normalized = strtolower(trim($value));
 
         if (!filter_var($normalized, FILTER_VALIDATE_EMAIL)) {
-            throw new \InvalidArgumentException("Invalid email: {$email}");
+            throw new \InvalidArgumentException("Invalid email address: {$value}");
         }
 
-        return new self($normalized);
-    }
-
-    public function equals(ValueObject $other): bool
-    {
-        return $other instanceof self && $this->value === $other->value;
+        $this->value = $normalized;
     }
 
     public function __toString(): string
@@ -52,14 +44,16 @@ final readonly class Email extends ValueObject
         return $this->value;
     }
 
-    public function getDomain(): string
+    public function equals(self $other): bool
     {
-        return substr($this->value, strpos($this->value, '@') + 1);
+        return $this->value === $other->value;
     }
 }
 ```
 
-```php title="src/Payment/Domain/ValueObject/Money.php"
+For simple value objects, the lightweight pattern above works well: a public constructor that validates in place, a readonly backing field, and `\Stringable`. The framework also ships an `abstract readonly class ValueObject` base if you want a shared `equals()` contract enforced at the type level:
+
+```php title="src/Payment/Domain/Payment/ValueObjects/Money.php"
 final readonly class Money extends ValueObject
 {
     private function __construct(
@@ -100,7 +94,7 @@ final readonly class Money extends ValueObject
 
 ## Key Rules
 
-**Private constructor, public factory.** Validation lives in the factory — invalid value objects cannot be created.
+**Validate on construction.** Either validate in a public constructor (simple VOs) or in a private constructor called from a public factory method (VOs using the `ValueObject` base). Invalid value objects must never be creatable.
 
 **Return new instances for transformations.** Never mutate:
 
@@ -130,13 +124,10 @@ public function equals(ValueObject $other): bool
 ## Common Value Objects
 
 ```php
-final readonly class Name extends ValueObject { ... }
-final readonly class Email extends ValueObject { ... }
-final readonly class PhoneNumber extends ValueObject { ... }
-final readonly class Money extends ValueObject { ... }
-final readonly class Address extends ValueObject { ... }
-final readonly class Url extends ValueObject { ... }
-final readonly class Percentage extends ValueObject { ... }
+final class Email implements \Stringable { ... }          // lightweight pattern
+final class PhoneNumber implements \Stringable { ... }    // lightweight pattern
+final readonly class Money extends ValueObject { ... }    // ValueObject base
+final readonly class Address extends ValueObject { ... }  // ValueObject base
 ```
 
 <Callout type="info" title="Value Objects in Database">

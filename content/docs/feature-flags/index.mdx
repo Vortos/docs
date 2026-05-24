@@ -152,7 +152,7 @@ By default, all requests are evaluated as anonymous (no `userId`, no attributes)
 ```php title="src/Infrastructure/Flags/UserFlagContextResolver.php"
 use Vortos\FeatureFlags\FlagContext;
 use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 
 final class UserFlagContextResolver implements FlagContextResolverInterface
 {

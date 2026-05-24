@@ -1,0 +1,168 @@
+---
+title: MCP Server
+description: An MCP server that makes Vortos conventions, architecture rules, best practices, and project config queryable by AI coding assistants — Claude Code, Cursor, Windsurf, and Codex.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# MCP Server
+
+`vortos-mcp` ships a [Model Context Protocol](https://modelcontextprotocol.io) server that makes the framework's knowledge queryable by AI coding tools. When it's running, your AI assistant can ask it for golden rules, architecture patterns, common mistakes, module APIs, best practices, and your project's own config files — and act on that information when generating code.
+
+<Callout type="info" title="What MCP Is">
+MCP (Model Context Protocol) is an open standard for exposing context to AI tools. An MCP server runs as a subprocess alongside your AI client. The client sends tool calls over stdin/stdout; the server returns structured answers. No HTTP server, no API keys, no cloud dependency.
+</Callout>
+
+## What the Server Provides
+
+Seven tools are registered in the MCP server, each answering a different class of question:
+
+| Tool | What it answers |
+|---|---|
+| `get_conventions` | Golden rules, naming conventions, package registration order |
+| `get_architecture` | Layer responsibilities, CQRS/event flow, canonical directory structure |
+| `get_best_practices` | Performance, security, testing, worker mode, and Kafka practices |
+| `get_mistakes` | 15 common antipatterns with correct alternatives |
+| `get_module_docs` | API reference for any Vortos module |
+| `list_project_modules` | Which `vortos/*` packages are installed in your project |
+| `read_project_config` | The contents of your `config/*.php` files |
+
+See [Tools Reference](/docs/mcp/tools) for the full schema and example outputs.
+
+## Quick Setup
+
+<Steps>
+
+<Step>
+
+### Install the package
+
+```bash
+composer require vortos/vortos-mcp --dev
+```
+
+</Step>
+
+<Step>
+
+### Wire it into your AI client
+
+```bash
+php bin/console vortos:mcp:install
+```
+
+This command auto-detects which AI clients are installed on your machine and writes the MCP server configuration into each one. You can also target a specific client:
+
+```bash
+php bin/console vortos:mcp:install --client=claude
+php bin/console vortos:mcp:install --client=cursor
+php bin/console vortos:mcp:install --client=windsurf
+php bin/console vortos:mcp:install --client=codex
+php bin/console vortos:mcp:install --client=all
+```
+
+Pass `--global` to write to your user-level config (`~/`) instead of the project-level config (`.claude/`, `.cursor/`, `.windsurf/`):
+
+```bash
+php bin/console vortos:mcp:install --client=claude --global
+```
+
+</Step>
+
+<Step>
+
+### Verify the setup
+
+```bash
+php bin/console vortos:mcp:doctor
+```
+
+Output:
+
+```
+ AI Clients
+ ──────────────────────────────────────────────────
+ ✔ Claude Code      detected    configured
+ - Cursor           not found   —
+ - Windsurf         not found   —
+ - Codex            not found   —
+
+ MCP Server
+ ──────────────────────────────────────────────────
+ Command:    php ./bin/console vortos:mcp:serve
+ Transport:  stdio
+
+ Available Tools
+ ──────────────────────────────────────────────────
+ • get_conventions          Returns golden rules and naming conventions
+ • get_architecture         Returns layer rules and CQRS/event flow
+ • get_best_practices       Returns topic-filtered best practices
+ • get_mistakes             Returns common antipatterns with corrections
+ • get_module_docs          Returns module API reference
+ • list_project_modules     Lists installed vortos/* packages
+ • read_project_config      Returns config/ file contents
+
+ ✔ Setup complete. Restart your AI client to activate.
+```
+
+</Step>
+
+<Step>
+
+### Restart your AI client
+
+The MCP server is launched as a subprocess by the client. Restart the client after installing to pick up the new configuration.
+
+</Step>
+
+</Steps>
+
+## How It Works
+
+```
+AI Client (Claude Code / Cursor / Windsurf / Codex)
+    │
+    │  tools/list  ─────────────────────────────────────┐
+    │  tools/call get_conventions                       │
+    │  tools/call get_module_docs {module: "messaging"} │
+    ▼                                                   │
+StdioTransport (stdin/stdout JSON-RPC 2.0)            │
+    │                                                   │
+    ▼                                                   │
+McpServer::run() loop                                  │
+    │                                                   │
+    ├── initialize  → protocol handshake               │
+    ├── tools/list  → returns all 7 tool schemas ──────┘
+    └── tools/call  → routes to correct ToolInterface
+            ├── GetConventionsTool
+            ├── GetArchitectureTool
+            ├── GetBestPracticesTool
+            ├── GetMistakesTool
+            ├── GetModuleDocsTool
+            ├── ListProjectModulesTool   ← reads your composer.lock
+            └── ReadProjectConfigTool   ← reads your config/ directory
+```
+
+The server speaks [JSON-RPC 2.0](https://www.jsonrpc.org/specification) over stdin/stdout. The client launches `php bin/console vortos:mcp:serve` as a subprocess when it starts. No port is opened, no daemon runs in the background.
+
+## Supported Clients
+
+| Client | Config Location | Format |
+|---|---|---|
+| Claude Code | `.claude/settings.json` | JSON |
+| Cursor | `.cursor/mcp.json` | JSON |
+| Windsurf | `.windsurf/mcp.json` | JSON |
+| Codex | `~/.codex/config.toml` | TOML (global only) |
+
+<Callout type="info" title="Project vs Global Config">
+Project-level config (`.claude/settings.json`) is the default. It wires the MCP server only for the current project — the path to `bin/console` is project-specific. Use `--global` for clients like Codex that only support global config, or when you want the server available across all projects.
+</Callout>
+
+## Detailed Pages
+
+<Cards>
+  <Card title="Tools Reference" href="/docs/mcp/tools" description="Full schema and example output for all seven tools." />
+  <Card title="Install & Doctor" href="/docs/mcp/install" description="vortos:mcp:install and vortos:mcp:doctor command reference." />
+</Cards>

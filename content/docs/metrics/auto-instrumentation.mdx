@@ -164,6 +164,8 @@ Queue and outbox modules can expose operational gauges:
 
 Dead-letter gauges should alert quickly. A growing DLQ normally requires manual intervention.
 
+These gauges are point-in-time values — they are not updated on every request. They are populated by running `vortos:metrics:collect` on a schedule. See [Point-in-Time Collectors](#point-in-time-collectors) below.
+
 ---
 
 ## Cache
@@ -320,3 +322,41 @@ You can disable multiple modules in a single call:
 ```php
 $config->disableModule(MetricsModule::Cache, MetricsModule::Persistence);
 ```
+
+---
+
+## Point-in-Time Collectors
+
+Some metrics cannot be observed on the request path — they measure background system state that must be sampled on a schedule. The outbox and dead-letter backlog gauges fall into this category.
+
+Run the collector command on a cron schedule (every 30–60 seconds is typical):
+
+```bash
+php bin/console vortos:metrics:collect
+```
+
+Output:
+
+```
+Running 2 metric collector(s)...
+
+  ✔ OutboxBacklogCollector
+  ✔ DeadLetterBacklogCollector
+
+2 collector(s) ran successfully.
+```
+
+Each collector queries the database, sets the gauge to the current count, and returns. The command is idempotent — running it more frequently just updates the gauges more often.
+
+Add it to `supervisord.conf` or a cron entry alongside your outbox relay:
+
+```ini title="docker/worker/supervisord.conf"
+[program:metrics-collect]
+command=bash -c 'while true; do php /var/www/html/bin/console vortos:metrics:collect; sleep 30; done'
+autostart=true
+autorestart=true
+stdout_logfile=/var/log/supervisor/metrics-collect.out.log
+stderr_logfile=/var/log/supervisor/metrics-collect.err.log
+```
+
+If no collectors are registered (for example, the Messaging module is disabled), the command reports zero collectors and exits cleanly — it is safe to run regardless of which modules are active.

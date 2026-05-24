@@ -1,0 +1,177 @@
+---
+title: Config
+description: Publish annotated configuration stubs to your project with a single command — vortos:config:publish.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Config
+
+`vortos-config` is the mechanism every Vortos module uses to ship its configuration stub to your project. When you run `vortos:config:publish`, the framework copies annotated PHP config files into your `config/` directory — ready to customise.
+
+<Callout type="info" title="One Command, Any Module">
+Every module that accepts configuration ships its own stub. `vortos:config:publish` discovers all of them and publishes whichever you choose. You don't need to know where the stubs live — the framework handles it.
+</Callout>
+
+## Installation
+
+```bash
+composer require vortos/vortos-config
+```
+
+The package is auto-discovered. No manual registration is needed.
+
+## The Command
+
+```bash
+php bin/console vortos:config:publish
+```
+
+This copies a `config/{module}.php` file for every registered module into your project root. Each file is fully annotated — all options documented inline.
+
+### Options
+
+| Option | Shorthand | Description |
+|---|---|---|
+| `--module=<name>` | `-m` | Publish one specific module's config. Repeatable. |
+| `--force` | `-f` | Overwrite files that already exist in `config/`. |
+| `--dry-run` | | Preview which files would be published without writing anything. |
+
+### Examples
+
+```bash
+# Publish all module config files at once
+php bin/console vortos:config:publish
+
+# Publish only the cache and logger configs
+php bin/console vortos:config:publish --module=cache --module=logging
+
+# Preview what would be published without writing files
+php bin/console vortos:config:publish --dry-run
+
+# Re-publish and overwrite a file you want to reset to defaults
+php bin/console vortos:config:publish --module=auth --force
+
+# See what modules are available
+php bin/console vortos:config:publish --dry-run
+```
+
+### Output
+
+```
+ Publishing config stubs...
+
+  ✔ config/cache.php
+  ✔ config/logging.php
+  ✔ config/auth.php
+
+ Published 3 file(s). Review before deploying.
+```
+
+If some files already exist (and `--force` was not passed), they appear separately:
+
+```
+  ✔ config/messaging.php
+  - config/cache.php  (skipped — already exists, use --force to overwrite)
+
+ Published 1 file(s).  Skipped 1 (already exist — use --force to overwrite).
+```
+
+If you request a module that doesn't exist:
+
+```
+ [ERROR] Unknown module(s): typo
+         Available: auth, cache, cqrs, logging, messaging, tracing
+```
+
+## What Gets Published
+
+Each module's config stub is a plain PHP file that returns a closure accepting its typed config object:
+
+```php title="config/cache.php"
+use Vortos\Cache\DependencyInjection\VortosCacheConfig;
+
+return static function (VortosCacheConfig $config): void {
+
+    // Redis connection DSN.
+    // Default: redis://redis:6379
+    $config->dsn(sprintf('redis://%s:%s', $_ENV['REDIS_HOST'] ?? 'redis', $_ENV['REDIS_PORT'] ?? '6379'));
+
+    // Cache key prefix — always include APP_ENV to prevent collisions between environments.
+    // Default: 'vortos_'
+    $config->prefix($_ENV['APP_ENV'] . '_myapp_');
+
+    // Default TTL in seconds for cache entries with no explicit TTL.
+    // Default: 3600
+    $config->defaultTtl(3600);
+};
+```
+
+Every option is documented inline. You don't need to read source code — the stub tells you what each setting does and what the default is.
+
+## Modules With Config Stubs
+
+| Module | Config file | What you configure |
+|---|---|---|
+| `cache` | `config/cache.php` | Redis DSN, key prefix, default TTL, driver |
+| `logging` | `config/logging.php` | Channels, levels, alerting, buffering, rotation |
+| `auth` | `config/auth.php` | JWT secret, token TTL, rate limiting, lockout |
+| `messaging` | `config/messaging.php` | DLQ table name, idempotency defaults |
+| `cqrs` | `config/cqrs.php` | Command idempotency store, middleware |
+| `tracing` | `config/tracing.php` | OTLP endpoint, sampler, service name |
+
+<Callout type="info" title="Not Every Module Needs Config">
+Modules that are fully configuration-free (HTTP, Domain, Persistence) do not ship stubs. Running `vortos:config:publish` for them produces `[ERROR] Unknown module(s): ...`.
+</Callout>
+
+## Environment-Specific Overrides
+
+The config loader in `Runner` merges environment-specific files on top of the base file:
+
+```
+config/
+├── cache.php           ← base, loaded always
+├── dev/
+│   └── cache.php       ← merged on top when APP_ENV=dev
+└── test/
+    └── cache.php       ← merged on top when APP_ENV=test
+```
+
+To create an environment-specific override, publish normally first, then copy:
+
+```bash
+php bin/console vortos:config:publish --module=cache
+mkdir -p config/test
+cp config/cache.php config/test/cache.php
+# Edit config/test/cache.php to swap Redis → InMemory
+```
+
+The override file only needs to call the settings it changes — it does not need to repeat everything from the base file.
+
+## Registering Your Own Stubs
+
+If you build a custom Vortos package and want to participate in `vortos:config:publish`, register a `ConfigStub` service tagged with `vortos.config_stub`:
+
+```php title="src/MyFeature/DependencyInjection/MyFeatureExtension.php"
+use Vortos\Config\Stub\ConfigStub;
+
+$container->register('my_feature.config_stub', ConfigStub::class)
+    ->setArguments(['my-feature', __DIR__ . '/../Resources/config/config.stub.php'])
+    ->addTag('vortos.config_stub');
+```
+
+The first argument is the module name (becomes the output filename `config/my-feature.php`). The second argument is the absolute path to your stub file shipped inside the package.
+
+After registering, the stub appears in `vortos:config:publish --dry-run` and can be published like any built-in module.
+
+## Safe Re-publishing
+
+Running `vortos:config:publish` is always safe:
+
+- **Existing files are skipped** unless `--force` is passed
+- **`--dry-run` never writes** — use it freely to audit what would happen
+- **Unknown module names fail explicitly** — a typo in `--module` returns an error and exits `FAILURE`, it does not silently publish nothing
+
+The command is idempotent: running it twice with the same modules produces the same result.

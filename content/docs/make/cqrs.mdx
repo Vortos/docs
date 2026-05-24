@@ -1,0 +1,244 @@
+---
+title: CQRS Generators
+description: Generate commands, queries, and projection handlers wired directly into the Vortos CQRS bus.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# CQRS Generators
+
+These commands generate the application layer objects that sit between your HTTP controllers and your domain. Every generated file is wired correctly into the CQRS bus — no manual registration needed.
+
+---
+
+## `vortos:make:command`
+
+Generates a CQRS command and its handler as a pair. Both files are placed together in a dedicated sub-directory named after the command.
+
+```bash
+php bin/console vortos:make:command <name> --context=<context>
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Command class name. Imperative PascalCase. E.g., `RegisterUser`, `PlaceOrder`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:command RegisterUser --context=User
+```
+
+**Creates**
+
+```
+src/User/Application/Command/RegisterUser/RegisterUser.php
+src/User/Application/Command/RegisterUser/RegisterUserHandler.php
+```
+
+**`RegisterUser.php` (command)**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\Command\RegisterUser;
+
+use Vortos\Domain\Command\AbstractCommand;
+
+final class RegisterUser extends AbstractCommand
+{
+    public function __construct(
+        // add command properties here
+    ) {}
+}
+```
+
+**`RegisterUserHandler.php` (handler)**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\Command\RegisterUser;
+
+use Vortos\Cqrs\Attribute\AsCommandHandler;
+
+#[AsCommandHandler]
+final class RegisterUserHandler
+{
+    public function __construct(
+        // inject dependencies here
+    ) {}
+
+    public function __invoke(RegisterUser $command): mixed
+    {
+        // implement handler logic here
+
+        return null; // return the aggregate if it raises domain events
+    }
+}
+```
+
+<Callout type="warn" title="Return the Aggregate">
+If your handler creates or modifies an aggregate that raises domain events, return the aggregate from `__invoke`. The command bus calls `pullDomainEvents()` on the return value and dispatches them. If you return `void` or `null`, events are silently dropped.
+</Callout>
+
+---
+
+## `vortos:make:query`
+
+Generates a CQRS query and its handler as a pair.
+
+```bash
+php bin/console vortos:make:query <name> --context=<context>
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Query class name. Descriptive PascalCase. E.g., `GetUserById`, `ListOrders`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:query GetUserById --context=User
+```
+
+**Creates**
+
+```
+src/User/Application/Query/GetUserById/GetUserById.php
+src/User/Application/Query/GetUserById/GetUserByIdHandler.php
+```
+
+**`GetUserById.php` (query)**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\Query\GetUserById;
+
+use Vortos\Cqrs\Query\QueryInterface;
+
+final readonly class GetUserById implements QueryInterface
+{
+    public function __construct(
+        // add query parameters here
+    ) {}
+}
+```
+
+**`GetUserByIdHandler.php` (handler)**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\Query\GetUserById;
+
+use Vortos\Cqrs\Attribute\AsQueryHandler;
+
+#[AsQueryHandler]
+final class GetUserByIdHandler
+{
+    public function __construct(
+        // inject read repository here
+    ) {}
+
+    public function __invoke(GetUserById $query): mixed
+    {
+        // implement query logic here
+
+        return null;
+    }
+}
+```
+
+Query handlers read from the read side (MongoDB via a read repository). They never write. They return a plain data structure — typically an array or a DTO — not an aggregate.
+
+---
+
+## `vortos:make:projection-handler`
+
+Generates a Kafka projection handler — a consumer that listens to an event and writes to the read model (MongoDB).
+
+```bash
+php bin/console vortos:make:projection-handler <name> \
+    --context=<context> \
+    --consumer=<consumer-name> \
+    [--event=<EventClass>] \
+    [--handler-id=<id>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Handler name **without** the `ProjectionHandler` suffix. E.g., `UserRegistered`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--consumer` | Kafka consumer name. Must match a registered `#[RegisterConsumer]`. Required. |
+| `--event` / `-e` | Event class — short name or FQCN. If omitted, uses `DomainEventInterface` as the type. |
+| `--handler-id` | Unique handler ID. Defaults to dot.case of name (e.g., `user.registered`). |
+
+**Example**
+
+```bash
+php bin/console vortos:make:projection-handler UserRegistered \
+    --context=User \
+    --consumer=user.events \
+    --event=UserRegisteredEvent \
+    --handler-id=user.projection.registered
+```
+
+**Creates**
+
+```
+src/User/Application/Projection/UserRegisteredProjectionHandler.php
+```
+
+**Generated class**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\Projection;
+
+use App\User\Domain\Event\UserRegisteredEvent;
+use Vortos\Messaging\Attribute\AsEventHandler;
+
+#[AsEventHandler(
+    handlerId: 'user.projection.registered',
+    consumer: 'user.events',
+)]
+final class UserRegisteredProjectionHandler
+{
+    public function __construct(
+        // inject read repository here
+    ) {}
+
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        // write to the read model here
+        // always use upsert — Kafka delivers at-least-once
+    }
+}
+```
+
+<Callout type="warn" title="Always Upsert">
+Projection handlers must use `upsert()` not `insert()`. Kafka guarantees at-least-once delivery — the same event can arrive more than once. An `insert` on a duplicate `_id` throws; an `upsert` is idempotent.
+</Callout>
+
+The `handlerId` is used for idempotency tracking. Make it unique and stable — changing it after deployment resets the idempotency cache for this handler.

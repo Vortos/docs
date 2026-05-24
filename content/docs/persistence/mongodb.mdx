@@ -1,6 +1,6 @@
 ---
 title: MongoDB
-description: MongoDB client setup, DSN format, connection behaviour, index management, and bulk operations.
+description: MongoDB client setup, DSN format, connection behaviour, index management with PHP attributes, and bulk operations.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -14,6 +14,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 ```
 MongoDB\Client::class                        — shared, built from MONGODB_URL
 vortos.persistence.mongo.database_name       — container parameter
+MongoIndexAttributeScanner                   — populated with repo classes at compile time
 ```
 
 ## Environment Variables
@@ -55,47 +56,103 @@ MONGODB_URL=mongodb://root:secret@read_db:27017
 # Replica set
 MONGODB_URL=mongodb://user:pass@host1:27017,host2:27017/?replicaSet=rs0
 
-# Replica set with TLS
-MONGODB_URL=mongodb://user:pass@host1:27017,host2:27017/?replicaSet=rs0&tls=true
-
 # MongoDB Atlas
 MONGODB_URL=mongodb+srv://user:pass@cluster0.abc123.mongodb.net
 ```
 
 ## Register Your Read Repositories
 
-`MongoPersistenceExtension` does NOT register your read repositories automatically — you register them in `config/services.php`:
+Register your read repository class in `config/services.php` — the framework automatically injects `MongoDB\Client`, the database name, and the `vortos.read_repository` tag at compile time:
 
 ```php title="config/services.php"
-use MongoDB\Client;
-
-$services->set(UserReadRepository::class)
-    ->arg('$client', service(Client::class))
-    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
-    ->tag('vortos.read_repository')   // required for setup command
-    ->public();
-
-$services->set(OrderReadRepository::class)
-    ->arg('$client', service(Client::class))
-    ->arg('$databaseName', '%vortos.persistence.mongo.database_name%')
-    ->tag('vortos.read_repository')
-    ->public();
+$services->set(UserReadRepository::class);
+$services->set(OrderReadRepository::class);
 ```
 
-The `vortos.read_repository` tag is used by `vortos:setup:persistence` to discover all read repositories and call `ensureIndexes()` on each.
+`MongoReadRepositoryAutowirePass` detects every subclass of `MongoReadRepository` and:
 
-## Index Setup
+1. Sets `$client` → `MongoDB\Client`
+2. Sets `$databaseName` → `%vortos.persistence.mongo.database_name%`
+3. Adds the `vortos.read_repository` tag
+4. Registers the class name with `MongoIndexAttributeScanner` so `vortos:mongo:sync` finds it
+
+## Collections Are Created Automatically
+
+MongoDB creates a collection the first time you write to it or call `createIndex()` on it. You do not need to pre-create collections the way you create tables in SQL.
+
+## Index Management
+
+### Why indexes are not part of migrations
+
+SQL schema changes need versioning because they are destructive and ordered — dropping a column cannot be undone. MongoDB's `createIndex()` is idempotent — calling it on an existing index is a no-op. There is nothing to track and nothing to roll back.
+
+Mixing MongoDB indexes into the SQL migration system would couple infrastructure concerns that have nothing in common.
+
+### Declaring indexes with PHP attributes
+
+Add `#[MongoCollection]` and repeatable `#[MongoIndex]` directly on the repository class — the same class that uses the indexes for queries:
+
+```php title="src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php"
+use Vortos\PersistenceMongo\Read\MongoReadRepository;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoCollection;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
+
+#[MongoCollection('users')]
+#[MongoIndex(key: ['email' => 1], unique: true)]
+#[MongoIndex(key: ['createdAt' => -1, '_id' => -1])]
+#[MongoIndex(key: ['deletedAt' => 1], sparse: true)]
+#[MongoIndex(key: ['expiresAt' => 1], expireAfterSeconds: 3600)]
+final class UserReadRepository extends MongoReadRepository
+{
+    // ...
+}
+```
+
+`#[MongoIndex]` parameters:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `key` | `array` | required | Field → direction (1 asc, -1 desc, 'text') |
+| `unique` | `bool` | `false` | Enforce uniqueness |
+| `sparse` | `bool` | `false` | Only index documents where the field exists |
+| `expireAfterSeconds` | `int\|null` | `null` | TTL — MongoDB auto-deletes after N seconds |
+| `name` | `string\|null` | `null` | Explicit index name (auto-named if omitted) |
+
+`MongoReadRepositoryAutowirePass` registers each repository class with `MongoIndexAttributeScanner` at compile time. At runtime, the scanner reflects over the class and reads these attributes — no glob paths, no provider files.
+
+### Applying indexes with `vortos:mongo:sync`
 
 ```bash
-php bin/console vortos:setup:persistence
-
-# Output:
-#   ✔ Indexes ensured (3): users
-#   ✔ Indexes ensured (2): orders
-#   ⊘ No indexes declared: audit_log
+php bin/console vortos:mongo:sync
 ```
 
-Repositories with no entries in `indexes()` are reported but not skipped — they are valid. If a repository has `indexes()` returning an empty array, it will show the `⊘` message.
+```bash
+# Preview without writing to MongoDB
+php bin/console vortos:mongo:sync --dry-run
+```
+
+Example output:
+
+```
+Vortos MongoDB Index Sync
+
+  users
+    ✔ email (unique)
+    ✔ createdAt DESC, _id DESC
+    ✔ deletedAt (sparse)
+
+✔ 3 index(es) ensured across 1 collection(s).
+```
+
+### Deploy pipeline
+
+```bash
+# 1. Apply SQL schema changes (transactional, versioned)
+php bin/console vortos:migrate --force
+
+# 2. Apply MongoDB desired index state (idempotent, no tracking)
+php bin/console vortos:mongo:sync
+```
 
 ## Store `_id` as String UUID
 
@@ -110,24 +167,19 @@ $this->collection()->insertOne([
 
 // WRONG — ObjectId is incompatible with UuidV7 identity
 $this->collection()->insertOne([
-    '_id'   => new \MongoDB\BSON\ObjectId(),  // don't do this
+    '_id'   => new \MongoDB\BSON\ObjectId(),
     'email' => $event->email,
 ]);
 ```
-
-Mixing `ObjectId` and string UUIDs causes silent type mismatch bugs when querying by ID. The write side stores UuidV7 as a string — the read side must match.
 
 ## Bulk Operations
 
 ### `bulkUpsert(array $documents): void`
 
-Single bulk write for multiple documents:
-
 ```php
 $userReadRepository->bulkUpsert([
     ['_id' => 'user-1', 'email' => 'alice@example.com', 'status' => 'active'],
     ['_id' => 'user-2', 'email' => 'bob@example.com', 'status' => 'active'],
-    ['_id' => 'user-3', 'email' => 'carol@example.com', 'status' => 'inactive'],
 ]);
 ```
 
@@ -136,7 +188,7 @@ Uses `replaceOne` with `upsert: true` for each document. All documents must have
 ### `bulkDelete(array $ids): void`
 
 ```php
-$userReadRepository->bulkDelete(['user-1', 'user-2', 'user-3']);
+$userReadRepository->bulkDelete(['user-1', 'user-2']);
 ```
 
 Single `deleteMany` with `$in` filter.
@@ -156,37 +208,14 @@ public function getStatsByRole(): array
         ])
     );
 }
-
-// Geospatial query (requires 2dsphere index)
-public function findNearby(float $lat, float $lng, int $radiusMetres): array
-{
-    $cursor = $this->collection()->find([
-        'location' => [
-            '$near' => [
-                '$geometry' => ['type' => 'Point', 'coordinates' => [$lng, $lat]],
-                '$maxDistance' => $radiusMetres,
-            ],
-        ],
-    ]);
-
-    return array_map(fn($doc) => $this->fromDocument((array) $doc), iterator_to_array($cursor));
-}
 ```
 
 ## Multiple Databases
 
-If you need read repositories in different MongoDB databases, register multiple `Client` instances manually in `config/services.php`:
-
-```php
+```php title="config/services.php"
 use MongoDB\Client;
+use Vortos\PersistenceMongo\Connection\MongoClientFactory;
 
-// Primary read client (default)
-$services->set(Client::class)
-    ->factory([MongoClientFactory::class, 'fromDsn'])
-    ->arg('$dsn', '%vortos.persistence.read_dsn%')
-    ->public();
-
-// Analytics client (different database server)
 $services->set('mongodb.analytics_client', Client::class)
     ->factory([MongoClientFactory::class, 'fromDsn'])
     ->arg('$dsn', $_ENV['ANALYTICS_MONGODB_URL'])
@@ -194,6 +223,7 @@ $services->set('mongodb.analytics_client', Client::class)
 
 $services->set(AnalyticsReadRepository::class)
     ->arg('$client', service('mongodb.analytics_client'))
-    ->arg('$databaseName', $_ENV['ANALYTICS_DB_NAME'])
-    ->public();
+    ->arg('$databaseName', $_ENV['ANALYTICS_DB_NAME']);
+
+$services->set(UserReadRepository::class); // auto-wired to the default client
 ```

@@ -17,8 +17,10 @@ Lifecycle hooks let you intercept specific moments in the event processing pipel
 | `#[BeforeDispatch]` | Before `EventBus` routes the event | Producer (backend) |
 | `#[AfterDispatch]` | After `EventBus` completes (or fails) | Producer (backend) |
 | `#[PreSend]` | Before the event is produced to Kafka | Producer (backend) |
-| `#[BeforeConsume]` | Before the handler runs | Consumer (worker) |
-| `#[AfterConsume]` | After the handler runs (or fails) | Consumer (worker) |
+| `#[BeforeConsume]` | Before any handler runs for a message | Consumer (worker) |
+| `#[AfterConsume]` | After all handlers complete for a message | Consumer (worker) |
+| `#[BeforeHandler]` | Immediately before each individual handler | Consumer (worker) |
+| `#[AfterHandler]` | Immediately after each individual handler resolves | Consumer (worker) |
 
 ## How Discovery Works
 
@@ -32,10 +34,10 @@ All discovery and wiring happens at compile time. At runtime, `HookRunner` just 
 
 ## Writing a Hook
 
-A hook is a class with one or more hook attributes and an `__invoke` method:
+A hook is a class with one or more hook attributes and an `__invoke` method. All hooks receive an `EventEnvelope` — the wrapper that carries both the POPO payload and the framework metadata:
 
 ```php
-use Vortos\Messaging\Contract\DomainEventInterface;
+use Vortos\Domain\Event\EventEnvelope;
 use Vortos\Messaging\Hook\Attribute\BeforeDispatch;
 use Psr\Log\LoggerInterface;
 
@@ -46,10 +48,11 @@ final class AuditDispatchHook
         private LoggerInterface $logger
     ) {}
 
-    public function __invoke(DomainEventInterface $event): void
+    public function __invoke(EventEnvelope $envelope): void
     {
         $this->logger->info('Event dispatching', [
-            'event' => get_class($event),
+            'type'        => $envelope->payloadType,
+            'aggregateId' => $envelope->aggregateId,
         ]);
     }
 }
@@ -61,16 +64,18 @@ No registration needed. Vortos discovers it automatically.
 
 Each hook type receives different arguments:
 
-<Tabs items={['BeforeDispatch', 'AfterDispatch', 'PreSend', 'BeforeConsume', 'AfterConsume']}>
+<Tabs items={['BeforeDispatch', 'AfterDispatch', 'PreSend', 'BeforeConsume', 'AfterConsume', 'BeforeHandler', 'AfterHandler']}>
 
 <Tab value="BeforeDispatch">
 ```php
 #[BeforeDispatch]
 final class MyHook
 {
-    public function __invoke(DomainEventInterface $event): void
+    public function __invoke(EventEnvelope $envelope): void
     {
         // fires before EventBus routes the event
+        // $envelope->payload is your POPO
+        // $envelope->aggregateId, ->occurredAt, ->metadata available
     }
 }
 ```
@@ -81,7 +86,7 @@ final class MyHook
 #[AfterDispatch]
 final class MyHook
 {
-    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    public function __invoke(EventEnvelope $envelope, ?\Throwable $throwable): void
     {
         // $throwable is null on success, contains exception on failure
         if ($throwable !== null) {
@@ -97,11 +102,12 @@ final class MyHook
 #[PreSend]
 final class MyHook
 {
-    public function __invoke(DomainEventInterface $event, array &$headers): void
+    public function __invoke(EventEnvelope $envelope, array &$headers): void
     {
         // fires just before producing to Kafka
-        // $headers is passed by reference — you can add/modify headers
-        $headers['x-tenant-id'] = TenantContext::current();
+        // $headers is passed by reference — you can add/modify Kafka message headers
+        $headers['x-schema-version'] = (string) $envelope->schemaVersion;
+        $headers['x-tenant-id']      = $envelope->metadata->tenantId ?? '';
     }
 }
 ```
@@ -112,7 +118,7 @@ final class MyHook
 #[BeforeConsume]
 final class MyHook
 {
-    public function __invoke(DomainEventInterface $event): void
+    public function __invoke(EventEnvelope $envelope): void
     {
         // fires in the worker, before the handler runs
     }
@@ -125,13 +131,97 @@ final class MyHook
 #[AfterConsume]
 final class MyHook
 {
-    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    public function __invoke(EventEnvelope $envelope, ?\Throwable $throwable): void
     {
-        // fires after the handler completes or fails
+        // fires after all handlers complete for a message
         // $throwable is null on success
     }
 }
 ```
+</Tab>
+
+<Tab value="BeforeHandler">
+```php
+#[BeforeHandler]
+final class MyHook
+{
+    public function __invoke(EventEnvelope $envelope, string $consumerName, string $handlerId): void
+    {
+        // fires once per handler, immediately before it runs
+        // fires even for handlers that will be skipped (idempotency, replay limit)
+        // guaranteed to have a matching AfterHandler call
+    }
+}
+```
+</Tab>
+
+<Tab value="AfterHandler">
+```php
+use Vortos\Messaging\Hook\HandlerOutcome;
+
+#[AfterHandler]
+final class MyHook
+{
+    public function __invoke(
+        EventEnvelope  $envelope,
+        string         $consumerName,
+        string         $handlerId,
+        HandlerOutcome $outcome,
+        int            $attempts,
+        float          $latencyMs,
+        ?\Throwable    $throwable = null,
+    ): void {
+        // fires after each individual handler resolves
+        // default: fires for all terminal outcomes except AttemptFailed
+    }
+}
+```
+
+`HandlerOutcome` values:
+
+| Case | Meaning |
+|---|---|
+| `Succeeded` | Handler ran and committed on the first attempt |
+| `SucceededAfterRetries` | Handler eventually succeeded after one or more retries |
+| `SkippedIdempotent` | Duplicate message — idempotency key already set, handler skipped |
+| `DiscardedReplayLimit` | Replay limit exceeded — message discarded without running handler |
+| `DeadLettered` | All retries exhausted — message written to dead letter store |
+| `AttemptFailed` | Intermediate retry failure — opt-in only, not fired by default |
+
+Filter by outcome using `on:`:
+
+```php
+use Vortos\Messaging\Hook\HandlerOutcome;
+
+// only fires when a handler is dead-lettered or replay-discarded
+#[AfterHandler(on: HandlerOutcome::TERMINAL_FAILURE)]
+final class AlertOnFailureHook
+{
+    public function __invoke(
+        EventEnvelope $envelope,
+        string $consumerName,
+        string $handlerId,
+        HandlerOutcome $outcome,
+        int $attempts,
+        float $latencyMs,
+        ?\Throwable $throwable = null,
+    ): void {
+        // page your on-call team
+    }
+}
+
+// opt in to intermediate retry attempts
+#[AfterHandler(on: [HandlerOutcome::AttemptFailed])]
+final class RetryMetricsHook { ... }
+```
+
+Built-in outcome groups:
+
+| Constant | Includes |
+|---|---|
+| `HandlerOutcome::TERMINAL_SUCCESS` | `Succeeded`, `SucceededAfterRetries` |
+| `HandlerOutcome::TERMINAL_FAILURE` | `DeadLettered`, `DiscardedReplayLimit` |
+| `HandlerOutcome::TERMINAL` | All of the above + `SkippedIdempotent` (everything except `AttemptFailed`) |
 </Tab>
 
 </Tabs>
@@ -141,25 +231,25 @@ final class MyHook
 Hooks fire for all events by default. You can narrow scope using `event` and `consumer` filters:
 
 ```php
-// only fires for UserRegisteredEvent
-#[BeforeDispatch(event: UserRegisteredEvent::class)]
+// only fires for UserRegistered events
+#[BeforeDispatch(event: UserRegistered::class)]
 final class UserRegistrationAuditHook
 {
-    public function __invoke(DomainEventInterface $event): void {}
+    public function __invoke(EventEnvelope $envelope): void {}
 }
 
 // only fires for handlers in the 'orders' consumer
 #[BeforeConsume(consumer: 'orders')]
 final class OrderConsumerHook
 {
-    public function __invoke(DomainEventInterface $event): void {}
+    public function __invoke(EventEnvelope $envelope): void {}
 }
 
 // only fires on failure
 #[AfterConsume(onFailureOnly: true)]
 final class FailureAlertHook
 {
-    public function __invoke(DomainEventInterface $event, ?\Throwable $throwable): void
+    public function __invoke(EventEnvelope $envelope, ?\Throwable $throwable): void
     {
         // alert your on-call team
     }
@@ -196,23 +286,26 @@ This prevents a broken hook from blocking event dispatch or handler execution.
 ## Execution Order in the Full Pipeline
 
 ```
-EventBus::dispatch(event)
+EventBus::dispatch(envelope)
     │
     ├── [BeforeDispatch hooks]
     │
     ├── Route to producer
-    │       └── [PreSend hooks]  ← modify headers here
+    │       └── [PreSend hooks]  ← modify Kafka headers here
     │               └── produce to Kafka / write to outbox
     │
     └── [AfterDispatch hooks]
 
 Worker ConsumerRunner
     │
-    ├── Deserialize event
+    ├── Deserialize → build EventEnvelope
     │
     ├── [BeforeConsume hooks]
     │
-    ├── MiddlewareStack → Handler::__invoke()
+    ├── For each handler:
+    │       ├── [BeforeHandler hooks]
+    │       ├── MiddlewareStack → Handler::__invoke()
+    │       └── [AfterHandler hooks]  ← outcome, attempts, latencyMs
     │
     └── [AfterConsume hooks]
 ```

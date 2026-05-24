@@ -1,0 +1,495 @@
+---
+title: Domain Generators
+description: Scaffold bounded contexts, aggregate roots, child entities, value objects, domain events, and domain errors with the correct structure and imports from the start.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Domain Generators
+
+These commands generate the building blocks of your domain layer — the pure, infrastructure-free core of each bounded context.
+
+---
+
+## `vortos:make:context`
+
+Scaffolds a complete, empty bounded context directory tree. Run this once when starting a new bounded context before running any other `make:*` commands.
+
+```bash
+php bin/console vortos:make:context <name>
+```
+
+**Argument**
+
+| | |
+|---|---|
+| `name` | Bounded context name. PascalCase. Used as the top-level directory under `src/`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:context Order
+```
+
+**Creates**
+
+```
+src/Order/
+├── Domain/
+│   └── Shared/
+│       └── ValueObjects/       ← value objects shared across aggregates
+├── Application/
+│   ├── Command/
+│   ├── EventHandler/
+│   ├── Policy/
+│   ├── Projection/
+│   ├── Query/
+│   └── ReadModel/
+├── Infrastructure/
+│   ├── Messaging/
+│   ├── Persistence/
+│   │   └── Mongo/
+│   ├── Quota/
+│   └── Repository/
+└── Representation/
+    ├── Controller/
+    └── Request/
+```
+
+Aggregate sub-folders (`Domain/Order/`, `Domain/Buyer/`, etc.) are created on demand by `make:aggregate`. No files are generated — just directories.
+
+<Callout type="info" title="Multiple aggregates per context">
+A bounded context can contain multiple aggregate roots. Each aggregate gets its own sub-folder under `Domain/`. For example, an `Order` context might have both a `Domain/Order/` and a `Domain/Buyer/` aggregate boundary.
+</Callout>
+
+---
+
+## `vortos:make:aggregate`
+
+Generates an aggregate root, its typed ID class, and the repository interface. These three files always travel together and are placed inside the aggregate's own boundary folder.
+
+```bash
+php bin/console vortos:make:aggregate <name> [--context=<context>] [--no-orm]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Aggregate root class name. PascalCase. E.g., `User`, `Order`. |
+| `--context` / `-c` | Bounded context folder name. Defaults to `name` if omitted. |
+| `--no-orm` | Generate without Doctrine annotations even if `vortos/persistence-orm` is installed. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:aggregate TrainingSession --context=Training
+```
+
+**Creates**
+
+```
+src/Training/
+└── Domain/
+    └── TrainingSession/
+        ├── TrainingSession.php
+        ├── TrainingSessionId.php
+        └── Repository/
+            └── TrainingSessionRepositoryInterface.php
+```
+
+<Tabs items={['Plain', 'ORM']}>
+<Tab value="Plain">
+```php
+// TrainingSession.php
+namespace App\Training\Domain\TrainingSession;
+
+use Vortos\Domain\Aggregate\AggregateRoot;
+
+final class TrainingSession extends AggregateRoot
+{
+    private function __construct(private TrainingSessionId $id) {}
+
+    public static function create(TrainingSessionId $id): self
+    {
+        return new self($id);
+    }
+
+    public static function reconstruct(TrainingSessionId $id, int $version): self
+    {
+        $self = new self($id);
+        $self->restoreVersion($version);
+        return $self;
+    }
+
+    public function getId(): TrainingSessionId
+    {
+        return $this->id;
+    }
+}
+```
+</Tab>
+<Tab value="ORM">
+```php
+// TrainingSession.php (with vortos/persistence-orm installed)
+namespace App\Training\Domain\TrainingSession;
+
+use Doctrine\ORM\Mapping as ORM;
+use Vortos\PersistenceOrm\Aggregate\AggregateRoot;
+
+#[ORM\Entity]
+#[ORM\Table(name: 'training_sessions')]
+final class TrainingSession extends AggregateRoot
+{
+    #[ORM\Id]
+    #[ORM\Column(type: 'string', length: 36)]
+    private string $id;
+
+    private function __construct(TrainingSessionId $id)
+    {
+        $this->id = (string) $id;
+    }
+
+    public static function create(TrainingSessionId $id): self
+    {
+        $self = new self($id);
+        $self->incrementVersion();
+        return $self;
+    }
+
+    public function getId(): TrainingSessionId
+    {
+        return TrainingSessionId::fromString($this->id);
+    }
+}
+```
+</Tab>
+</Tabs>
+
+When `vortos/persistence-orm` is installed, the generator prints an ORM mode notice and suggests `--no-orm` if you want the plain variant for this specific aggregate.
+
+Next step after generating an aggregate:
+
+```bash
+php bin/console vortos:make:write-repository TrainingSession --context=Training
+```
+
+---
+
+## `vortos:make:entity`
+
+Generates a plain domain entity and its typed ID — for non-root entities that live *inside* an aggregate. Child entities have no repository and are always accessed and persisted through their aggregate root.
+
+```bash
+php bin/console vortos:make:entity <name> --context=<context> --aggregate=<aggregate> [--no-orm]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Entity class name. PascalCase. E.g., `ExerciseSet`, `OrderLine`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--aggregate` / `-a` | Aggregate root this entity belongs to. Required. |
+| `--no-orm` | Generate without Doctrine annotations even if `vortos/persistence-orm` is installed. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:entity ExerciseSet --context=Training --aggregate=TrainingSession
+```
+
+**Creates**
+
+```
+src/Training/
+└── Domain/
+    └── TrainingSession/
+        └── Entities/
+            ├── ExerciseSet.php
+            └── ExerciseSetId.php
+```
+
+No repository interface is generated — child entities are persisted through the aggregate root's repository.
+
+<Tabs items={['Plain', 'ORM']}>
+<Tab value="Plain">
+```php
+// ExerciseSet.php
+namespace App\Training\Domain\TrainingSession\Entities;
+
+final class ExerciseSet
+{
+    public function __construct(
+        private readonly ExerciseSetId $id,
+    ) {}
+
+    public function getId(): ExerciseSetId
+    {
+        return $this->id;
+    }
+}
+```
+</Tab>
+<Tab value="ORM">
+```php
+// ExerciseSet.php (with vortos/persistence-orm installed)
+namespace App\Training\Domain\TrainingSession\Entities;
+
+use Doctrine\ORM\Mapping as ORM;
+
+#[ORM\Entity]
+final class ExerciseSet
+{
+    #[ORM\Id]
+    #[ORM\Column(type: 'string', length: 36)]
+    private string $id;
+
+    // Add the back-reference to your aggregate root:
+    // #[ORM\ManyToOne(targetEntity: TrainingSession::class, inversedBy: 'sets')]
+    // private TrainingSession $session;
+
+    public function __construct(ExerciseSetId $id)
+    {
+        $this->id = (string) $id;
+    }
+
+    public function getId(): ExerciseSetId
+    {
+        return ExerciseSetId::fromString($this->id);
+    }
+}
+```
+</Tab>
+</Tabs>
+
+**ORM wiring — one annotation on the aggregate root**
+
+After generating an ORM child entity, add a single mapping annotation on the aggregate root side:
+
+```php
+// TrainingSession.php (aggregate root) — add this property
+#[ORM\OneToMany(
+    targetEntity: ExerciseSet::class,
+    mappedBy: 'session',
+    cascade: ['persist', 'remove'],
+    orphanRemoval: true,
+)]
+private Collection $sets;
+```
+
+With `cascade: ['persist', 'remove']` and `orphanRemoval: true`, calling `$repository->save($session)` persists all exercise sets automatically. You never call persist on a child entity directly.
+
+<Callout type="info" title="Aggregate root vs child entity">
+Use `make:aggregate` for the primary entity of an aggregate — the one that has a repository, is loaded by ID, and is the transaction boundary. Use `make:entity` for subordinate entities within an aggregate that have no independent lifecycle.
+</Callout>
+
+---
+
+## `vortos:make:value-object`
+
+Generates an immutable value object with `fromString`, `equals`, and `__toString`.
+
+```bash
+php bin/console vortos:make:value-object <name> --context=<context> (--aggregate=<aggregate> | --shared) [--embeddable]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Value object class name. PascalCase. E.g., `Email`, `Duration`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--aggregate` / `-a` | Aggregate this value object belongs to. Use when only one aggregate needs it. |
+| `--shared` | Generate into `Domain/Shared/ValueObjects/`. Use when multiple aggregates share it. |
+| `--embeddable` | Generate as a Doctrine embeddable. Requires `vortos/persistence-orm`. |
+
+Exactly one of `--aggregate` or `--shared` is required. Providing neither (or both) is an error with an explanation.
+
+<Tabs items={['Aggregate-specific', 'Shared', 'Embeddable (ORM)']}>
+<Tab value="Aggregate-specific">
+```bash
+# Duration is only used inside TrainingSession
+php bin/console vortos:make:value-object Duration --context=Training --aggregate=TrainingSession
+```
+
+**Creates:** `src/Training/Domain/TrainingSession/ValueObjects/Duration.php`
+
+```php
+namespace App\Training\Domain\TrainingSession\ValueObjects;
+
+use Vortos\Domain\ValueObject\ValueObject;
+
+final readonly class Duration extends ValueObject
+{
+    private function __construct(private string $value) {}
+
+    public static function fromString(string $value): self
+    {
+        return new self($value);
+    }
+
+    public function equals(ValueObject $other): bool
+    {
+        return $other instanceof self && $this->value === $other->value;
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
+    }
+}
+```
+</Tab>
+<Tab value="Shared">
+```bash
+# Email is used by both Athlete and TrainingSession
+php bin/console vortos:make:value-object Email --context=Training --shared
+```
+
+**Creates:** `src/Training/Domain/Shared/ValueObjects/Email.php`
+
+```php
+namespace App\Training\Domain\Shared\ValueObjects;
+
+use Vortos\Domain\ValueObject\ValueObject;
+
+final readonly class Email extends ValueObject { ... }
+```
+</Tab>
+<Tab value="Embeddable (ORM)">
+```bash
+php bin/console vortos:make:value-object Address --context=User --aggregate=User --embeddable
+```
+
+**Creates:** `src/User/Domain/User/ValueObjects/Address.php`
+
+```php
+namespace App\User\Domain\User\ValueObjects;
+
+use Doctrine\ORM\Mapping as ORM;
+use Vortos\Domain\ValueObject\ValueObject;
+
+#[ORM\Embeddable]
+final class Address extends ValueObject { ... }
+```
+
+After generating, add `#[ORM\Embedded]` on the aggregate root property:
+
+```php
+#[ORM\Embedded(class: Address::class)]
+private Address $address;
+```
+</Tab>
+</Tabs>
+
+Add your validation logic to `fromString`. Throw a domain error (generated with `make:domain-error`) when invariants are violated.
+
+---
+
+## `vortos:make:domain-event`
+
+Generates a domain event — an immutable record of something that happened in the domain.
+
+```bash
+php bin/console vortos:make:domain-event <name> --context=<context> --aggregate=<aggregate>
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Event name **without** the `Event` suffix. PascalCase. E.g., `UserRegistered`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--aggregate` / `-a` | Aggregate root that emits this event. Required. |
+
+The `Event` suffix is appended automatically — pass `UserRegistered`, get `UserRegisteredEvent`.
+
+**Example**
+
+```bash
+php bin/console vortos:make:domain-event SessionStarted --context=Training --aggregate=TrainingSession
+```
+
+**Creates**
+
+```
+src/Training/Domain/TrainingSession/Event/SessionStartedEvent.php
+```
+
+**Generated class**
+
+```php
+namespace App\Training\Domain\TrainingSession\Event;
+
+final readonly class SessionStartedEvent
+{
+    public function __construct(
+        // public string $property,
+    ) {}
+}
+```
+
+Add your event properties as public readonly constructor-promoted parameters. No base class, no `aggregateId` — those live on `EventEnvelope`, which the framework injects automatically.
+
+---
+
+## `vortos:make:domain-error`
+
+Generates a structured domain error with a stable error code, typed context, and automatic HTTP status mapping.
+
+```bash
+php bin/console vortos:make:domain-error <name> --context=<context> --aggregate=<aggregate> [--status=<http-status>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Error name **without** the `Error` suffix. PascalCase. E.g., `UserNotFound`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--aggregate` / `-a` | Aggregate root this error belongs to. Required. |
+| `--status` / `-s` | HTTP status code the error maps to. Defaults to `422`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:domain-error SessionNotFound --context=Training --aggregate=TrainingSession --status=404
+```
+
+**Creates**
+
+```
+src/Training/Domain/TrainingSession/Error/SessionNotFoundError.php
+```
+
+**Generated class**
+
+```php
+namespace App\Training\Domain\TrainingSession\Error;
+
+use Vortos\Domain\Error\DomainError;
+use Vortos\Domain\Error\HttpStatus;
+
+#[HttpStatus(404)]
+final class SessionNotFoundError extends DomainError
+{
+    public static function because(string $reason): self
+    {
+        return new self($reason);
+    }
+}
+```
+
+**After generating**, replace the generic `because()` constructor with one that carries structured context:
+
+```php
+public static function forId(string $id): self
+{
+    return new self(
+        "Session '{$id}' was not found.",
+        context: ['sessionId' => $id],
+    );
+}
+```

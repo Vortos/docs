@@ -18,29 +18,28 @@ use Vortos\Domain\Identity\AggregateId;
 final class User extends AggregateRoot
 {
     private function __construct(
-        private UserId $id,
-        private Email $email,
+        private readonly UserId $id,
+        private readonly Email $email,
         private string $name,
         private string $passwordHash,
-        private string $status,
     ) {}
 
     // Named constructor for new aggregates
-    public static function register(Email $email, string $name, string $passwordHash): self
+    public static function register(string $name, string $email, string $plainPassword): self
     {
+        $id   = UserId::generate();
         $user = new self(
-            id: UserId::generate(),
-            email: $email,
-            name: $name,
-            passwordHash: $passwordHash,
-            status: 'active',
+            id:           $id,
+            email:        new Email($email),
+            name:         $name,
+            passwordHash: password_hash($plainPassword, PASSWORD_BCRYPT),
         );
 
         // Record event — dispatched by CommandBus after commit
         $user->recordEvent(new UserRegisteredEvent(
-            aggregateId: (string) $user->id,
-            email: (string) $email,
-            name: $name,
+            aggregateId: (string) $id,
+            email:       $email,
+            name:        $name,
         ));
 
         return $user;
@@ -52,13 +51,15 @@ final class User extends AggregateRoot
         Email $email,
         string $name,
         string $passwordHash,
-        string $status,
         int $version,
     ): self {
-        $user = new self($id, $email, $name, $passwordHash, $status);
-        for ($i = 0; $i < $version; $i++) {
-            $user->incrementVersion();
-        }
+        $user = new self(
+            id:           $id,
+            email:        $email,
+            name:         $name,
+            passwordHash: $passwordHash,
+        );
+        $user->restoreVersion($version);
         return $user;
     }
 
@@ -73,16 +74,6 @@ final class User extends AggregateRoot
         $old = $this->name;
         $this->name = $name;
         $this->recordEvent(new UserNameUpdatedEvent((string) $this->id, $old, $name));
-    }
-
-    public function deactivate(): void
-    {
-        if ($this->status === 'inactive') {
-            return; // idempotent
-        }
-
-        $this->status = 'inactive';
-        $this->recordEvent(new UserDeactivatedEvent((string) $this->id));
     }
 }
 ```
@@ -104,7 +95,8 @@ public function hasDomainEvents(): bool;
 
 // Optimistic locking
 public function getVersion(): int;
-public function incrementVersion(): void; // @internal — called by repository
+protected function restoreVersion(int $version): void; // @internal — call from reconstruct() only
+public function incrementVersion(): void;              // @internal — called by repository after save
 ```
 
 ## Domain Event Recording
@@ -145,7 +137,7 @@ save()            version = 3   (UPDATE WHERE version = 2)
 
 If two processes load version 2 and both try to save, the second save fails because the database version is already 3. See [Optimistic Locking](/docs/persistence/optimistic-locking) for handling strategies.
 
-**Never call `incrementVersion()` directly.** It is called by the repository after a successful save.
+**Never call `incrementVersion()` or `restoreVersion()` directly from outside the aggregate.** `incrementVersion()` is called by the repository after a successful save; `restoreVersion()` is called only inside `reconstruct()` factories.
 
 ## The reconstruct() Pattern
 
@@ -156,17 +148,16 @@ If two processes load version 2 and both try to save, the second save fails beca
 protected function fromRow(array $row): AggregateRoot
 {
     return User::reconstruct(
-        id: UserId::fromString($row['id']),
-        email: new Email($row['email']),
-        name: $row['name'],
+        id:           UserId::fromString($row['id']),
+        email:        new Email($row['email']),
+        name:         $row['name'],
         passwordHash: $row['password_hash'],
-        status: $row['status'],
-        version: (int) $row['version'],
+        version:      (int) $row['version'],
     );
 }
 ```
 
-The version is restored so optimistic locking works correctly on the next `save()`.
+Inside `reconstruct()`, call `$this->restoreVersion($version)` — this directly assigns the stored version number so optimistic locking works correctly on the next `save()`. Never use an `incrementVersion()` loop for this; `restoreVersion()` is the correct API.
 
 ## EventSourcedAggregateRoot
 

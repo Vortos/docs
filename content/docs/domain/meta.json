@@ -8,6 +8,7 @@
     "commands",
     "queries",
     "value-objects",
-    "collections"
+    "collections",
+    "errors"
   ]
 }

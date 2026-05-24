@@ -1,0 +1,375 @@
+---
+title: Messaging Generators
+description: Generate Kafka event handlers, messaging config classes, middleware, and lifecycle hooks.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Messaging Generators
+
+These commands generate the infrastructure wiring for your Kafka integration — event handlers, transports, middleware, and hooks. Every generated file uses the correct attributes and is auto-discovered by the framework.
+
+---
+
+## `vortos:make:consumer`
+
+Generates a Kafka event handler — a class that reacts to a domain event arriving from a Kafka topic.
+
+```bash
+php bin/console vortos:make:consumer <name> \
+    --context=<context> \
+    --consumer=<consumer-name> \
+    --event=<EventClass> \
+    [--handler-id=<id>] \
+    [--idempotent]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Handler name **without** the `Handler` suffix. E.g., `SendWelcomeEmail`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--consumer` | Kafka consumer name. Must match a registered `#[RegisterConsumer]`. Required. |
+| `--event` / `-e` | Event class — short name or full FQCN. Short names are resolved by scanning `src/`. Required. |
+| `--handler-id` | Unique handler ID. Defaults to dot.case of name (e.g., `send.welcome.email`). |
+| `--idempotent` | Flag. Marks handler `idempotent: true` — skips deduplication. Omit for the default safe behaviour. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:consumer SendWelcomeEmail \
+    --context=User \
+    --consumer=user.events \
+    --event=UserRegisteredEvent
+```
+
+**Creates**
+
+```
+src/User/Application/EventHandler/SendWelcomeEmailHandler.php
+```
+
+**Generated class**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Application\EventHandler;
+
+use App\User\Domain\Event\UserRegisteredEvent;
+use Vortos\Messaging\Attribute\AsEventHandler;
+
+#[AsEventHandler(
+    handlerId: 'send.welcome.email',
+    consumer: 'user.events',
+    idempotent: false,
+)]
+final class SendWelcomeEmailHandler
+{
+    public function __construct(
+        // inject dependencies here
+    ) {}
+
+    public function __invoke(UserRegisteredEvent $event): void
+    {
+        // implement handler logic here
+    }
+}
+```
+
+The `handlerId` is stable — never change it after deployment. It is used as the idempotency cache key. Changing it means the deduplication window resets and previously-processed messages may re-run.
+
+---
+
+## `vortos:make:messaging-config`
+
+Generates a `MessagingConfig` class that wires a transport, producer, and consumer together. This is the first thing to generate when adding Kafka integration to a new bounded context.
+
+```bash
+php bin/console vortos:make:messaging-config \
+    --context=<context> \
+    --transport=<transport-name> \
+    [--topic=<topic-name>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--transport` | Transport name. Becomes the Kafka topic name unless `--topic` overrides it. Required. |
+| `--topic` | Kafka topic name. Defaults to the value of `--transport`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:messaging-config \
+    --context=User \
+    --transport=user.events
+```
+
+**Creates**
+
+```
+src/User/Infrastructure/UserMessagingConfig.php
+```
+
+**Generated class**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Infrastructure;
+
+use Vortos\Messaging\Attribute\MessagingConfig;
+use Vortos\Messaging\Attribute\RegisterConsumer;
+use Vortos\Messaging\Attribute\RegisterProducer;
+use Vortos\Messaging\Attribute\RegisterTransport;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaConsumerDefinition;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaProducerDefinition;
+use Vortos\Messaging\Driver\Kafka\Definition\KafkaTransportDefinition;
+use Vortos\Messaging\Retry\RetryPolicy;
+
+#[MessagingConfig]
+final class UserMessagingConfig
+{
+    #[RegisterTransport]
+    public function transport(): KafkaTransportDefinition
+    {
+        return KafkaTransportDefinition::create('user.events')
+            ->dsn($_ENV['KAFKA_DSN'] ?? 'kafka://kafka:9092')
+            ->topic('user.events')
+            ->partitions(3)
+            ->replicationFactor(1);
+    }
+
+    #[RegisterProducer]
+    public function producer(): KafkaProducerDefinition
+    {
+        return KafkaProducerDefinition::create('user.events')
+            ->transport('user.events')
+            ->outbox(true)
+            ->linger(5);
+    }
+
+    #[RegisterConsumer]
+    public function consumer(): KafkaConsumerDefinition
+    {
+        return KafkaConsumerDefinition::create('user.events')
+            ->groupId('user-service')
+            ->parallelism(1)
+            ->batchSize(1)
+            ->retry(RetryPolicy::exponential(attempts: 3, initialDelayMs: 500))
+            ->dlq('user.events.dlq')
+            ->offsetReset('earliest');
+    }
+}
+```
+
+Edit the transport DSN, partitions, group ID, and retry policy to match your deployment. The generated defaults are production-sensible starting points.
+
+---
+
+## `vortos:make:middleware`
+
+Generates a Kafka consumer middleware — a cross-cutting concern that wraps every handler invocation within a consumer pipeline.
+
+```bash
+php bin/console vortos:make:middleware <name> \
+    --context=<context> \
+    [--priority=<int>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Middleware name **without** the `Middleware` suffix. E.g., `TenantContext`, `AuditLog`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--priority` | Execution priority. Higher numbers run first. Default: `100`. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:middleware TenantContext \
+    --context=User \
+    --priority=200
+```
+
+**Creates**
+
+```
+src/User/Infrastructure/Messaging/TenantContextMiddleware.php
+```
+
+**Generated class**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Infrastructure\Messaging;
+
+use Vortos\Messaging\Attribute\AsMiddleware;
+use Vortos\Messaging\Middleware\MiddlewareInterface;
+use Symfony\Component\Messenger\Envelope;
+
+#[AsMiddleware(priority: 200)]
+final class TenantContextMiddleware implements MiddlewareInterface
+{
+    public function handle(Envelope $envelope, callable $next): Envelope
+    {
+        // run before handler
+        $result = $next($envelope);
+        // run after handler
+        return $result;
+    }
+}
+```
+
+---
+
+## `vortos:make:hook`
+
+Generates a messaging lifecycle hook — a targeted callback that runs at a specific point in the dispatch or consume cycle without wrapping every handler like middleware does.
+
+```bash
+php bin/console vortos:make:hook <name> \
+    --context=<context> \
+    --type=<hook-type>
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Hook name **without** the `Hook` suffix. E.g., `LogDispatch`, `AuditConsume`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--type` / `-t` | Hook lifecycle point. Required. One of: `before-dispatch`, `after-dispatch`, `before-consume`, `after-consume`, `pre-send`. |
+
+**Hook types**
+
+| Type | When it runs | Use for |
+|---|---|---|
+| `before-dispatch` | Before the event is produced to Kafka | Enriching headers, pre-flight validation |
+| `after-dispatch` | After the event is successfully produced | Audit logging, metrics |
+| `pre-send` | Before the message reaches the transport layer | Mutating Kafka headers before wire |
+| `before-consume` | Before any handler runs for a message | Setting request context, tracing |
+| `after-consume` | After all handlers complete for a message | Cleanup, metrics |
+| `before-handler` | Immediately before each individual handler | Per-handler tracing, logging |
+| `after-handler` | Immediately after each individual handler | Per-handler metrics, alerting on failure |
+
+**Examples**
+
+<Tabs items={['before-dispatch', 'after-consume', 'pre-send', 'after-handler']}>
+<Tab value="before-dispatch">
+```bash
+php bin/console vortos:make:hook LogDispatch \
+    --context=User \
+    --type=before-dispatch
+```
+
+```php
+use Vortos\Domain\Event\EventEnvelope;
+use Vortos\Messaging\Hook\Attribute\BeforeDispatch;
+
+#[BeforeDispatch]
+final class LogDispatchHook
+{
+    public function __invoke(EventEnvelope $envelope): void
+    {
+        // runs before the event is produced to Kafka
+    }
+}
+```
+</Tab>
+<Tab value="after-consume">
+```bash
+php bin/console vortos:make:hook AuditConsume \
+    --context=User \
+    --type=after-consume
+```
+
+```php
+use Vortos\Domain\Event\EventEnvelope;
+use Vortos\Messaging\Hook\Attribute\AfterConsume;
+
+#[AfterConsume]
+final class AuditConsumeHook
+{
+    public function __invoke(EventEnvelope $envelope, string $consumerName, ?\Throwable $throwable = null): void
+    {
+        // runs after all handlers complete for the message
+    }
+}
+```
+</Tab>
+<Tab value="pre-send">
+```bash
+php bin/console vortos:make:hook InjectTenant \
+    --context=User \
+    --type=pre-send
+```
+
+```php
+use Vortos\Domain\Event\EventEnvelope;
+use Vortos\Messaging\Hook\Attribute\PreSend;
+
+#[PreSend]
+final class InjectTenantHook
+{
+    public function __invoke(EventEnvelope $envelope, array &$headers): void
+    {
+        // $headers passed by reference — add or modify Kafka message headers
+        $headers['x-tenant-id'] = $envelope->metadata->tenantId ?? '';
+    }
+}
+```
+</Tab>
+<Tab value="after-handler">
+```bash
+php bin/console vortos:make:hook AlertOnFailure \
+    --context=User \
+    --type=after-handler
+```
+
+```php
+use Vortos\Domain\Event\EventEnvelope;
+use Vortos\Messaging\Hook\Attribute\AfterHandler;
+use Vortos\Messaging\Hook\HandlerOutcome;
+
+#[AfterHandler(on: HandlerOutcome::TERMINAL_FAILURE)]
+final class AlertOnFailureHook
+{
+    public function __invoke(
+        EventEnvelope  $envelope,
+        string         $consumerName,
+        string         $handlerId,
+        HandlerOutcome $outcome,
+        int            $attempts,
+        float          $latencyMs,
+        ?\Throwable    $throwable = null,
+    ): void {
+        // fires when a handler is dead-lettered or replay-discarded
+    }
+}
+```
+</Tab>
+</Tabs>
+
+**Creates**
+
+```
+src/User/Infrastructure/Messaging/{Name}Hook.php
+```
+
+<Callout type="info" title="Hook vs Middleware">
+Use a **hook** when you want to react to a specific lifecycle point globally — before every dispatch, after every consume — without wrapping handler execution. Use **middleware** when you need to wrap the handler callable itself, such as for transaction boundaries or tracing spans.
+</Callout>

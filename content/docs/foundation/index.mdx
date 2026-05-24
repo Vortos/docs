@@ -49,7 +49,7 @@ run()
 └── return Response
 ```
 
-On container compile failure, `run()` returns a `503` response rather than crashing — logs the error prominently with full stack trace.
+On container compile failure, `run()` returns a `503` response rather than crashing. The behavior differs by environment — see [Boot Error Survival](#boot-error-survival) below.
 
 ### setParameter() / setParameters()
 
@@ -83,6 +83,52 @@ $runner->cleanUp(); // ArrayAdapter cleared, container kept alive
 
 <Callout type="warn" title="Always call cleanUp()">
 `cleanUp()` must be called after every request. Without it, `ArrayAdapter` data leaks between requests in worker mode — user A's identity could be visible to user B.
+</Callout>
+
+## Boot Error Survival
+
+In FrankenPHP worker mode, `public/index.php` warms the container once before entering the request loop. If that warm-up throws — bad DI config, missing service, syntax error in a config file — the worker must not crash. A crashed worker means FrankenPHP restarts it immediately, it crashes again, and you get an infinite crash loop with a gateway error on every request and no useful output.
+
+`Runner` handles this entirely. The pre-warm call is wrapped in a try/catch in `index.php` that survives the failure:
+
+```php title="public/index.php (worker mode)"
+try {
+    $runner->getContainer();
+} catch (\Throwable $e) {
+    // Logged by run() on each request. Nothing else to do here.
+}
+
+while (frankenphp_handle_request(function () use ($runner): void {
+    $response = $runner->run();
+    $response->send();
+    $runner->cleanUp();
+})) {}
+```
+
+The worker stays alive. When requests arrive, `run()` takes over:
+
+**In `prod` (`APP_DEBUG=false`):**
+- The boot error is cached in `$runner->bootError` after the first failure.
+- Every subsequent request returns a plain-text `503` immediately — no recompilation attempted.
+- The full error with stack trace is written to `error_log` once, visible in `docker logs`.
+- The worker stays alive and serving 503s until a fix is deployed and the container restarts.
+
+**In `dev` (`APP_DEBUG=true`):**
+- `run()` retries `getContainer()` on every request — no error caching.
+- The 503 response includes the full exception message and stack trace rendered in the browser.
+- Fix the code, refresh the browser — if compilation succeeds, `$bootError` resets to `null` and the worker resumes normally. **No restart needed.**
+
+```
+Boot fails (any environment)
+    └── Worker survives
+    └── run() called per request
+            ├── prod: $bootError cached → 503 plain text, no recompile
+            └── dev:  retry getContainer() → 503 HTML with error in browser
+                      fix code → retry succeeds → $bootError = null → normal operation
+```
+
+<Callout type="info" title="docker logs still works">
+Even in prod where the browser gets a generic 503, the full error is in `docker logs` on the first failed boot. You never need to guess what broke.
 </Callout>
 
 ## Container Auto-Discovery
@@ -163,24 +209,133 @@ final class MyFeaturePackage implements PackageInterface
 
 ## Container Caching
 
-In `prod` + `http` context, the compiled container is dumped to `var/cache/container_dump.php` as `CachedContainer`. On subsequent requests it is loaded directly — zero compilation overhead:
+In `prod` + `http` context, the compiled container is dumped to `var/cache/` and loaded on subsequent requests — zero compilation overhead.
+
+### Content-Hashed Filenames
+
+The dump filename is `container_<hash>.php`, where `<hash>` is an `xxh3` hash of the modification times and sizes of all `.php`, `.yaml`, and `.yml` files under `config/` and `src/`. The hash changes whenever any config or source file changes:
 
 ```
-First prod request:
-    Container.php → compile → dump to var/cache/container_dump.php
+First prod request (no cache hit):
+    Container.php → compile → dump to var/cache/container_<hash>.php
 
-Subsequent prod requests:
-    require_once var/cache/container_dump.php
+Subsequent prod requests (hash matches):
+    require_once var/cache/container_<hash>.php
     new CachedContainer() → instant, no compile
+
+After any config/source change (new hash):
+    Old container_<oldhash>.php is ignored and cleaned up
+    Container.php → compile → dump to var/cache/container_<newhash>.php
 ```
 
-In `dev`, the container is recompiled on every request — config changes take effect immediately.
+On startup, `Runner` scans `var/cache/` and deletes any `container_*.php` files whose hash does not match the current config. Stale dumps from previous deployments are cleaned automatically.
 
-Clear the cache dump when deploying:
+### Concurrent Compile Protection
+
+When two requests race to compile the container simultaneously, `Runner` uses `flock(LOCK_EX|LOCK_NB)` on a PID-scoped temporary file. The first request wins the lock, compiles, and atomically renames the dump into place. The second request skips the dump (no lock) and serves from the newly written file on the next request.
+
+This prevents a partial container dump from being loaded mid-write under concurrent traffic.
+
+### Clearing the Cache
+
+Because filenames are content-hashed, you do not need to delete a specific file. On the next request after a deployment, the hash changes and the old dump is ignored. The stale file is cleaned on startup.
+
+If you need to force a recompile immediately (e.g. during debugging), delete all container dumps:
 
 ```bash
-rm -f var/cache/container_dump.php
+rm -f var/cache/container_*.php
 ```
+
+In `dev`, the container is recompiled on every request — config changes take effect immediately with no cache to clear.
+
+## #[DefaultImpl]
+
+`#[DefaultImpl]` is a compile-time attribute that tells the container to create an interface alias pointing to the annotated class — without any manual `$services->alias()` calls.
+
+```php
+use Vortos\Foundation\DependencyInjection\Attribute\DefaultImpl;
+
+#[DefaultImpl]
+final class RedisTokenStore implements TokenStoreInterface
+{
+    // ...
+}
+```
+
+`DefaultImplCompilerPass` runs at compile time, reflects the class, finds `TokenStoreInterface` (the single app-namespace interface it implements), and registers:
+
+```php
+// Equivalent to what the compiler pass generates automatically:
+$container->setAlias(TokenStoreInterface::class, RedisTokenStore::class);
+```
+
+The alias is only created if no alias or definition for `TokenStoreInterface` already exists — explicit registrations in `services.php` always take precedence.
+
+### When the Interface Cannot Be Inferred
+
+If the class implements multiple app-namespace interfaces, the pass cannot infer which one to alias. Specify it explicitly:
+
+```php
+#[DefaultImpl(interface: TokenStoreInterface::class)]
+final class RedisTokenStore implements TokenStoreInterface, StoreStatsInterface
+{
+    // ...
+}
+```
+
+### Compile-Time Errors
+
+The pass throws `\LogicException` at container build time in the following cases:
+
+| Situation | Error |
+|---|---|
+| Multiple app-namespace interfaces and no `interface` arg | "Ambiguous: specify `interface` explicitly" |
+| `interface` arg points to a non-existent interface | "Interface does not exist" |
+| `interface` arg names a class, not an interface | "Target is not an interface" |
+
+Errors surface at boot, not at runtime — misconfiguration is caught before any request is served.
+
+### "App Namespace" Detection
+
+The pass reads `composer.json`'s `psr-4` autoload map to determine which namespaces belong to your application. Framework interfaces (e.g. `Vortos\*`, `Symfony\*`) are excluded from inference — only your own interfaces are candidates.
+
+### Inspecting bindings at runtime
+
+Use `debug:bindings` to list all `#[DefaultImpl]` interface → class bindings that the compiler pass resolved:
+
+```bash
+php vortos debug:bindings
+```
+
+```
+ Default Implementation Bindings
+ ================================
+
+ -------------------------------------------------------------------------------
+  Interface                                      Implementation
+ -------------------------------------------------------------------------------
+  App\User\Domain\Repository\UserRepositoryInterface  App\User\Infrastructure\Repository\UserWriteRepository
+  App\Auth\Contract\TokenStoreInterface               App\Auth\Infrastructure\RedisTokenStore
+ -------------------------------------------------------------------------------
+
+ 2 binding(s) registered.
+```
+
+Add `-v` to also show the file path of each implementation:
+
+```bash
+php vortos debug:bindings -v
+```
+
+```
+ -------------------------------------------------------------------------------
+  Interface                  Implementation        File
+ -------------------------------------------------------------------------------
+  ...UserRepositoryInterface  ...UserWriteRepository  /var/www/html/src/User/...
+ -------------------------------------------------------------------------------
+```
+
+Only bindings created by `DefaultImplCompilerPass` are listed. Aliases registered manually in `services.php` are not included — they take precedence over `#[DefaultImpl]` and are visible via `php vortos debug:container`.
 
 ## ConsoleCommandPass
 

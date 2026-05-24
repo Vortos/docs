@@ -71,8 +71,8 @@ final class EncryptionServiceTest extends TestCase
 ## CSRF Token Service
 
 ```php title="packages/Vortos/Tests/Security/CsrfTokenServiceTest.php"
-use Symfony\Component\HttpFoundation\Request;
-use Symfony\Component\HttpFoundation\Response;
+use Vortos\Http\Request;
+use Vortos\Http\Response;
 use Vortos\Security\Csrf\CsrfTokenService;
 
 final class CsrfTokenServiceTest extends TestCase
@@ -139,7 +139,7 @@ final class CsrfTokenServiceTest extends TestCase
 ## IP Resolver
 
 ```php title="packages/Vortos/Tests/Security/IpResolverTest.php"
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 use Vortos\Security\IpFilter\IpResolver;
 
 final class IpResolverTest extends TestCase
@@ -188,7 +188,7 @@ final class IpResolverTest extends TestCase
 ## Signature Verifier
 
 ```php title="packages/Vortos/Tests/Security/SignatureVerifierTest.php"
-use Symfony\Component\HttpFoundation\Request;
+use Vortos\Http\Request;
 use Vortos\Security\Signing\SignatureVerifier;
 
 final class SignatureVerifierTest extends TestCase

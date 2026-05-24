@@ -47,6 +47,7 @@ CREATE TABLE vortos_failed_messages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     transport_name  VARCHAR(255) NOT NULL,
     event_class     VARCHAR(512) NOT NULL,
+    handler_id      VARCHAR(512) NOT NULL,
     payload         TEXT NOT NULL,
     headers         JSONB NOT NULL DEFAULT '{}',
     failure_reason  TEXT NOT NULL,
@@ -67,9 +68,10 @@ Every dead-lettered message stores:
 | `id` | UuidV7 — time-sortable unique identifier |
 | `transport_name` | Kafka transport the message came from |
 | `event_class` | Fully qualified PHP class name of the event |
+| `handler_id` | `handlerId` of the specific handler that failed |
 | `payload` | Original JSON payload as received from Kafka |
 | `headers` | Full message headers (event_id, correlation_id, timestamp) |
-| `failure_reason` | Exception message from the last failed attempt |
+| `failure_reason` | Exception message from the last failed attempt — control characters stripped, max 2000 characters |
 | `exception_class` | Exception class name for filtering |
 | `attempt_count` | Total attempts including retries |
 | `failed_at` | When the message was dead-lettered |
@@ -125,15 +127,23 @@ Dry run complete. No messages replayed.
 php bin/console vortos:dlq:replay
 ```
 
+The command prompts for confirmation before writing to Kafka:
+
 ```
 Found 3 failed message(s).
 
-  ✔ Replayed: 019d4784-7b26-...  |  UserCreatedEvent
-  ✔ Replayed: 019d4784-93cf-...  |  UserCreatedEvent
-  ✔ Replayed: 019d4785-1abc-...  |  OrderPlacedEvent
+Replay 3 failed message(s) to Kafka? [y/N]
+```
+
+```
+  ✔ 019d4784-7b26-...  |  UserCreatedEvent
+  ✔ 019d4784-93cf-...  |  UserCreatedEvent
+  ✔ 019d4785-1abc-...  |  OrderPlacedEvent
 
 Done. Replayed: 3  Failed: 0
 ```
+
+Add `--force` to skip the prompt in automated pipelines or CI.
 
 </Step>
 
@@ -152,6 +162,47 @@ Status changes from `failed` to `replayed` with a `replayed_at` timestamp.
 </Step>
 
 </Steps>
+
+## Inspecting the DLQ
+
+Use `vortos:dlq:list` to see what's in the dead letter queue without writing SQL:
+
+```bash
+# list all failed messages (default: 50, oldest first)
+php bin/console vortos:dlq:list
+
+# filter by transport, event class, or handler
+php bin/console vortos:dlq:list --transport=user.events
+php bin/console vortos:dlq:list --event-class="App\\User\\Domain\\Event\\UserRegistered"
+php bin/console vortos:dlq:list --handler=user.registered.send-welcome-email
+
+# show most recently failed first
+php bin/console vortos:dlq:list --latest --limit=20
+
+# filter by time window
+php bin/console vortos:dlq:list --failed-from="2026-05-11T10:00:00Z" --failed-to="2026-05-11T10:30:00Z"
+```
+
+Example output:
+
+```
+Found 2 failed message(s).
+
+  ID                                    Handler                             Event            Attempts  Failed
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+  019d4784-7b26-78a6-ba36-3b74ce5ad751  user.registered.send-welcome-email  UserRegistered   5         2min ago
+  019d4784-93cf-78a6-ba36-3b74ce5ad752  order.placed.reserve-inventory      OrderPlaced      5         14min ago
+
+Tip: vortos:dlq:show <id> for full details · vortos:dlq:replay to re-produce to Kafka
+```
+
+Use `vortos:dlq:show <id>` to see the full entry — exception class, failure reason, payload, headers, and timestamps:
+
+```bash
+php bin/console vortos:dlq:show 019d4784-7b26-78a6-ba36-3b74ce5ad751
+```
+
+---
 
 ## Replay Options
 
@@ -177,6 +228,12 @@ php bin/console vortos:dlq:replay --latest
 # replay messages failed during a specific timestamp window
 php bin/console vortos:dlq:replay --failed-from="2026-05-11T10:00:00Z" --failed-to="2026-05-11T10:30:00Z"
 
+# re-broadcast the full event to ALL handlers, not just the one that failed
+php bin/console vortos:dlq:replay --all-handlers
+
+# skip the interactive confirmation prompt (safe for CI / cron)
+php bin/console vortos:dlq:replay --force
+
 # combine flags freely
 php bin/console vortos:dlq:replay --latest --limit=10 --transport=user.events --failed-from="2026-05-11T10:00:00Z" --dry-run
 ```
@@ -191,22 +248,72 @@ Filters can be combined — for example, `--transport=user.events --event-class=
 
 Replay re-produces the original message payload directly to Kafka — it does not re-dispatch through `EventBus`. The message goes back into the Kafka topic and is consumed by the worker as a fresh message, running through the full pipeline: deserialization, handler, middleware, retry.
 
+Before producing, the command validates that the stored `event_class` is registered in `HandlerRegistry` and that the stored `transport_name` is registered in `TransportRegistry`. If either check fails, that row is skipped with an error — preventing replay of stale or corrupted rows from producing to unknown topics.
+
+There are two replay modes controlled by `--all-handlers`.
+
+### Targeted replay (default)
+
+Each dead letter row stores the `handler_id` of the specific handler that failed. On replay, `ConsumerRunner` reads the `x-vortos-target-handler` header, verifies an HMAC signature, and filters the handler chain to run only that handler.
+
 ```
 vortos_failed_messages (status: failed)
     │
     ▼
 ReplayDeadLetterCommand
     ├── deserialize payload → DomainEvent
+    ├── increment x-vortos-global-replays
+    ├── set x-vortos-target-handler → handler_id from the failed row
+    ├── set x-vortos-replay-sig → HMAC-SHA256(target-handler, VORTOS_REPLAY_SECRET)
+    ├── strip x-vortos-failure-reason, x-vortos-failed-at
     ├── ProducerInterface::produce(transportName, event, headers)
     │       └── message back in Kafka topic
     └── markReplayed(id) → status: replayed
 
 Worker picks up from Kafka
-    └── ConsumerRunner → handler runs again
+    └── ConsumerRunner
+        ├── verifies x-vortos-replay-sig via HMAC-SHA256 against VORTOS_REPLAY_SECRET
+        ├── filters descriptors to only the handler that originally failed
+        └── runs only that handler — not the full handler chain
 ```
 
+Use this (the default) when the bug was in one specific handler and the other handlers already ran successfully. Re-running healthy handlers is unnecessary and risks side effects.
+
+### Broadcast replay (`--all-handlers`)
+
+Omits `x-vortos-target-handler` entirely. `ConsumerRunner` sees no trusted replay signature and runs all registered handlers for the event — subject to normal idempotency rules.
+
+```
+vortos_failed_messages (status: failed)
+    │
+    ▼
+ReplayDeadLetterCommand --all-handlers
+    ├── deserialize payload → DomainEvent
+    ├── increment x-vortos-global-replays
+    ├── strip x-vortos-target-handler, x-vortos-replay-sig   ← no targeting
+    ├── strip x-vortos-failure-reason, x-vortos-failed-at
+    ├── deduplicate by event_id — produce once per unique event
+    ├── ProducerInterface::produce(transportName, event, headers)
+    │       └── message back in Kafka topic
+    └── markReplayed(id) → status: replayed  (all rows for that event)
+
+Worker picks up from Kafka
+    └── ConsumerRunner
+        ├── no trusted replay sig → isTrustedReplay = false
+        └── runs ALL handlers normally (idempotency still applies)
+```
+
+**Deduplication:** if multiple handlers failed for the same event, `vortos_failed_messages` holds one row per failed handler. With `--all-handlers`, the command groups by `event_id` and produces a single Kafka message for all of them, marking every row as replayed. Without this, each row would produce a separate message, causing all handlers to run multiple times.
+
+**Use this when:**
+- You added a new handler after the event was originally processed and want it to run on historical events.
+- A bug affected multiple handlers for the same event and you want a clean full reprocess.
+- You want to treat the event as if it arrived fresh.
+
+**Idempotency interaction:** handlers that already succeeded on the original attempt still have their idempotency cache key set. They will be skipped automatically by `setNx` — only handlers whose keys were released (on failure) will actually execute. This is correct default behavior. If you need to force re-execution of a handler that already succeeded, temporarily mark it `idempotent: true` before replaying.
+
 <Callout type="warn" title="Idempotency on Replay">
-Replayed messages have new Kafka offsets but carry the **original** `event_id` header. If your handlers use idempotency (`idempotent: false`, the default), and the original message was successfully processed before it was dead-lettered (unlikely but possible), the handler will be skipped. If you need to force re-execution, temporarily mark your handler `idempotent: true` before replaying.
+Replayed messages carry the **original** `event_id` header. Handlers marked `idempotent: false` (the default) use this ID to claim an idempotency key. If the TTL on that key has expired, the handler will run again even if it succeeded originally. Design handlers to be safe under re-execution, or use `idempotent: true` on handlers where re-execution is always correct.
 </Callout>
 
 ## Global Configuration
@@ -243,6 +350,58 @@ The `user.events.dlq` value must reference a registered transport. After retry e
 2. Produces the original payload to the `user.events.dlq` Kafka topic (for real-time alerting or automated pipelines)
 
 Both happen together. If the Kafka DLQ produce fails, the failure is logged at `ERROR` level — the write to `vortos_failed_messages` is not rolled back.
+
+## PII Sanitization
+
+By default the full event payload is stored verbatim. If your events contain sensitive data (emails, payment details, health records), bind a custom `PayloadSanitizerInterface` implementation before the dead letter store persists anything.
+
+### How it works
+
+`DeadLetterWriter` calls `PayloadSanitizerInterface::sanitize()` on every payload before the database write. The default implementation (`NullPayloadSanitizer`) is a no-op — no behaviour change unless you override it.
+
+### Implementing a sanitizer
+
+```php
+use Vortos\Messaging\Contract\PayloadSanitizerInterface;
+
+final class AppPayloadSanitizer implements PayloadSanitizerInterface
+{
+    public function sanitize(string $payload, array $headers): string
+    {
+        $data = json_decode($payload, true);
+        if (!is_array($data)) {
+            return $payload;
+        }
+
+        // Mask any field named 'password', 'token', 'credit_card', etc.
+        array_walk_recursive($data, static function (mixed &$value, string $key): void {
+            if (in_array($key, ['password', 'token', 'credit_card', 'ssn', 'card_number'], true)) {
+                $value = '[REDACTED]';
+            }
+        });
+
+        return json_encode($data, JSON_THROW_ON_ERROR);
+    }
+}
+```
+
+### Binding your sanitizer
+
+In your DI configuration, alias `PayloadSanitizerInterface` to your implementation:
+
+```php
+use Vortos\Messaging\Contract\PayloadSanitizerInterface;
+
+$container->setAlias(PayloadSanitizerInterface::class, AppPayloadSanitizer::class);
+```
+
+<Callout type="warn" title="Sanitizer must return valid JSON">
+The sanitized payload is stored as-is and re-deserialized on replay. If your sanitizer returns invalid JSON or changes the structure in a way that breaks the event class constructor, replay will fail. Test your sanitizer against all event types before deploying to production.
+</Callout>
+
+<Callout type="warn" title="Do not mask fields required for replay">
+If you use `array_walk_recursive`, be careful with generic key names. Fields like `type`, `status`, `id`, or `version` may look like candidates for redaction but are often structural — removing or masking them will break deserialization on replay. Scope your redaction to fields that contain actual PII values (emails, phone numbers, raw credentials), not fields that drive control flow.
+</Callout>
 
 ## This Command is Manual — By Design
 

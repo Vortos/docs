@@ -3,6 +3,7 @@
   "pages": [
     "getting-started",
     "setup",
+    "foundation",
     "auth",
     "authorization",
     "security",
@@ -19,6 +20,9 @@
     "docker",
     "debug",
     "feature-flags",
+    "make",
+    "mcp",
+    "config",
     "contributing"
   ]
 }

@@ -27,6 +27,9 @@ Infrastructure depends on domain. Domain never depends on infrastructure. `DbalW
 | `WriteRepositoryInterface` | Contract for write-side repositories |
 | `ReadRepositoryInterface` | Contract for read-side repositories |
 | `PageResult` | Cursor-based pagination result |
+| `DomainError` | Structured, typed domain failure with error code and context |
+| `Result<T>` | Explicit success/failure container — `ok()`, `fail()`, `unwrap()` |
+| `#[HttpStatus]` | Declares the HTTP status a `DomainError` maps to |
 
 ## The Aggregate Pattern
 
@@ -52,4 +55,5 @@ Your domain model is built entirely from these building blocks. Infrastructure l
   <Card title="Queries" href="/docs/domain/queries" description="QueryInterface — marker interface for read-side questions." />
   <Card title="Value Objects" href="/docs/domain/value-objects" description="ValueObject — equality by value, immutability, toString." />
   <Card title="Collections" href="/docs/domain/collections" description="Collection — type-safe, ordered, filterable." />
+  <Card title="Errors & Result" href="/docs/domain/errors" description="DomainError and Result — typed failures with stable error codes, context, and automatic HTTP mapping." />
 </Cards>

@@ -89,6 +89,17 @@ prod_myapp___tag__permissions    → SET { "prod_myapp_permissions:matrix:tenant
 
 Values are serialized with PHP's native `serialize()`/`unserialize()`. This handles all PHP types including objects, arrays, nested structures, and custom classes. `ext-redis`'s built-in serializer is disabled — `RedisConnectionFactory` sets `Redis::OPT_SERIALIZER` to `Redis::SERIALIZER_NONE` explicitly.
 
+By default, `unserialize()` is called with `allowed_classes: false` — plain arrays and scalars only. If you need to cache PHP objects, declare the allowed classes explicitly in `config/cache.php`:
+
+```php title="config/cache.php"
+$config->allowSerializedClasses([
+    \App\User\Domain\UserProfile::class,
+    \App\Catalog\Domain\ProductSummary::class,
+]);
+```
+
+Only the listed classes will be instantiated during deserialization. Any other class in the serialized payload will be returned as `__PHP_Incomplete_Class` instead of being constructed — preventing PHP object injection attacks via a compromised Redis instance.
+
 ## clear() Uses SCAN, Not FLUSHDB
 
 ```php

@@ -1,0 +1,168 @@
+---
+title: Make
+description: 22 code generation commands that scaffold your entire application — domain, CQRS, messaging, HTTP, persistence, and authorization — from a single CLI.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Make
+
+`vortos-make` is a code generator built into the framework. It understands Vortos architecture and generates files that already follow every golden rule — correct attribute usage, correct layer placement, correct naming. You describe what you want; it writes the boilerplate.
+
+<Callout type="info" title="Not a Scaffold — a Starting Point">
+Generated files compile and run immediately. They do not contain `// TODO` markers. They contain real implementations with the correct structure, the correct imports, and the correct attribute configuration. You fill in the logic; the generator handles everything else.
+</Callout>
+
+## Installation
+
+```bash
+composer require vortos/vortos-make --dev
+```
+
+The package is auto-discovered. All 23 commands are immediately available in `bin/console`.
+
+## How It Works
+
+Every `vortos:make:*` command does three things:
+
+1. **Validates input** — names, context folders, event class resolution, argument constraints
+2. **Renders a stub** — substitutes your values into the template for that file type
+3. **Writes the file** — creates the target directory if needed, skips if the file already exists
+
+After writing, each command prints a **next-step hint** — the exact follow-up action required, such as registering in DI config or dispatching via the command bus. No need to memorise the wiring rules.
+
+Files are always written to `src/{Context}/{Layer}/{ClassName}.php`. The generator never touches existing files — re-running a command is always safe.
+
+### Stub Resolution
+
+Stubs live inside each module's `Resources/stubs/` directory. When a command renders a stub it looks in two places, in order:
+
+```
+stubs/{stub-name}.stub          ← your project override (wins if present)
+    ↓ not found
+{module}/Resources/stubs/{stub-name}.stub   ← framework default
+```
+
+Placing a file in your project's `stubs/` directory overrides any framework stub by that name. See [Customizing Stubs](/docs/make/customizing-stubs) for the full override guide.
+
+### Event Class Resolution
+
+Several commands accept `--event` as either a short name (`UserRegisteredEvent`) or a full FQCN. When a short name is given, the generator scans `src/` to find the class:
+
+```bash
+# Short name — generator scans src/ to resolve to FQCN
+php bin/console vortos:make:consumer SendEmail \
+    --context=User \
+    --consumer=user.events \
+    --event=UserRegisteredEvent
+
+# Full FQCN — used as-is, no scanning
+php bin/console vortos:make:consumer SendEmail \
+    --context=User \
+    --consumer=user.events \
+    --event="App\\User\\Domain\\Event\\UserRegisteredEvent"
+```
+
+If the short name matches zero classes, the command fails with a helpful error. If it matches more than one, it fails listing all ambiguous matches so you can use the full FQCN.
+
+## Available Commands
+
+### Domain
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:context` | Full bounded context directory structure |
+| `vortos:make:aggregate` | Aggregate root + typed AggregateId + repository interface, inside `Domain/{Name}/` |
+| `vortos:make:entity` | Child entity + typed EntityId inside `Domain/{Aggregate}/Entities/` — requires `--aggregate` |
+| `vortos:make:value-object` | Immutable value object — requires `--aggregate` or `--shared` |
+| `vortos:make:domain-event` | Domain event inside `Domain/{Aggregate}/Event/` — requires `--aggregate` |
+| `vortos:make:domain-error` | Structured domain error inside `Domain/{Aggregate}/Error/` — requires `--aggregate` |
+
+### CQRS
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:command` | CQRS command + handler |
+| `vortos:make:query` | CQRS query + handler |
+| `vortos:make:projection-handler` | Kafka projection handler |
+
+### Messaging
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:consumer` | Kafka event handler |
+| `vortos:make:messaging-config` | MessagingConfig class (transport + producer + consumer) |
+| `vortos:make:middleware` | Kafka consumer middleware |
+| `vortos:make:hook` | Messaging lifecycle hook |
+
+### HTTP
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:controller` | API controller + request DTO |
+
+### Persistence
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:write-repository` | PostgreSQL write repository + interface |
+| `vortos:make:read-repository` | MongoDB read repository |
+
+### Authorization
+
+| Command | What it generates |
+|---|---|
+| `vortos:make:authorization-policy` | Resource authorization policy |
+| `vortos:make:ownership-policy` | Ownership policy |
+| `vortos:make:feature-policy` | Feature access policy |
+| `vortos:make:rate-limit-policy` | Rate limit policy |
+| `vortos:make:quota-policy` | Quota policy |
+| `vortos:make:quota-resolver` | Quota subject resolver |
+| `vortos:make:session-policy` | Session limit policy |
+
+## Quick Start — Scaffolding a Feature End-to-End
+
+The typical flow for adding a new feature to an existing bounded context:
+
+```bash
+# 1. Generate the aggregate root
+php bin/console vortos:make:aggregate User --context=User
+
+# 2. Generate the domain event the feature will emit
+php bin/console vortos:make:domain-event UserRegistered --context=User --aggregate=User
+
+# 3. Generate the command that triggers the action
+php bin/console vortos:make:command RegisterUser --context=User
+
+# 4. Generate the write repository for the aggregate
+php bin/console vortos:make:write-repository User --context=User
+
+# 5. Generate the HTTP controller to accept the request
+php bin/console vortos:make:controller RegisterUser --context=User --route=/users --method=POST
+
+# 6. Generate a Kafka consumer to react to the event
+php bin/console vortos:make:consumer SendWelcomeEmail \
+    --context=User \
+    --consumer=user.events \
+    --event=UserRegisteredEvent
+```
+
+Starting a brand-new bounded context? Generate the directory tree first:
+
+```bash
+php bin/console vortos:make:context Order
+```
+
+## Detailed Pages
+
+<Cards>
+  <Card title="Domain" href="/docs/make/domain" description="context, aggregate, entity, value-object, domain-event, domain-error." />
+  <Card title="CQRS" href="/docs/make/cqrs" description="command, query, projection-handler." />
+  <Card title="Messaging" href="/docs/make/messaging" description="consumer, messaging-config, middleware, hook." />
+  <Card title="HTTP" href="/docs/make/http" description="controller and request DTO." />
+  <Card title="Persistence" href="/docs/make/persistence" description="write-repository and read-repository." />
+  <Card title="Authorization" href="/docs/make/authorization" description="All seven policy and resolver types." />
+  <Card title="Customizing Stubs" href="/docs/make/customizing-stubs" description="Override framework stubs with your own project templates." />
+</Cards>

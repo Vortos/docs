@@ -1,0 +1,13 @@
+{
+  "title": "Make",
+  "pages": [
+    "index",
+    "domain",
+    "cqrs",
+    "messaging",
+    "http",
+    "persistence",
+    "authorization",
+    "customizing-stubs"
+  ]
+}

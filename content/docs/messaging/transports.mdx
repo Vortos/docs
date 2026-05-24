@@ -211,17 +211,20 @@ Example output:
 Found 2 transport(s).
 
 ▶ orders.placed
-  DSN:        kafka://kafka:9092
-  Topic:      orders.placed
-  Serializer: json
+  Topic:       orders-placed-v2
+  DSN:         kafka://kafka:9092
+  Serializer:  json
+
   Producers (1):
-    - orders.placed
+    • orders.placed    outbox: on   compression: snappy
+      Publishes: OrderPlaced, OrderCancelled
 
 ▶ orders.placed.dlq
-  DSN:        kafka://kafka:9092
-  Topic:      orders.placed.dlq
-  Serializer: json
-  Producers:  none
+  Topic:       orders-placed-dlq
+  DSN:         kafka://kafka:9092
+  Serializer:  json
+
+  Producers:   none
 ```
 
 ## Environment-Based Configuration

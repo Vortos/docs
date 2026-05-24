@@ -17,7 +17,7 @@ Both modules implement the same `WriteRepositoryInterface` and `UnitOfWorkInterf
 |---|---|---|
 | SQL required | None — Doctrine generates it | Full control via QueryBuilder |
 | Aggregate mapping | Doctrine entity annotations | `toRow()` / `fromRow()` |
-| Schema management | `vortos:orm:schema --force` | Manual migrations |
+| Schema management | `vortos:orm:diff` → `vortos:migrate` | Hand-written migrations + `vortos:migrate` |
 | Optimistic locking | `#[ORM\Version]` — Doctrine-managed | `version` column — base class managed |
 | Bulk operations | Not provided | `batchInsert`, `batchUpdate`, `batchUpsert` |
 | Custom queries | DQL or `createQueryBuilder()` | DBAL `createQueryBuilder()` |
@@ -58,9 +58,9 @@ EntityManager::class          — shared, lazy
 EntityManagerInterface::class — aliased to EntityManager
 Connection::class             — DBAL connection extracted from EntityManager
                                 (shared with OutboxWriter for atomic writes)
-OrmUnitOfWork::class          — transaction boundary and worker-request isolation
+OrmUnitOfWork::class          — DBAL-level transaction boundary and worker-request isolation
 UnitOfWorkInterface::class    — aliased to OrmUnitOfWork
-OrmMetadataCache::class       — PSR-6 metadata cache pool (registered when Cache module is loaded)
+OrmMetadataCache::class       — PSR-6 metadata cache pool (wired at compile time when Cache module is loaded)
 OrmClearCacheCommand::class   — vortos:orm:clear-cache (registered when Cache module is loaded)
 ```
 
@@ -78,7 +78,7 @@ use Vortos\PersistenceOrm\Aggregate\AggregateRoot;
 
 **Why a separate property?** The domain `AggregateRoot::$version` field is private — Doctrine cannot access or manage it through reflection. `$ormVersion` solves this: it is managed by Doctrine via `#[ORM\Version]`, and `AggregateRoot` overrides `getVersion()`, `incrementVersion()`, and `restoreVersion()` so that the framework's optimistic locking and Doctrine always read and write the same number. Your application code never touches `$ormVersion` directly.
 
-```php title="src/User/Domain/Entity/User.php"
+```php title="src/User/Domain/User/User.php"
 use Doctrine\ORM\Mapping as ORM;
 use Vortos\PersistenceOrm\Aggregate\AggregateRoot;
 
@@ -145,7 +145,38 @@ No `toRow()`, no `fromRow()`, no column map. Doctrine handles serialisation from
 
 `delete()` also checks `$em->contains()` first. If the aggregate is not managed (for example, if it was constructed outside Doctrine), it calls `find()` to load a managed copy before calling `remove()`.
 
-Both `save()` and `delete()` catch Doctrine's `OptimisticLockException` and rethrow it as `Vortos\Domain\Repository\Exception\OptimisticLockException` — the same exception your application code already handles from the DBAL module.
+Both `save()` and `delete()` translate all infrastructure exceptions so application code never imports Doctrine or DBAL types.
+
+### Exception Translation
+
+`OrmWriteRepository` translates every DBAL and Doctrine exception to a type in `Vortos\PersistenceOrm\Exception\`:
+
+| DBAL exception | Vortos exception |
+|---|---|
+| `UniqueConstraintViolationException` | `UniqueConstraintException` |
+| `ForeignKeyConstraintViolationException` | `ForeignKeyConstraintException` |
+| `NotNullConstraintViolationException` | `NotNullConstraintException` |
+| `DeadlockException` | `DeadlockException` (safe to retry) |
+| `LockWaitTimeoutException` | `LockWaitTimeoutException` (safe to retry) |
+| `ConnectionException` | `ConnectionException` |
+| Any other `Doctrine\DBAL\Exception` | `PersistenceException` (base) |
+| `DoctrineOptimisticLockException` | `Vortos\Domain\Repository\Exception\OptimisticLockException` |
+
+The original exception is always available via `$e->getPrevious()`. Non-DBAL exceptions (e.g. your own `DomainException`) pass through unwrapped.
+
+```php
+use Vortos\PersistenceOrm\Exception\UniqueConstraintException;
+
+try {
+    $this->users->save($user);
+} catch (UniqueConstraintException $e) {
+    throw EmailAlreadyTakenException::forEmail($command->email);
+}
+```
+
+<Callout type="info" title="Pre-check vs catch">
+For constraints you can cheaply check before writing (e.g. email uniqueness), prefer an `existsByEmail()` pre-check over catching `UniqueConstraintException`. The catch pattern is appropriate for constraints that are hard or expensive to pre-check (e.g. composite uniqueness, foreign key references into tables you don't query directly).
+</Callout>
 
 ### Built-In Operations
 
@@ -157,7 +188,7 @@ Both `save()` and `delete()` catch Doctrine's `OptimisticLockException` and reth
 
 ### Custom Queries
 
-For queries beyond `findById()`, use the protected `em()` accessor, which returns `EntityManagerInterface`:
+For queries beyond `findById()`, use the protected `em()` accessor, which returns `EntityManagerInterface`. The underlying `EntityManager` field is `private` — subclasses must go through `em()`, never `$this->em`. This keeps the resolution strategy (lazy load, decoration, registry) an internal detail of the base class:
 
 ```php
 final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
@@ -184,7 +215,7 @@ final class UserRepository extends OrmWriteRepository implements UserRepositoryI
 
 ## OrmUnitOfWork
 
-`OrmUnitOfWork` implements `UnitOfWorkInterface` and wraps `EntityManager::wrapInTransaction()`. The API is identical to the DBAL `UnitOfWork` — no application code changes are needed when switching persistence backends.
+`OrmUnitOfWork` implements `UnitOfWorkInterface` using DBAL-level transactions (`beginTransaction` / `commit` / `rollBack`). The API is identical to the DBAL `UnitOfWork` — no application code changes are needed when switching persistence backends.
 
 ```php
 use Vortos\Persistence\Transaction\UnitOfWorkInterface;
@@ -196,29 +227,34 @@ final class RegisterUserHandler
         private readonly UserRepositoryInterface $users,
     ) {}
 
-    public function __invoke(RegisterUser $command): void
+    public function __invoke(RegisterUser $command): User
     {
-        $this->unitOfWork->run(function () use ($command) {
+        return $this->unitOfWork->run(function () use ($command) {
             $user = User::register(UserId::generate(), $command->email);
             $this->users->save($user);
+            return $user;
         });
     }
 }
 ```
 
 <Callout type="info" title="CommandBus Manages the Transaction Automatically">
-The `CommandBus` wraps every handler in `UnitOfWork::run()` automatically via `TransactionalMiddleware`. Inject `UnitOfWorkInterface` directly only when you need explicit transaction boundaries outside of a command handler.
+The `CommandBus` wraps every handler in `UnitOfWork::run()` automatically. Inject `UnitOfWorkInterface` directly only when you need explicit transaction boundaries outside of a command handler.
+</Callout>
+
+<Callout type="warn" title="Why Not EntityManager::wrapInTransaction()?">
+Doctrine's `wrapInTransaction()` calls `$em->close()` in its `finally` block whenever any exception escapes the callback. In FrankenPHP worker mode, a single exception permanently kills the `EntityManager` for all subsequent requests in that worker thread. `OrmUnitOfWork` uses DBAL-level transactions to avoid this — the EM is never closed on normal exception paths.
 </Callout>
 
 ### Worker Mode Isolation
 
 `OrmUnitOfWork` implements `ResetInterface`. In FrankenPHP worker mode, `ServicesResetter` calls `reset()` between requests. `reset()` calls `$em->clear()`, which detaches all entities from Doctrine's identity map.
 
-This means no aggregate state leaks across requests — each request starts with a clean identity map. This happens automatically: `ResettableServicesPass` discovers `ResetInterface` implementations at compile time. No manual tagging or configuration is required.
+If the `EntityManager` was closed by an unexpected code path, `reset()` also closes the underlying DBAL connection so that DBAL auto-reconnects on the next request — a safety net that should never be needed in practice, since DBAL-level transactions do not close the EM.
 
 ### Connection Resilience
 
-`OrmUnitOfWork` includes an `ensureConnection()` method that runs before beginning a transaction. It pings the database with a lightweight `SELECT 1`. If the ping fails — for example after a database restart or a long idle period in a worker process — it calls `close()` on the DBAL connection. DBAL reconnects automatically on the next query.
+`OrmUnitOfWork` pings the database with `SELECT 1` before beginning each transaction. If the ping fails — for example after a database restart or a long idle period in a worker process — it calls `close()` on the DBAL connection. DBAL reconnects automatically on the next query.
 
 This prevents dead connection errors that would otherwise surface as fatal errors in long-running FrankenPHP workers after periods of inactivity.
 
@@ -228,7 +264,9 @@ This prevents dead connection errors that would otherwise surface as fatal error
 
 In production with the Cache module loaded, `OrmMetadataCache` is registered automatically. It is a PSR-6 `CacheItemPoolInterface` adapter backed by Vortos `TaggedCacheInterface`. All ORM metadata entries are tagged with `'orm_metadata'`.
 
-`PersistenceOrmExtension` reads `kernel.env` from the container to decide which path to take:
+`OrmMetadataCachePass` runs at compile time (after all extensions are merged) and wires the cache into the `EntityManagerFactory`. This happens via a compiler pass rather than inside the extension itself — extensions cannot see each other's services during `load()` due to Symfony's isolation mechanism, but compiler passes can.
+
+The pass decides which path to take based on `kernel.env` and whether `TaggedCacheInterface` is registered:
 
 **Dev mode** (`kernel.env = dev`): The metadata cache is bypassed entirely. Doctrine re-reads entity attributes on every request. Mapping changes are visible immediately without clearing any cache.
 
@@ -252,41 +290,24 @@ This command surgically invalidates only the `orm_metadata` tag. It does not tou
 
 ## Schema Management
 
-`vortos:orm:schema` generates and applies DDL from your entity mappings.
-
-```bash
-# Preview the SQL without executing
-php vortos vortos:orm:schema --dump-sql
-
-# Apply schema changes to the database
-php vortos vortos:orm:schema --force
-
-# Preview the DROP statements
-php vortos vortos:orm:schema --dump-sql --drop
-
-# Drop all mapped tables (destructive)
-php vortos vortos:orm:schema --drop --force
-```
-
-<Callout type="warn" title="--drop --force Is Destructive">
-`--drop --force` drops all tables mapped by Doctrine in one operation. Always run `--dump-sql --drop` first to see exactly what will be dropped before running against any environment with real data.
-</Callout>
-
-### Migration-Based Workflow
-
-For production deployments, schema changes should go through `vortos:migrate` rather than `vortos:orm:schema --force`. `vortos:orm:schema --force` is useful during active development but bypasses the migration history — it cannot be rolled back and leaves no audit trail.
+Schema changes always go through the migration system — there is no direct `SchemaTool::update` path. This keeps every schema change reviewable, version-controlled, and rollback-able.
 
 ```bash
 # 1. Make your entity changes
 
-# 2. Generate a migration from the diff
+# 2. Preview the SQL diff without writing a file (useful before committing)
+php vortos vortos:orm:diff --dry-run
+
+# 3. Generate a migration from the diff against the live database
 php vortos vortos:orm:diff
 
-# 3. Review the generated migration file in migrations/
+# 4. Review the generated migration file in migrations/
 
-# 4. Run all pending migrations (ORM diff + framework module migrations in one command)
+# 5. Run all pending migrations (ORM diff + framework module migrations in one command)
 php vortos vortos:migrate
 ```
+
+`--dry-run` prints every SQL statement that would be written without creating a file. Use it to confirm the diff is what you expect before committing a migration to source control.
 
 Both framework table migrations (published via `vortos:migrate:publish`) and ORM entity migrations (generated via `vortos:orm:diff`) land in the same `migrations/` directory and are run together by `vortos:migrate`. One command covers everything.
 

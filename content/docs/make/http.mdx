@@ -1,0 +1,144 @@
+---
+title: HTTP Generator
+description: Generate an API controller and its request DTO wired into the Vortos HTTP layer.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# HTTP Generator
+
+## `vortos:make:controller`
+
+Generates an API controller and a paired request DTO. Both files are wired into the Vortos HTTP layer automatically — no route registration YAML or manual service tagging needed.
+
+```bash
+php bin/console vortos:make:controller <name> \
+    --context=<context> \
+    [--route=<path>] \
+    [--route-name=<name>] \
+    [--method=<METHOD>]
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Controller name **without** the `Controller` suffix. PascalCase. E.g., `RegisterUser`, `GetUserById`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--route` | Route path. Defaults to kebab-case of name prefixed with `/`. E.g., `RegisterUser` → `/register-user`. |
+| `--route-name` | Route name. Defaults to snake_case of name. E.g., `RegisterUser` → `register_user`. |
+| `--method` | HTTP method. Default: `POST`. Case-insensitive. |
+
+**Example**
+
+```bash
+php bin/console vortos:make:controller RegisterUser \
+    --context=User \
+    --route=/users \
+    --route-name=user.register \
+    --method=POST
+```
+
+**Creates**
+
+```
+src/User/Representation/Controller/RegisterUserController.php
+src/User/Representation/Request/RegisterUserRequest.php
+```
+
+**`RegisterUserController.php`**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Representation\Controller;
+
+use App\User\Representation\Request\RegisterUserRequest;
+use Vortos\Http\Attribute\AsController;
+use Vortos\Http\JsonResponse;
+use Vortos\Http\Response;
+use Symfony\Component\Routing\Attribute\Route;
+
+#[AsController]
+#[Route('/users', name: 'user.register', methods: ['POST'])]
+final class RegisterUserController
+{
+    public function __construct(
+        // inject CommandBusInterface or QueryBusInterface here
+    ) {}
+
+    public function __invoke(RegisterUserRequest $request): Response
+    {
+        // implement controller logic here
+
+        return new JsonResponse(null, Response::HTTP_NO_CONTENT);
+    }
+}
+```
+
+**`RegisterUserRequest.php`**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Representation\Request;
+
+use Vortos\Http\Request\RequestDto;
+
+final class RegisterUserRequest extends RequestDto
+{
+    public function __construct(
+        // add request fields here
+    ) {}
+}
+```
+
+## Wiring the Pattern
+
+A typical controller dispatches a command and returns the result. Fill in the constructor and `__invoke` body:
+
+```php
+final class RegisterUserController
+{
+    public function __construct(
+        private readonly CommandBusInterface $commandBus,
+    ) {}
+
+    public function __invoke(RegisterUserRequest $request): Response
+    {
+        $this->commandBus->dispatch(new RegisterUser(
+            email: $request->email,
+            name:  $request->name,
+        ));
+
+        return new JsonResponse(null, Response::HTTP_CREATED);
+    }
+}
+```
+
+The `RegisterUserRequest` DTO is hydrated and validated before `__invoke` is called. Add your field declarations with `#[Assert\*]` constraints:
+
+```php
+final class RegisterUserRequest extends RequestDto
+{
+    public function __construct(
+        #[Assert\NotBlank]
+        #[Assert\Email]
+        public readonly string $email,
+
+        #[Assert\NotBlank]
+        #[Assert\Length(min: 2, max: 100)]
+        public readonly string $name,
+    ) {}
+}
+```
+
+If validation fails, the framework returns a `422 Unprocessable Entity` response with field-level error details automatically — no try/catch needed in the controller.
+
+<Callout type="info" title="Route Discovery">
+Routes are discovered from `#[Route]` attributes at compile time by `RouteCompilerPass`. No YAML, no route file. Add the attribute and the route is registered. Use `vortos:debug:routes` to verify.
+</Callout>

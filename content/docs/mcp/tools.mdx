@@ -1,0 +1,323 @@
+---
+title: Tools Reference
+description: Full schema, input parameters, and example output for all seven MCP tools registered in the Vortos MCP server.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Tools Reference
+
+The Vortos MCP server registers seven tools. All tools return markdown-formatted strings. The AI client renders them directly in the assistant context.
+
+---
+
+## `get_conventions`
+
+Returns the Vortos golden rules, naming conventions, and package registration order.
+
+**Input schema:** No parameters.
+
+**What it returns:**
+
+- **Golden Rules** — 10 non-negotiable architectural constraints (no runtime reflection, shared connection, CommandBus owns transactions, etc.)
+- **Naming Conventions** — 16 naming patterns for aggregates, events, commands, handlers, queries, repos, controllers, policies, and cache keys
+- **Package Registration Order** — The mandatory load sequence for all 15 packages
+
+**Example call (from AI tool use):**
+
+```json
+{ "name": "get_conventions", "arguments": {} }
+```
+
+**Example output (excerpt):**
+
+```
+## Golden Rules
+
+1. Zero runtime reflection — all discovery (handlers, policies, routes, idempotency) at compile time
+2. Connection is always shared — setShared(true) on DBAL Connection; multiple = broken transactions
+3. CommandBus owns the transaction — handlers NEVER call beginTransaction/commit/rollBack
+4. Return the aggregate from handlers — bus calls pullDomainEvents(); void = events silently dropped
+...
+
+## Naming Conventions
+
+| Concept        | Pattern                  | Example                   |
+|--------------- |--------------------------|---------------------------|
+| Aggregate      | PascalCase               | User, Order               |
+| Aggregate ID   | {Aggregate}Id            | UserId, OrderId           |
+| Domain Event   | {Noun}{Verb}Event        | UserRegisteredEvent       |
+| Command        | {Verb}{Noun}             | RegisterUser              |
+| Command Handler| {Command}Handler         | RegisterUserHandler       |
+...
+```
+
+---
+
+## `get_architecture`
+
+Returns layer responsibilities, CQRS/event flow diagrams, the canonical directory structure, and transaction boundary rules.
+
+**Input schema:** No parameters.
+
+**What it returns:**
+
+- **Layers** — Domain, Application, Infrastructure, Representation with what belongs in each and what is forbidden
+- **CQRS + Event Flow** — Step-by-step command flow, query flow, and projection flow
+- **File Structure** — Canonical directory tree for a bounded context
+- **Transaction Boundary** — Who owns transactions and what the rules are
+
+**Example call:**
+
+```json
+{ "name": "get_architecture", "arguments": {} }
+```
+
+**Example output (excerpt):**
+
+```
+## Layers
+
+### Domain
+Responsibilities:
+- Aggregates, entities, value objects, domain events, domain exceptions
+- Repository interfaces (not implementations)
+Rules:
+- NO framework imports (no Symfony, no Doctrine, no Vortos attributes)
+- NO infrastructure dependencies
+- Pure PHP only
+
+### Application
+Responsibilities:
+- Commands, queries, handlers, projections, policies
+Rules:
+- May import framework contracts (CommandBusInterface, QueryBusInterface)
+- NO database calls directly — only via repository interface
+...
+
+## Canonical Directory Structure
+
+src/{Context}/
+├── Domain/
+│   ├── Entity/
+│   ├── Event/
+│   ├── Exception/
+│   ├── Repository/        ← interfaces only
+│   └── ValueObject/
+├── Application/
+│   ├── Command/
+│   ├── EventHandler/
+│   ├── Policy/
+│   ├── Projection/
+│   └── Query/
+├── Infrastructure/
+│   ├── Messaging/
+│   └── Repository/        ← implementations
+└── Representation/
+    ├── Controller/
+    └── Request/
+```
+
+---
+
+## `get_best_practices`
+
+Returns best practices, optionally filtered to a specific topic.
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "topic": {
+      "type": "string",
+      "enum": ["performance", "security", "testing", "worker_mode", "kafka"],
+      "description": "Filter to a specific topic. Omit to return all topics."
+    }
+  }
+}
+```
+
+**Topics:**
+
+| Topic | Practices covered |
+|---|---|
+| `performance` | FrankenPHP worker mode, container compilation, DBAL connection pooling, Redis pipelining, projection batch writes |
+| `security` | Secrets management, security headers, CSRF protection, request signing, rate limiting, IP filtering, data masking |
+| `testing` | In-memory drivers, projection isolation, integration tests vs unit tests, testing policies, command bus testing |
+| `worker_mode` | `ServicesResetter`, stateless handlers, connection lifecycle, memory monitoring, graceful shutdown |
+| `kafka` | Consumer groups, idempotency keys, DLQ configuration, outbox pattern, at-least-once delivery |
+
+**Example calls:**
+
+```json
+{ "name": "get_best_practices", "arguments": { "topic": "testing" } }
+{ "name": "get_best_practices", "arguments": {} }
+```
+
+---
+
+## `get_mistakes`
+
+Returns 15 common Vortos antipatterns, each with a "what not to do", the correct alternative, and an explanation.
+
+**Input schema:** No parameters.
+
+**What it returns:**
+
+15 numbered entries in the format:
+
+```
+1. Creating multiple DBAL Connection instances
+   ✗ Wrong:  new Connection($params)
+   ✓ Right:  ConnectionFactory::fromDsn() — shared singleton via DI
+   Why: Multiple connections break transactions; write and read sides would use different connections
+
+2. Returning void from a command handler
+   ✗ Wrong:  public function __invoke(RegisterUser $command): void
+   ✓ Right:  Return the aggregate — bus calls pullDomainEvents() on return value
+   Why: Domain events are silently dropped if the handler returns void or null
+
+...
+```
+
+**Example call:**
+
+```json
+{ "name": "get_mistakes", "arguments": {} }
+```
+
+---
+
+## `get_module_docs`
+
+Returns API reference documentation for any Vortos module. Covers what the module provides (classes, interfaces, attributes), its configuration options, and available CLI commands.
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "module": {
+      "type": "string",
+      "description": "Module name. Omit to list all modules."
+    }
+  }
+}
+```
+
+**Modules covered:**
+
+`domain`, `cqrs`, `messaging`, `persistence`, `cache`, `auth`, `authorization`, `http`, `security`, `make`, `logger`, `tracing`, `observability`, `foundation`, `setup`, `mcp`
+
+**Example calls:**
+
+```json
+{ "name": "get_module_docs", "arguments": { "module": "messaging" } }
+{ "name": "get_module_docs", "arguments": {} }
+```
+
+**Example output for `messaging` (excerpt):**
+
+```
+## Messaging
+
+Kafka-backed event-driven messaging with outbox, retry, dead letter, and full consumer pipeline.
+
+### Provides
+- EventBusInterface — dispatch domain events
+- #[MessagingConfig], #[RegisterTransport], #[RegisterProducer], #[RegisterConsumer]
+- #[AsEventHandler] — register event handlers (class or method level)
+- #[MessageId], #[CorrelationId], #[Timestamp], #[Header] — header injection attributes
+- RetryPolicy::exponential(), RetryPolicy::fixed() — configurable retry backoff
+- DeadLetterWriter — persists failed messages to vortos_failed_messages
+
+### Configuration (config/messaging.php)
+- dlq().table(string) — dead letter table name (default: vortos_failed_messages)
+- idempotency defaults via VortosMessagingConfig
+
+### Commands
+- vortos:consume <name>
+- vortos:dlq:replay
+- vortos:outbox:relay
+- vortos:outbox:replay
+- vortos:consumers:list
+- vortos:transports:list
+```
+
+---
+
+## `list_project_modules`
+
+Reads `composer.lock` from your project root and lists all installed `vortos/*` packages with their version and whether they are a dev or production dependency.
+
+**Input schema:** No parameters.
+
+**What it returns:**
+
+```
+Installed vortos/* packages:
+
+Package                        Version              Type
+────────────────────────────── ──────────────────── ──────
+vortos/vortos-foundation        v1.0.0-alpha-35      prod
+vortos/vortos-cache             v1.0.0-alpha-35      prod
+vortos/vortos-messaging         v1.0.0-alpha-35      prod
+vortos/vortos-cqrs              v1.0.0-alpha-35      prod
+vortos/vortos-make              v1.0.0-alpha-35      dev
+vortos/vortos-mcp               v1.0.0-alpha-35      dev
+```
+
+This tells the AI assistant exactly which modules are available in the current project, so it doesn't suggest APIs from packages that aren't installed.
+
+---
+
+## `read_project_config`
+
+Reads the contents of your `config/*.php` files and returns them as PHP code blocks.
+
+**Input schema:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "file": {
+      "type": "string",
+      "description": "Config filename without .php extension. Omit to return all config files."
+    }
+  }
+}
+```
+
+**Example calls:**
+
+```json
+{ "name": "read_project_config", "arguments": { "file": "cache" } }
+{ "name": "read_project_config", "arguments": {} }
+```
+
+**Example output:**
+
+```
+## config/cache.php
+
+```php
+use Vortos\Cache\DependencyInjection\VortosCacheConfig;
+
+return static function (VortosCacheConfig $config): void {
+    $config->dsn(sprintf('redis://%s:%s', $_ENV['REDIS_HOST'], $_ENV['REDIS_PORT']));
+    $config->prefix($_ENV['APP_ENV'] . '_myapp_');
+    $config->defaultTtl(3600);
+};
+```
+```
+
+If no `config/` directory exists, the tool returns instructions for publishing config stubs with `vortos:config:publish`.
+
+<Callout type="info" title="Project-Aware Context">
+`list_project_modules` and `read_project_config` are the tools that give the AI assistant project-specific awareness. They let the assistant tailor its suggestions to what is actually installed and configured in your project, rather than guessing from generic framework knowledge.
+</Callout>

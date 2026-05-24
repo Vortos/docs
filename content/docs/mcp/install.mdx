@@ -1,0 +1,242 @@
+---
+title: Install & Doctor
+description: vortos:mcp:install wires the server into your AI client. vortos:mcp:doctor verifies the setup and lists active tools.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+# Install & Doctor
+
+Two commands manage the MCP server lifecycle: `vortos:mcp:install` wires the server into your AI client configuration, and `vortos:mcp:doctor` verifies everything is connected correctly.
+
+---
+
+## `vortos:mcp:install`
+
+Detects installed AI clients and writes the MCP server entry into each client's configuration file. Safe to re-run — existing entries are preserved unchanged.
+
+```bash
+php bin/console vortos:mcp:install [--client=<client>] [--global]
+```
+
+**Options**
+
+| Option | Description |
+|---|---|
+| `--client=auto` | Detect installed clients automatically and configure all of them (default) |
+| `--client=claude` | Configure Claude Code only |
+| `--client=cursor` | Configure Cursor only |
+| `--client=windsurf` | Configure Windsurf only |
+| `--client=codex` | Configure Codex only (global config only — see below) |
+| `--client=all` | Configure all known clients regardless of detection |
+| `--global` | Write to the user-level config file (`~/`) instead of the project-level file |
+
+**Default behaviour (`--client=auto`):**
+
+The command scans for config files or directories belonging to each known client. Any client whose config directory exists (even if empty) is considered installed and is configured.
+
+### Output
+
+```
+ Configuring AI clients...
+
+ Claude Code     →  .claude/settings.json          created
+ Cursor          →  .cursor/mcp.json                created
+ Windsurf        not detected — skipped
+ Codex           not detected — skipped
+
+ ✔ Done. Run vortos:mcp:doctor to verify, then restart your AI client.
+```
+
+Status column values:
+
+| Status | Meaning |
+|---|---|
+| `created` | Config file did not exist — created fresh |
+| `updated` | Config file existed — `mcpServers.vortos` entry added |
+| `unchanged` | Entry already present — nothing written |
+| `not detected — skipped` | No config dir or file found for this client |
+
+### What Gets Written
+
+<Tabs items={['Claude Code', 'Cursor', 'Windsurf', 'Codex']}>
+<Tab value="Claude Code">
+
+**File:** `.claude/settings.json`
+
+```json
+{
+  "mcpServers": {
+    "vortos": {
+      "type": "stdio",
+      "command": "php",
+      "args": ["./bin/console", "vortos:mcp:serve"]
+    }
+  }
+}
+```
+
+If `.claude/settings.json` already has other keys (e.g., `permissions`), they are preserved — only the `mcpServers.vortos` key is added.
+</Tab>
+<Tab value="Cursor">
+
+**File:** `.cursor/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "vortos": {
+      "type": "stdio",
+      "command": "php",
+      "args": ["./bin/console", "vortos:mcp:serve"]
+    }
+  }
+}
+```
+</Tab>
+<Tab value="Windsurf">
+
+**File:** `.windsurf/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "vortos": {
+      "type": "stdio",
+      "command": "php",
+      "args": ["./bin/console", "vortos:mcp:serve"]
+    }
+  }
+}
+```
+</Tab>
+<Tab value="Codex">
+
+**File:** `~/.codex/config.toml` (global — Codex does not support project-level config)
+
+```toml
+[mcp_servers.vortos]
+command = "php"
+args = ["./bin/console", "vortos:mcp:serve"]
+```
+
+Codex always uses the global config. Passing `--global` is redundant but harmless.
+</Tab>
+</Tabs>
+
+### Global vs Project Config
+
+By default, the project-level config is written — the path to `bin/console` is relative to the project root. This is correct for most setups.
+
+Use `--global` when:
+- You are configuring Codex (global only)
+- You want the server available across all your Vortos projects from a single Claude Code global config
+
+```bash
+# Write to ~/.claude/settings.json instead of .claude/settings.json
+php bin/console vortos:mcp:install --client=claude --global
+```
+
+<Callout type="warn" title="Global config uses an absolute path">
+When `--global` is used, the install command writes the absolute path to `bin/console` (e.g., `/home/user/projects/myapp/bin/console`). This means the global config only works for the project it was installed from. For multi-project global config, run the install command once per project.
+</Callout>
+
+---
+
+## `vortos:mcp:doctor`
+
+Audits the MCP setup and prints a status report. Run this after `vortos:mcp:install` and any time the setup behaves unexpectedly.
+
+```bash
+php bin/console vortos:mcp:doctor
+```
+
+**No options.**
+
+### Output
+
+```
+ AI Clients
+ ──────────────────────────────────────────────────────────────
+ ✔ Claude Code      detected    configured     .claude/settings.json
+ ✔ Cursor           detected    configured     .cursor/mcp.json
+ - Windsurf         not found   —              —
+ - Codex            not found   —              —
+
+ MCP Server
+ ──────────────────────────────────────────────────────────────
+ Command:    php ./bin/console vortos:mcp:serve
+ Transport:  stdio
+
+ Available Tools (7)
+ ──────────────────────────────────────────────────────────────
+ • get_conventions          Returns Vortos golden rules and naming conventions
+ • get_architecture         Returns layer rules and CQRS/event flow diagrams
+ • get_best_practices       Returns topic-filtered best practices
+ • get_mistakes             Returns common antipatterns with correct alternatives
+ • get_module_docs          Returns API reference for any Vortos module
+ • list_project_modules     Lists installed vortos/* packages from composer.lock
+ • read_project_config      Returns project config/ file contents
+
+ ✔ Setup complete. Restart your AI client to activate the MCP server.
+```
+
+### Reading the Clients Table
+
+| Column | Meaning |
+|---|---|
+| `detected` | The client config file or directory was found |
+| `configured` | The `mcpServers.vortos` entry is present in the config file |
+| `not found` | No sign of this client on the machine |
+
+A client can be `detected` but not `configured` — this happens when the config file exists (from a previous install) but the Vortos entry was removed or was never added. Run `vortos:mcp:install --client=<name>` to fix it.
+
+### Troubleshooting
+
+**Client shows `detected` but not `configured`:**
+```bash
+php bin/console vortos:mcp:install --client=claude
+```
+
+**AI client shows "MCP server failed to start":**
+
+Test the server manually:
+```bash
+php bin/console vortos:mcp:serve
+# Should block waiting for stdin input — press Ctrl+C to exit
+```
+
+If this fails, the issue is in the PHP environment, not the config. Check that `php` is on the PATH that the AI client uses.
+
+**Wrong path in config:**
+
+If the AI client is not in the same directory as the project, the relative `./bin/console` path may not resolve. Use `--global` to write an absolute path, or edit the config file manually:
+
+```json
+{
+  "mcpServers": {
+    "vortos": {
+      "type": "stdio",
+      "command": "php",
+      "args": ["/absolute/path/to/bin/console", "vortos:mcp:serve"]
+    }
+  }
+}
+```
+
+---
+
+## `vortos:mcp:serve`
+
+The server process itself. You do not call this directly — the AI client calls it automatically. Documented here for completeness.
+
+```bash
+php bin/console vortos:mcp:serve
+```
+
+Starts the MCP server in stdio mode. Blocks indefinitely, reading JSON-RPC messages from stdin and writing responses to stdout. Exit with `Ctrl+C`.
+
+<Callout type="info" title="HTTP mode is not yet available">
+The `--http` flag exists in the command but is not yet implemented. HTTP transport support is planned for a future release. Use stdio mode (the default) for all current integrations.
+</Callout>

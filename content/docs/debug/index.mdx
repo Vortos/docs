@@ -39,7 +39,7 @@ Method  Path                  Name              Controller
 GET     /users/{id}           user.show         App\User\Http\UserController::show
 POST    /users                user.create       App\User\Http\UserController::create
 DELETE  /users/{id}           user.delete       App\User\Http\UserController::delete
-GET     /health               health            Vortos\Health\Http\HealthController::__invoke
+GET     /health               health            Vortos\Http\Health\HealthController::__invoke
 ```
 
 ### Options
@@ -167,4 +167,4 @@ Service: App\User\Infrastructure\Repository\UserRepository
 
 **Find what is tagged.** `--tag=vortos.health_check` lists every health check registered in the container. Use this to audit which checks are active in a given environment.
 
-**Debug missing routes.** If a controller route is not responding, `vortos:debug:routes --filter=your-path` confirms whether the route was compiled at all. A missing route means the controller class is not tagged `vortos.api.controller` — check that `#[ApiController]` is present.
+**Debug missing routes.** If a controller route is not responding, `vortos:debug:routes --filter=your-path` confirms whether the route was compiled at all. A missing route means the controller class is not tagged `vortos.api.controller` — check that `#[AsController]` is present.

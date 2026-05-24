@@ -42,12 +42,12 @@ RUN pecl install redis mongodb rdkafka \
 
 RUN mkdir -p /var/log/supervisor
 
-COPY docker/worker/supervisord.conf /etc/supervisord.conf
-
 WORKDIR /var/www/html
 
 CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf"]
 ```
+
+`supervisord.conf` is not baked into the image — it is volume-mounted from `docker/worker/supervisord.conf` at runtime (see [docker-compose.yml](#docker-composeyml) below). This means you can update consumer configuration without rebuilding the image.
 
 <Callout type="info" title="pcntl Extension">
 The `pcntl` extension is required for signal handling. Without it, `SIGTERM` and `SIGINT` signals cannot be caught and the consumer will not shut down gracefully.
@@ -130,6 +130,7 @@ worker:
   restart: always
   volumes:
     - ./:/var/www/html
+    - ./docker/worker/supervisord.conf:/etc/supervisord.conf:ro
   depends_on:
     - kafka
     - write_db
@@ -139,6 +140,116 @@ worker:
 ```
 
 No `command:` override — the Dockerfile `CMD` runs supervisord. `restart: always` ensures the container restarts if it ever exits (e.g. on server reboot).
+
+The `supervisord.conf` volume mount (`:ro`) means consumer configuration is managed in your repository and applied without an image rebuild. After editing `docker/worker/supervisord.conf`, restart the worker container to pick up the changes:
+
+```bash
+docker compose restart worker
+```
+
+## Per-Environment Configuration
+
+Supervisord does not have its own environment concept, but its `[include]` directive lets you split program blocks into separate files. Combined with Docker Compose overrides, this gives you environment-specific worker configurations without duplicating the base supervisord setup.
+
+### Structure
+
+```
+docker/worker/
+  supervisord.conf          ← daemon config + [include] directive only
+  programs/
+    base/
+      outbox-relay.conf     ← always runs in every environment
+    dev/
+      consumers.conf        ← lighter setup for local development
+    prod/
+      consumers.conf        ← full fleet, numprocs tuned for production
+```
+
+**`docker/worker/supervisord.conf`** — stripped down to daemon config and the include:
+
+```ini title="docker/worker/supervisord.conf"
+[supervisord]
+nodaemon=true
+logfile=/var/log/supervisor/supervisord.log
+pidfile=/var/run/supervisord.pid
+
+[unix_http_server]
+file=/var/run/supervisor.sock
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix:///var/run/supervisor.sock
+
+[include]
+files = /etc/supervisor/conf.d/*.conf
+```
+
+**`docker/worker/programs/base/outbox-relay.conf`** — shared across all environments:
+
+```ini
+[program:outbox-relay]
+command=php /var/www/html/bin/console vortos:outbox:relay
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=10
+stdout_logfile=/var/log/supervisor/outbox-relay.out.log
+stderr_logfile=/var/log/supervisor/outbox-relay.err.log
+```
+
+**`docker/worker/programs/dev/consumers.conf`** — single process per consumer for local dev:
+
+```ini
+[program:consumer-user-events]
+command=php /var/www/html/bin/console vortos:consume user.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/user-events.out.log
+stderr_logfile=/var/log/supervisor/user-events.err.log
+```
+
+**`docker/worker/programs/prod/consumers.conf`** — scaled up for production:
+
+```ini
+[program:consumer-user-events]
+command=php /var/www/html/bin/console vortos:consume user.events
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+numprocs=3
+process_name=%(program_name)s_%(process_num)02d
+stdout_logfile=/var/log/supervisor/user-events.out.log
+stderr_logfile=/var/log/supervisor/user-events.err.log
+```
+
+### Docker Compose wiring
+
+Mount the base programs directory and the environment-specific one into `/etc/supervisor/conf.d/`:
+
+```yaml title="docker-compose.yml (dev)"
+worker:
+  volumes:
+    - ./:/var/www/html
+    - ./docker/worker/supervisord.conf:/etc/supervisord.conf:ro
+    - ./docker/worker/programs/base:/etc/supervisor/conf.d/base:ro
+    - ./docker/worker/programs/dev:/etc/supervisor/conf.d/env:ro
+```
+
+```yaml title="docker-compose.prod.yml"
+worker:
+  volumes:
+    - ./:/var/www/html
+    - ./docker/worker/supervisord.conf:/etc/supervisord.conf:ro
+    - ./docker/worker/programs/base:/etc/supervisor/conf.d/base:ro
+    - ./docker/worker/programs/prod:/etc/supervisor/conf.d/env:ro
+```
+
+Supervisord picks up all `.conf` files under `/etc/supervisor/conf.d/` recursively. Swapping the `env` mount is the only difference between environments — the base conf and the supervisord daemon config are identical everywhere.
 
 ## Adding a New Consumer
 
@@ -179,11 +290,12 @@ stderr_logfile=/var/log/supervisor/payment-events.err.log
 
 <Step>
 
-### Rebuild and restart the worker container
+### Restart the worker container
+
+Because `supervisord.conf` is volume-mounted, no image rebuild is needed — just restart:
 
 ```bash
-docker compose build worker
-docker compose up -d worker
+docker compose restart worker
 ```
 
 </Step>
