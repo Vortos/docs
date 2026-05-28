@@ -18,8 +18,8 @@ declare(strict_types=1);
 
 namespace App\Billing\Application\Handler;
 
-use Vortos\Ses\Contract\MailerInterface;
-use Vortos\Ses\ValueObject\Email;
+use Vortos\AwsSes\Contract\MailerInterface;
+use Vortos\AwsSes\ValueObject\Email;
 
 final class SendReceiptHandler
 {
@@ -38,7 +38,7 @@ final class SendReceiptHandler
 }
 ```
 
-When `from` is omitted, the package uses `defaultFrom()` from `config/ses.php`.
+When `from` is omitted, the package uses `defaultFrom()` from `config/aws_ses.php`.
 
 ## Recipients
 
@@ -57,8 +57,8 @@ Email::new()
 ## Attachments
 
 ```php
-use Vortos\Ses\ValueObject\Attachment;
-use Vortos\Ses\ValueObject\Email;
+use Vortos\AwsSes\ValueObject\Attachment;
+use Vortos\AwsSes\ValueObject\Email;
 
 $email = Email::new()
     ->to('customer@example.com')
@@ -108,8 +108,8 @@ Use `StandaloneMailerInterface` in maintenance commands when the outbox write sh
 Use `ImmediateMailerInterface` for diagnostics or operational probes.
 
 ```php
-use Vortos\Ses\Contract\ImmediateMailerInterface;
-use Vortos\Ses\ValueObject\Email;
+use Vortos\AwsSes\Contract\ImmediateMailerInterface;
+use Vortos\AwsSes\ValueObject\Email;
 
 final class SesProbe
 {
@@ -132,10 +132,10 @@ final class SesProbe
 Use middleware for cross-cutting policy, not ad hoc checks in every handler.
 
 ```php
-use Vortos\Ses\Attribute\AsEmailMiddleware;
-use Vortos\Ses\Contract\EmailMiddlewareInterface;
-use Vortos\Ses\ValueObject\Email;
-use Vortos\Ses\ValueObject\SentEmail;
+use Vortos\AwsSes\Attribute\AsEmailMiddleware;
+use Vortos\AwsSes\Contract\EmailMiddlewareInterface;
+use Vortos\AwsSes\ValueObject\Email;
+use Vortos\AwsSes\ValueObject\SentEmail;
 
 #[AsEmailMiddleware(priority: 500)]
 final class TenantHeaderMiddleware implements EmailMiddlewareInterface

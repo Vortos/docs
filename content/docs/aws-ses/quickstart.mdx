@@ -17,7 +17,7 @@ This guide gets a project from zero to a production-ready SES integration with t
 ### Install The Package
 
 ```bash
-composer require vortos/vortos-ses
+composer require vortos/vortos-aws-ses
 ```
 
 </Step>
@@ -27,11 +27,11 @@ composer require vortos/vortos-ses
 ### Register The Package
 
 ```php title="bootstrap/app.php"
-use Vortos\Ses\DependencyInjection\SesPackage;
+use Vortos\AwsSes\DependencyInjection\AwsSesPackage;
 
 $packages = [
     // ... other packages
-    new SesPackage(),
+    new AwsSesPackage(),
 ];
 ```
 
@@ -72,16 +72,16 @@ SES_FROM_ADDRESS=no-reply@example.test
 
 ### Publish Or Create Config
 
-The package works from environment variables alone. For explicit project config, create `config/ses.php`:
+The package works from environment variables alone. For explicit project config, create `config/aws_ses.php`:
 
-```php title="config/ses.php"
+```php title="config/aws_ses.php"
 <?php
 
 declare(strict_types=1);
 
-use Vortos\Ses\DependencyInjection\VortosSesConfig;
+use Vortos\AwsSes\DependencyInjection\VortosAwsSesConfig;
 
-return static function (VortosSesConfig $config): void {
+return static function (VortosAwsSesConfig $config): void {
     $config
         ->driver($_ENV['VORTOS_MAILER_DRIVER'] ?? 'log')
         ->region($_ENV['AWS_SES_REGION'] ?? 'us-east-1')
@@ -100,9 +100,9 @@ return static function (VortosSesConfig $config): void {
 
 The SES package ships migrations for:
 
-- `ses_suppression_list`
-- `ses_outbox`
-- `ses_audit_log`
+- `aws_ses_suppression_list`
+- `aws_ses_outbox`
+- `aws_ses_audit_log`
 
 Run your normal Vortos migration command after registering the package.
 
@@ -115,7 +115,7 @@ Run your normal Vortos migration command after registering the package.
 If outbox is enabled, production needs the relay worker:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
 ```
 
 Then reload your worker container or supervisor process according to your deployment runbook.
@@ -176,7 +176,7 @@ Keep IAM credentials out of source control. Rotate them through your secret mana
 - Configure `SES_FROM_ADDRESS`.
 - Tune `rateLimit()->maxSendRate()` to match the SES account quota.
 - Run package migrations.
-- Install `ses-outbox-relay` through `vortos:worker:install`.
+- Install `aws-ses-outbox-relay` through `vortos:worker:install`.
 - Configure SNS bounce and complaint webhooks.
 - Confirm logs, metrics, and traces are visible in the framework observability stack.
 

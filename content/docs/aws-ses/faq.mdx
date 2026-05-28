@@ -7,11 +7,11 @@ description: Common questions about the Vortos AWS SES package.
 
 ## Can I Use SES With No Config File?
 
-Yes. Install the package, register `SesPackage`, set the required env vars, and use `MailerInterface`.
+Yes. Install the package, register `AwsSesPackage`, set the required env vars, and use `MailerInterface`.
 
 ## Is The Package Optional?
 
-Yes. Projects that do not install or register `vortos/vortos-ses` do not get SES services, commands, tables, or workers.
+Yes. Projects that do not install or register `vortos/vortos-aws-ses` do not get SES services, commands, tables, or workers.
 
 ## Can I Disable Logs, Metrics, Or Tracing?
 
@@ -24,7 +24,7 @@ $config->observability()
     ->metrics(false);
 ```
 
-You can also disable only specific sections with `SesObservabilitySection`.
+You can also disable only specific sections with `AwsSesObservabilitySection`.
 
 ## Why Are There Separate Messaging, SES, And Object Store Outbox Tables?
 
@@ -35,7 +35,7 @@ They have different payloads, retry semantics, workers, and operational indexes.
 No. Vortos can generate and maintain managed supervisor blocks, but production process management is an explicit deployment action:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
 ```
 
 ## Can I Send Directly Without Outbox?

@@ -8,10 +8,10 @@ import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # AWS SES
 
-`vortos/vortos-ses` is the first-class email package for Vortos. It gives application code a small typed API while the package owns the enterprise concerns: SES transport mapping, transactional outbox, worker relay, rate limiting, suppression lists, bounce and complaint webhooks, audit logging, metrics, logs, traces, and testing fakes.
+`vortos/vortos-aws-ses` is the first-class email package for Vortos. It gives application code a small typed API while the package owns the enterprise concerns: SES transport mapping, transactional outbox, worker relay, rate limiting, suppression lists, bounce and complaint webhooks, audit logging, metrics, logs, traces, and testing fakes.
 
 <Callout type="info" title="The application API stays small">
-Most business code injects `Vortos\Ses\Contract\MailerInterface` and calls `send()`. The selected driver, middleware stack, outbox behavior, retry policy, and observability are configured once at the package boundary.
+Most business code injects `Vortos\AwsSes\Contract\MailerInterface` and calls `send()`. The selected driver, middleware stack, outbox behavior, retry policy, and observability are configured once at the package boundary.
 </Callout>
 
 ## What The Package Guarantees
@@ -40,9 +40,9 @@ The package also prevents common production mistakes:
 Vortos does not hide delivery guarantees behind one ambiguous config switch. The interface you inject tells reviewers exactly what will happen.
 
 ```php
-use Vortos\Ses\Contract\MailerInterface;
-use Vortos\Ses\Contract\StandaloneMailerInterface;
-use Vortos\Ses\Contract\ImmediateMailerInterface;
+use Vortos\AwsSes\Contract\MailerInterface;
+use Vortos\AwsSes\Contract\StandaloneMailerInterface;
+use Vortos\AwsSes\Contract\ImmediateMailerInterface;
 
 final class RegistrationHandler
 {
@@ -52,7 +52,7 @@ final class RegistrationHandler
 }
 ```
 
-`MailerInterface` is the normal application path. When outbox is enabled, it writes to `ses_outbox` and requires an active CommandBus or UnitOfWork transaction.
+`MailerInterface` is the normal application path. When outbox is enabled, it writes to `aws_ses_outbox` and requires an active CommandBus or UnitOfWork transaction.
 
 `StandaloneMailerInterface` opens a short transaction for only the email outbox row. Use it for maintenance commands or scripts that want async reliability without joining a domain transaction.
 
@@ -80,7 +80,7 @@ Transactional Outbox Writer
     |
     | same DB transaction as domain save
     v
-ses_outbox
+aws_ses_outbox
     |
     | vortos:ses:outbox:relay
     v
@@ -114,11 +114,11 @@ AWS SNS -> /webhooks/aws/ses -> SNS signature verifier
 ## Package Registration
 
 ```php title="bootstrap/app.php"
-use Vortos\Ses\DependencyInjection\SesPackage;
+use Vortos\AwsSes\DependencyInjection\AwsSesPackage;
 
 $packages = [
     // ... other packages
-    new SesPackage(),
+    new AwsSesPackage(),
 ];
 ```
 

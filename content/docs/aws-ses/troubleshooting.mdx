@@ -36,7 +36,7 @@ This is expected for the transactional path. Call it from a command handler thro
 
 Check:
 
-- Is `ses-outbox-relay` installed in supervisor?
+- Is `aws-ses-outbox-relay` installed in supervisor?
 - Is the worker container running?
 - Does `php bin/console vortos:ses:outbox:relay --once` process rows?
 - Are provider credentials valid inside the worker container?

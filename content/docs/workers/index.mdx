@@ -21,8 +21,8 @@ Messaging is part of the framework baseline. SES, Object Store, and future packa
 ```bash
 php bin/console vortos:worker:list
 php bin/console vortos:worker:install
-php bin/console vortos:worker:install --worker=ses-outbox-relay
-php bin/console vortos:worker:remove ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
+php bin/console vortos:worker:remove aws-ses-outbox-relay
 ```
 
 ## Registered Workers
@@ -32,7 +32,7 @@ Current package workers:
 | Worker | Command | Package |
 | --- | --- | --- |
 | `messaging-outbox-relay` | `php /var/www/html/bin/console vortos:outbox:relay` | Messaging |
-| `ses-outbox-relay` | `php /var/www/html/bin/console vortos:ses:outbox:relay` | AWS SES |
+| `aws-ses-outbox-relay` | `php /var/www/html/bin/console vortos:ses:outbox:relay` | AWS SES |
 | `object-store-outbox-relay` | `php /var/www/html/bin/console vortos:object-store:relay` | Object Store |
 
 ## Documentation Map
@@ -65,7 +65,7 @@ php bin/console vortos:worker:install
 Install one or more workers:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay --worker=object-store-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay --worker=object-store-outbox-relay
 ```
 
 Preview:

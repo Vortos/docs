@@ -32,8 +32,8 @@ php bin/console vortos:worker:install
 Install selected workers:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay
-php bin/console vortos:worker:install --worker=ses-outbox-relay --worker=object-store-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay --worker=object-store-outbox-relay
 ```
 
 Write to a non-default supervisor path:
@@ -51,9 +51,9 @@ php bin/console vortos:worker:install --dry-run
 ## Remove Workers
 
 ```bash
-php bin/console vortos:worker:remove ses-outbox-relay
-php bin/console vortos:worker:remove ses-outbox-relay object-store-outbox-relay
-php bin/console vortos:worker:remove ses-outbox-relay --dry-run
+php bin/console vortos:worker:remove aws-ses-outbox-relay
+php bin/console vortos:worker:remove aws-ses-outbox-relay object-store-outbox-relay
+php bin/console vortos:worker:remove aws-ses-outbox-relay --dry-run
 ```
 
 ## Managed Block Model
@@ -69,14 +69,14 @@ The command updates files. It does not call `supervisorctl reread`, `supervisorc
 ## Example Generated Program
 
 ```ini
-[program:ses-outbox-relay]
+[program:aws-ses-outbox-relay]
 command=php /var/www/html/bin/console vortos:ses:outbox:relay
 autostart=true
 autorestart=true
 startsecs=3
 stopwaitsecs=30
-stdout_logfile=/var/log/supervisor/ses-outbox-relay.out.log
-stderr_logfile=/var/log/supervisor/ses-outbox-relay.err.log
+stdout_logfile=/var/log/supervisor/aws-ses-outbox-relay.out.log
+stderr_logfile=/var/log/supervisor/aws-ses-outbox-relay.err.log
 ```
 
 ## Deployment Pattern

@@ -12,8 +12,8 @@ The SES outbox protects business workflows from partial failure. The command han
 ## Normal Command Handler Flow
 
 ```php
-use Vortos\Ses\Contract\MailerInterface;
-use Vortos\Ses\ValueObject\Email;
+use Vortos\AwsSes\Contract\MailerInterface;
+use Vortos\AwsSes\ValueObject\Email;
 
 final class ApproveRegistrationHandler
 {
@@ -39,7 +39,7 @@ final class ApproveRegistrationHandler
 }
 ```
 
-When this handler is invoked through the Vortos command bus, the UnitOfWork transaction is already active. The repository write and `ses_outbox` write commit together.
+When this handler is invoked through the Vortos command bus, the UnitOfWork transaction is already active. The repository write and `aws_ses_outbox` write commit together.
 
 <Callout type="warn" title="Transactional interfaces fail fast outside a transaction">
 If you call `MailerInterface` outside the command bus transaction path while outbox is enabled, Vortos throws instead of silently creating non-atomic behavior. Use `StandaloneMailerInterface` or `ImmediateMailerInterface` for intentional direct usage.
@@ -50,7 +50,7 @@ If you call `MailerInterface` outside the command bus transaction path while out
 Use `StandaloneMailerInterface` when you want the outbox and retries, but the email is not part of a domain transaction.
 
 ```php
-use Vortos\Ses\Contract\StandaloneMailerInterface;
+use Vortos\AwsSes\Contract\StandaloneMailerInterface;
 
 final class SendDigestCommand
 {
@@ -81,7 +81,7 @@ php bin/console vortos:ses:outbox:relay --sleep=2
 Install it into managed supervisor config:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
 ```
 
 See [Workers](/docs/workers) for supervisor management, deployment, and reload guidance.

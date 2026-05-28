@@ -19,7 +19,7 @@ Default route:
 
 Override it:
 
-```php title="config/ses.php"
+```php title="config/aws_ses.php"
 $config->webhooks()
     ->enabled(true)
     ->routePath('/internal/webhooks/ses');
@@ -38,9 +38,9 @@ At AWS level:
 ## Bounce Handlers
 
 ```php
-use Vortos\Ses\Attribute\AsBounceHandler;
-use Vortos\Ses\Contract\BounceHandlerInterface;
-use Vortos\Ses\Webhook\BounceNotification;
+use Vortos\AwsSes\Attribute\AsBounceHandler;
+use Vortos\AwsSes\Contract\BounceHandlerInterface;
+use Vortos\AwsSes\Webhook\BounceNotification;
 
 #[AsBounceHandler]
 final class MarkEmailBouncedHandler implements BounceHandlerInterface
@@ -63,9 +63,9 @@ php bin/console vortos:ses:make:bounce-handler MarkEmailBounced --context=Notifi
 ## Complaint Handlers
 
 ```php
-use Vortos\Ses\Attribute\AsComplaintHandler;
-use Vortos\Ses\Contract\ComplaintHandlerInterface;
-use Vortos\Ses\Webhook\ComplaintNotification;
+use Vortos\AwsSes\Attribute\AsComplaintHandler;
+use Vortos\AwsSes\Contract\ComplaintHandlerInterface;
+use Vortos\AwsSes\Webhook\ComplaintNotification;
 
 #[AsComplaintHandler]
 final class UnsubscribeComplaintRecipientHandler implements ComplaintHandlerInterface
@@ -85,11 +85,11 @@ php bin/console vortos:ses:make:complaint-handler UnsubscribeComplaintRecipient 
 
 ## Local Suppression List
 
-The package stores suppressed recipients in `ses_suppression_list` by default. Sending behavior is configured with `onSuppressed()`.
+The package stores suppressed recipients in `aws_ses_suppression_list` by default. Sending behavior is configured with `onSuppressed()`.
 
 ```php
 $config->suppression()
-    ->tableName('ses_suppression_list')
+    ->tableName('aws_ses_suppression_list')
     ->onSuppressed('throw');
 ```
 

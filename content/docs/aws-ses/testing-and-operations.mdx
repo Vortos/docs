@@ -11,20 +11,20 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 Use the `null` driver in automated tests:
 
-```php title="config/test/ses.php"
-use Vortos\Ses\DependencyInjection\VortosSesConfig;
+```php title="config/test/aws_ses.php"
+use Vortos\AwsSes\DependencyInjection\VortosAwsSesConfig;
 
-return static function (VortosSesConfig $config): void {
+return static function (VortosAwsSesConfig $config): void {
     $config->driver('null');
 };
 ```
 
-The package includes `Vortos\Ses\Testing\SesMailerFake` for assertions.
+The package includes `Vortos\AwsSes\Testing\SesMailerFake` for assertions.
 
 ## Functional Test Pattern
 
 ```php
-use Vortos\Ses\Testing\SesMailerFake;
+use Vortos\AwsSes\Testing\SesMailerFake;
 
 final class RegistrationNotificationTest extends TestCase
 {
@@ -50,7 +50,7 @@ php bin/console vortos:ses:outbox:relay --once
 php bin/console vortos:ses:suppression:sync
 php bin/console vortos:ses:suppression:sync --dry-run
 php bin/console vortos:ses:suppression:list
-php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
 ```
 
 Make commands, when the Make package is installed:
@@ -72,13 +72,13 @@ php bin/console vortos:worker:list
 Install the SES relay:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay
 ```
 
 Preview without writing:
 
 ```bash
-php bin/console vortos:worker:install --worker=ses-outbox-relay --dry-run
+php bin/console vortos:worker:install --worker=aws-ses-outbox-relay --dry-run
 ```
 
 See [Worker Supervisor](/docs/workers/supervisor) for managed block behavior and deployment notes.

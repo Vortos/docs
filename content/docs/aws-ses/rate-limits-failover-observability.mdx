@@ -11,7 +11,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 SES accounts have send-rate quotas. Configure Vortos to match your account instead of discovering the limit through throttling.
 
-```php title="config/ses.php"
+```php title="config/aws_ses.php"
 $config->rateLimit()
     ->maxSendRate(14)
     ->burst(14)
@@ -76,12 +76,12 @@ $config->observability()
 Section-level opt-out:
 
 ```php
-use Vortos\Ses\Config\SesObservabilitySection;
+use Vortos\AwsSes\Config\AwsSesObservabilitySection;
 
 $config->observability()
-    ->disableLoggingFor(SesObservabilitySection::RateLimit)
-    ->disableTracingFor(SesObservabilitySection::Webhook)
-    ->disableMetricsFor(SesObservabilitySection::Audit);
+    ->disableLoggingFor(AwsSesObservabilitySection::RateLimit)
+    ->disableTracingFor(AwsSesObservabilitySection::Webhook)
+    ->disableMetricsFor(AwsSesObservabilitySection::Audit);
 ```
 
 Typed sections:
