@@ -1,0 +1,114 @@
+---
+title: Outbox And Transactions
+description: Atomic email intent, relay workers, retries, and supervisor setup.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Outbox And Transactions
+
+The SES outbox protects business workflows from partial failure. The command handler records "an email must be sent" in the same database transaction as the domain change. The relay worker performs the provider call later.
+
+## Normal Command Handler Flow
+
+```php
+use Vortos\Ses\Contract\MailerInterface;
+use Vortos\Ses\ValueObject\Email;
+
+final class ApproveRegistrationHandler
+{
+    public function __construct(
+        private readonly RegistrationRepository $registrations,
+        private readonly MailerInterface $mailer,
+    ) {}
+
+    public function handle(ApproveRegistration $command): void
+    {
+        $registration = $this->registrations->get($command->registrationId);
+        $registration->approve();
+
+        $this->registrations->save($registration);
+
+        $this->mailer->send(
+            Email::new()
+                ->to($registration->email())
+                ->subject('Registration approved')
+                ->textBody('Your registration has been approved.'),
+        );
+    }
+}
+```
+
+When this handler is invoked through the Vortos command bus, the UnitOfWork transaction is already active. The repository write and `ses_outbox` write commit together.
+
+<Callout type="warn" title="Transactional interfaces fail fast outside a transaction">
+If you call `MailerInterface` outside the command bus transaction path while outbox is enabled, Vortos throws instead of silently creating non-atomic behavior. Use `StandaloneMailerInterface` or `ImmediateMailerInterface` for intentional direct usage.
+</Callout>
+
+## Standalone Async Email
+
+Use `StandaloneMailerInterface` when you want the outbox and retries, but the email is not part of a domain transaction.
+
+```php
+use Vortos\Ses\Contract\StandaloneMailerInterface;
+
+final class SendDigestCommand
+{
+    public function __construct(private readonly StandaloneMailerInterface $mailer) {}
+
+    public function __invoke(): void
+    {
+        $this->mailer->send($this->buildDigestEmail());
+    }
+}
+```
+
+## Relay Worker
+
+Run the worker in production:
+
+```bash
+php bin/console vortos:ses:outbox:relay
+```
+
+Useful modes:
+
+```bash
+php bin/console vortos:ses:outbox:relay --once
+php bin/console vortos:ses:outbox:relay --sleep=2
+```
+
+Install it into managed supervisor config:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+See [Workers](/docs/workers) for supervisor management, deployment, and reload guidance.
+
+## Retry Behavior
+
+The relay reads pending rows, marks work in progress, calls the mailer, and records success or failure. Failed rows are retried with backoff until `maxDeliveryAttempts()` is reached.
+
+Tune retry behavior in config:
+
+```php
+$config->outbox()
+    ->batchSize(100)
+    ->maxDeliveryAttempts(8)
+    ->backoffBaseSeconds(15)
+    ->backoffCapSeconds(1800)
+    ->staleMessageTimeoutSeconds(300);
+```
+
+## Table Ownership
+
+The SES outbox table belongs to the SES package. Messaging and Object Store have their own outbox tables because they have different payloads, retry semantics, and workers. They are made atomic by sharing the same UnitOfWork transaction, not by sharing one table.
+
+## Performance Notes
+
+- The HTTP request writes a small outbox row, not a network call to SES.
+- Worker throughput is controlled by batch size, SES rate limits, and supervisor process count.
+- Large email attachments increase outbox payload size. Prefer object-store links for large files.
+- Use one relay worker process until account quotas and database metrics prove you need more.
+

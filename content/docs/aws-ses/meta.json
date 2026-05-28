@@ -1,0 +1,15 @@
+{
+  "title": "AWS SES",
+  "pages": [
+    "index",
+    "quickstart",
+    "configuration",
+    "sending",
+    "outbox-and-transactions",
+    "webhooks-and-suppression",
+    "rate-limits-failover-observability",
+    "testing-and-operations",
+    "troubleshooting",
+    "faq"
+  ]
+}

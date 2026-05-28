@@ -197,7 +197,7 @@ php bin/console vortos:make:projection-handler <name> \
 php bin/console vortos:make:projection-handler UserRegistered \
     --context=User \
     --consumer=user.events \
-    --event=UserRegisteredEvent \
+    --event=UserRegistered \
     --handler-id=user.projection.registered
 ```
 
@@ -216,7 +216,7 @@ declare(strict_types=1);
 
 namespace App\User\Application\Projection;
 
-use App\User\Domain\Event\UserRegisteredEvent;
+use App\User\Domain\Event\UserRegistered;
 use Vortos\Messaging\Attribute\AsEventHandler;
 
 #[AsEventHandler(
@@ -229,7 +229,7 @@ final class UserRegisteredProjectionHandler
         // inject read repository here
     ) {}
 
-    public function __invoke(UserRegisteredEvent $event): void
+    public function __invoke(UserRegistered $event): void
     {
         // write to the read model here
         // always use upsert — Kafka delivers at-least-once

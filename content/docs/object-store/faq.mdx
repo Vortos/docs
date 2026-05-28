@@ -1,0 +1,65 @@
+---
+title: Object Store FAQ
+description: Common questions about Vortos Object Store.
+---
+
+# Object Store FAQ
+
+## Why Use S3 Semantics For R2?
+
+R2 intentionally supports S3-compatible object APIs. S3 semantics give Vortos one stable object-store contract across R2, S3, and compatible providers.
+
+## Should Large Uploads Touch PHP?
+
+No for public uploads. Use direct-to-cloud presigned upload intents. PHP should issue short-lived credentials and later promote object keys.
+
+## Is Server-Side Multipart Useless Then?
+
+No. It is for trusted backend-owned transfers: imports, exports, migrations, and CLI jobs. It is not the browser upload path.
+
+## Can I Disable Logs, Metrics, Or Traces?
+
+Yes globally:
+
+```php
+$config->observability()->logging(false)->tracing(false)->metrics(false);
+```
+
+or by typed section:
+
+```php
+$config->observability()
+    ->disableLoggingFor(ObjectStoreObservabilitySection::Presign);
+```
+
+## Can Temporary Cleanup Be Configured Through R2 Or S3 APIs?
+
+Yes. Use:
+
+```bash
+php bin/console vortos:object-store:lifecycle plan
+php bin/console vortos:object-store:lifecycle apply --confirm
+```
+
+The command manages the Vortos rule and preserves unrelated provider lifecycle rules.
+
+## Does Lifecycle Apply Automatically?
+
+No. It is an infrastructure mutation and must be explicit.
+
+## Can I Use Outbox Without Joining A Domain Transaction?
+
+Yes. Inject `StandaloneObjectStoreInterface` or `StandaloneDirectUploadManagerInterface`.
+
+## Can I Bypass Outbox?
+
+Yes. Inject `ImmediateObjectStoreInterface` or `ImmediateDirectUploadManagerInterface`.
+
+## Where Does Malware Scanning Belong?
+
+The package provides middleware and promotion policy extension points. The actual malware scanner, quarantine bucket, and scan workflow are userland or a future optional package because scanner choices vary by domain and infrastructure.
+
+## Does The Package Use LocalStack?
+
+No. Provider integration tests should use real R2/S3 credentials in protected CI jobs.
+

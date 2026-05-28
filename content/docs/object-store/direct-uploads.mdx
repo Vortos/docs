@@ -1,0 +1,137 @@
+---
+title: Direct Uploads
+description: Create temporary upload intents so browsers upload directly to R2 or S3.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Direct Uploads
+
+Direct uploads are the default public file upload pattern. The frontend asks for an upload intent, uploads the binary directly to R2 or S3, then submits application data containing the temporary object key.
+
+## Flow
+
+```text
+Browser
+  |
+  | 1. POST /upload-intents { fileName, contentType, size }
+  v
+Vortos API
+  |
+  | 2. DirectUploadManagerInterface::createUploadIntent()
+  v
+R2/S3 presigned upload
+  ^
+  | 3. Browser PUT/POST file directly to object storage
+  |
+Browser
+  |
+  | 4. Submit domain command with tmp object key
+  v
+Command Handler
+  |
+  | 5. promote tmp key to permanent key through outbox
+```
+
+## Backend Intent Creation
+
+```php
+use Vortos\ObjectStore\Contract\DirectUploadManagerInterface;
+use Vortos\ObjectStore\ValueObject\TemporaryUploadUrlOptions;
+
+final class CreateAvatarUploadIntentHandler
+{
+    public function __construct(private readonly DirectUploadManagerInterface $uploads) {}
+
+    public function handle(CreateAvatarUploadIntent $command): AvatarUploadIntentDto
+    {
+        $temporaryKey = sprintf(
+            'tmp/users/%s/avatar-%s',
+            $command->userId,
+            bin2hex(random_bytes(16)),
+        );
+
+        $intent = $this->uploads->createUploadIntent(
+            $temporaryKey,
+            TemporaryUploadUrlOptions::forDirectUpload(
+                ttlSeconds: 900,
+                contentType: $command->contentType,
+                maxSizeBytes: 5_000_000,
+            ),
+        );
+
+        return AvatarUploadIntentDto::fromIntent($intent);
+    }
+}
+```
+
+The package enforces that direct-upload keys are under the configured temporary prefix, `tmp/` by default.
+
+## Frontend Upload
+
+For signed PUT uploads, the frontend sends the exact headers required by the intent.
+
+```ts
+const intent = await fetch('/upload-intents/avatar', {
+  method: 'POST',
+  body: JSON.stringify({
+    fileName: file.name,
+    contentType: file.type,
+    size: file.size,
+  }),
+}).then((response) => response.json());
+
+await fetch(intent.upload.url, {
+  method: 'PUT',
+  headers: intent.upload.headers,
+  body: file,
+});
+
+await fetch('/profile/avatar', {
+  method: 'POST',
+  body: JSON.stringify({
+    temporaryKey: intent.temporaryKey,
+  }),
+});
+```
+
+## Constraints
+
+Use `TemporaryUploadUrlOptions::forDirectUpload()` to bind upload constraints:
+
+```php
+TemporaryUploadUrlOptions::forDirectUpload(
+    ttlSeconds: 900,
+    contentType: 'video/mp4',
+    maxSizeBytes: 209_715_200,
+);
+```
+
+Supported providers can enforce these constraints through signed PUT headers or POST policy conditions. The backend should still validate the resulting object metadata before promotion when content safety matters.
+
+<Callout type="warn" title="Do not trust client file names for permanent keys">
+Client file names are display metadata, not storage paths. Generate permanent keys server-side using stable domain IDs and random suffixes.
+</Callout>
+
+## Content-Type Policy
+
+Allow only the content types the use case needs:
+
+```php
+if (!in_array($command->contentType, ['image/jpeg', 'image/png'], true)) {
+    throw new \InvalidArgumentException('Unsupported avatar type.');
+}
+```
+
+## Size Policy
+
+Reject impossible sizes before presigning:
+
+```php
+if ($command->size <= 0 || $command->size > 5_000_000) {
+    throw new \InvalidArgumentException('Avatar must be at most 5 MB.');
+}
+```
+
+The package-level `maxUploadSizeBytes()` is a global guard. Domain-specific limits should be stricter.
+

@@ -1,0 +1,89 @@
+---
+title: Object Store Troubleshooting
+description: Diagnose common R2, S3, presign, outbox, lifecycle, and multipart issues.
+---
+
+# Object Store Troubleshooting
+
+## Presigned Upload Fails With 403
+
+Check:
+
+- The browser uses the exact HTTP method returned by the intent.
+- The browser sends required signed headers exactly.
+- The object key is under the temporary prefix.
+- The URL has not expired.
+- The content type matches the signed content type.
+- Provider credentials can write to the bucket.
+- R2 account ID, endpoint, and region are correct.
+
+## `DirectUploadManagerInterface` Throws Outside Transaction
+
+This is expected for the transactional path when outbox is enabled. Call it from a command handler through the command bus, or inject:
+
+- `StandaloneDirectUploadManagerInterface` for standalone async outbox writes.
+- `ImmediateDirectUploadManagerInterface` for direct provider calls.
+
+## Outbox Rows Are Pending
+
+Check:
+
+- `object-store-outbox-relay` is installed in supervisor.
+- Worker container is running.
+- `php bin/console vortos:object-store:relay --once` processes work.
+- Credentials inside the worker can copy and delete objects.
+- Temporary source objects still exist.
+- Provider throttling is not blocking relay throughput.
+
+## Lifecycle Plan Fails
+
+Check:
+
+- Runtime credential has lifecycle read permissions.
+- Deployment credential has lifecycle write permissions for apply/remove.
+- `orphanTtlSeconds()` is at least `86400`, or `roundUpMinimumLifecycleDay(true)` is deliberate.
+- Provider supports S3-compatible lifecycle APIs.
+
+## Temporary Objects Accumulate
+
+Possible causes:
+
+- Users upload but never submit final commands.
+- Frontend failed after upload.
+- Promotion worker is down.
+- Lifecycle rule was not applied.
+- Temporary prefix config does not match uploaded keys.
+
+Run:
+
+```bash
+php bin/console vortos:object-store:lifecycle show
+php bin/console vortos:object-store:relay --once
+```
+
+## Multipart Uploads Accumulate
+
+Run:
+
+```bash
+php bin/console vortos:object-store:multipart list
+php bin/console vortos:object-store:multipart abort-stale --older-than="-24 hours" --dry-run
+php bin/console vortos:object-store:multipart abort-stale --older-than="-24 hours" --confirm
+```
+
+Also confirm failed backend jobs are aborting uploads and `abortOnFailure(true)` is enabled.
+
+## Memory Usage Spikes
+
+Do not proxy public uploads through PHP. For backend-owned transfers, lower multipart part size and concurrency. For direct object `put()` calls through outbox, keep inline payloads below `maxInlinePayloadBytes()`.
+
+## Public URL Is Wrong
+
+Set:
+
+```php
+$config->bucketConfig()->publicBaseUrl('https://cdn.example.com');
+```
+
+Use temporary download URLs for private files.
+

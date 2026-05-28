@@ -1,0 +1,17 @@
+{
+  "title": "Object Store",
+  "pages": [
+    "index",
+    "quickstart",
+    "configuration",
+    "direct-uploads",
+    "outbox-and-promotions",
+    "lifecycle-cleanup",
+    "server-side-multipart",
+    "security-and-routing",
+    "observability",
+    "testing-and-operations",
+    "troubleshooting",
+    "faq"
+  ]
+}

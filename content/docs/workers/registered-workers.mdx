@@ -1,0 +1,92 @@
+---
+title: Registered Workers
+description: Worker definitions contributed by Vortos packages.
+---
+
+# Registered Workers
+
+Vortos workers are contributed by packages through the Docker worker registry. A worker appears only when the package that owns it is installed and registered.
+
+## Messaging
+
+Worker:
+
+```text
+messaging-outbox-relay
+```
+
+Command:
+
+```bash
+php /var/www/html/bin/console vortos:outbox:relay
+```
+
+Purpose:
+
+Relays transactional messaging outbox rows to the configured broker.
+
+Install:
+
+```bash
+php bin/console vortos:worker:install --worker=messaging-outbox-relay
+```
+
+## AWS SES
+
+Worker:
+
+```text
+ses-outbox-relay
+```
+
+Command:
+
+```bash
+php /var/www/html/bin/console vortos:ses:outbox:relay
+```
+
+Purpose:
+
+Relays `ses_outbox` rows to the configured mailer driver.
+
+Install:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+## Object Store
+
+Worker:
+
+```text
+object-store-outbox-relay
+```
+
+Command:
+
+```bash
+php /var/www/html/bin/console vortos:object-store:relay
+```
+
+Purpose:
+
+Relays object-store outbox operations such as promotion, copy, move, put, and delete.
+
+Install:
+
+```bash
+php bin/console vortos:worker:install --worker=object-store-outbox-relay
+```
+
+## Future Packages
+
+Future optional packages can contribute workers without changing application code. For example, a payments package can add a payment outbox relay. The project then runs:
+
+```bash
+php bin/console vortos:worker:list
+php bin/console vortos:worker:install --worker=payment-outbox-relay
+```
+
+The package owns worker definition. The application owns deployment.
+

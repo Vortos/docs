@@ -1,0 +1,104 @@
+---
+title: Supervisor Management
+description: Use Vortos-managed supervisor blocks for package workers.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Supervisor Management
+
+`vortos:worker:install` writes managed worker blocks to the configured supervisor file. By default, the path is:
+
+```text
+docker/worker/supervisord.conf
+```
+
+## List Workers
+
+```bash
+php bin/console vortos:worker:list
+```
+
+The command shows the worker name, command, and description for every worker contributed by installed packages.
+
+## Install Workers
+
+Install all registered workers:
+
+```bash
+php bin/console vortos:worker:install
+```
+
+Install selected workers:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=ses-outbox-relay --worker=object-store-outbox-relay
+```
+
+Write to a non-default supervisor path:
+
+```bash
+php bin/console vortos:worker:install --path=docker/worker/programs/vortos.conf
+```
+
+Preview:
+
+```bash
+php bin/console vortos:worker:install --dry-run
+```
+
+## Remove Workers
+
+```bash
+php bin/console vortos:worker:remove ses-outbox-relay
+php bin/console vortos:worker:remove ses-outbox-relay object-store-outbox-relay
+php bin/console vortos:worker:remove ses-outbox-relay --dry-run
+```
+
+## Managed Block Model
+
+The command owns only Vortos-managed worker blocks. Existing supervisor daemon settings, custom programs, and non-Vortos sections are preserved.
+
+This means teams can keep hand-written custom workers next to generated package workers without losing local config.
+
+<Callout type="warn" title="Install does not reload supervisor">
+The command updates files. It does not call `supervisorctl reread`, `supervisorctl update`, or restart containers. Process reload is deployment-specific and stays explicit.
+</Callout>
+
+## Example Generated Program
+
+```ini
+[program:ses-outbox-relay]
+command=php /var/www/html/bin/console vortos:ses:outbox:relay
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+stdout_logfile=/var/log/supervisor/ses-outbox-relay.out.log
+stderr_logfile=/var/log/supervisor/ses-outbox-relay.err.log
+```
+
+## Deployment Pattern
+
+1. Install or update workers in source-controlled supervisor config.
+2. Review the diff.
+3. Deploy code and config.
+4. Reload supervisor or restart the worker container.
+5. Verify the process is running.
+6. Watch package-specific lag metrics.
+
+For Docker Compose:
+
+```bash
+docker compose restart worker
+```
+
+Inside a running supervisor container:
+
+```bash
+supervisorctl reread
+supervisorctl update
+supervisorctl status
+```
+

@@ -10,6 +10,10 @@ import { Step, Steps } from 'fumadocs-ui/components/steps';
 
 Vortos consumers run as long-lived PHP CLI processes managed by supervisord. Each consumer pipeline gets its own process. Supervisord handles automatic restarts on crash and graceful shutdown on `SIGTERM`.
 
+<Callout type="info" title="Use worker tooling for package relays">
+For package-provided relay processes, use `php bin/console vortos:worker:list` and `php bin/console vortos:worker:install`. The dedicated [Workers](/docs/workers) section covers managed supervisor blocks for Messaging, AWS SES, Object Store, and future optional packages.
+</Callout>
+
 ## Architecture
 
 ```

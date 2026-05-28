@@ -1,0 +1,43 @@
+---
+title: Worker FAQ
+description: Common questions about Vortos worker supervisor tooling.
+---
+
+# Worker FAQ
+
+## Does Vortos Automatically Add Workers To Supervisor?
+
+No. Vortos provides commands that generate managed supervisor blocks. You decide when to run them and when to reload supervisor.
+
+## Why Not Restart Supervisor Automatically?
+
+Restart behavior is deployment-specific. Docker Compose, Kubernetes, systemd, and bare supervisor all have different operational rules. Vortos writes files predictably and leaves process reload explicit.
+
+## Can I Install All Workers At Once?
+
+Yes.
+
+```bash
+php bin/console vortos:worker:install
+```
+
+## Can I Install Only One Package Worker?
+
+Yes.
+
+```bash
+php bin/console vortos:worker:install --worker=object-store-outbox-relay
+```
+
+## Does This Work Without SES Or Object Store?
+
+Yes. Optional packages contribute no workers when absent. `vortos:worker:list` only shows installed and registered package definitions.
+
+## Can I Keep Custom Supervisor Programs?
+
+Yes. The file manager updates Vortos-managed worker blocks and preserves unrelated config.
+
+## Should Workers Be Committed To Git?
+
+Yes for Docker-based projects. Generated supervisor config is infrastructure code and should be reviewed like any other deployment file.
+

@@ -1,0 +1,114 @@
+---
+title: Webhooks And Suppression
+description: Handle AWS SES bounce and complaint notifications with SNS signature verification and local suppression.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Webhooks And Suppression
+
+SES emits bounce and complaint events through SNS. Vortos verifies the SNS signature, parses the notification, and runs registered bounce or complaint handlers.
+
+## Route
+
+Default route:
+
+```text
+/webhooks/aws/ses
+```
+
+Override it:
+
+```php title="config/ses.php"
+$config->webhooks()
+    ->enabled(true)
+    ->routePath('/internal/webhooks/ses');
+```
+
+## SNS Setup
+
+At AWS level:
+
+1. Create an SNS topic for SES events.
+2. Subscribe the Vortos webhook URL.
+3. Attach the topic to the SES identity or configuration set for bounces and complaints.
+4. Confirm the SNS subscription.
+5. Keep the route reachable over HTTPS.
+
+## Bounce Handlers
+
+```php
+use Vortos\Ses\Attribute\AsBounceHandler;
+use Vortos\Ses\Contract\BounceHandlerInterface;
+use Vortos\Ses\Webhook\BounceNotification;
+
+#[AsBounceHandler]
+final class MarkEmailBouncedHandler implements BounceHandlerInterface
+{
+    public function handle(BounceNotification $notification): void
+    {
+        foreach ($notification->recipients() as $recipient) {
+            // Update local read model or support workflow.
+        }
+    }
+}
+```
+
+Generate a skeleton when the Make package is installed:
+
+```bash
+php bin/console vortos:ses:make:bounce-handler MarkEmailBounced --context=Notification
+```
+
+## Complaint Handlers
+
+```php
+use Vortos\Ses\Attribute\AsComplaintHandler;
+use Vortos\Ses\Contract\ComplaintHandlerInterface;
+use Vortos\Ses\Webhook\ComplaintNotification;
+
+#[AsComplaintHandler]
+final class UnsubscribeComplaintRecipientHandler implements ComplaintHandlerInterface
+{
+    public function handle(ComplaintNotification $notification): void
+    {
+        foreach ($notification->recipients() as $recipient) {
+            // Unsubscribe or mark as complained.
+        }
+    }
+}
+```
+
+```bash
+php bin/console vortos:ses:make:complaint-handler UnsubscribeComplaintRecipient --context=Notification
+```
+
+## Local Suppression List
+
+The package stores suppressed recipients in `ses_suppression_list` by default. Sending behavior is configured with `onSuppressed()`.
+
+```php
+$config->suppression()
+    ->tableName('ses_suppression_list')
+    ->onSuppressed('throw');
+```
+
+`throw` rejects the email when any recipient is suppressed.
+
+`strip` removes suppressed recipients and sends to the remaining recipients.
+
+## Sync Commands
+
+```bash
+php bin/console vortos:ses:suppression:sync
+php bin/console vortos:ses:suppression:sync --dry-run
+php bin/console vortos:ses:suppression:list
+php bin/console vortos:ses:suppression:list --limit=50 --offset=100
+```
+
+Use explicit sync commands in deployment or operations workflows. Avoid expensive provider syncs during application boot unless you have a small account and a very deliberate startup policy.
+
+<Callout type="warn" title="Do not skip signature verification">
+The webhook is public internet input. Keep SNS signature verification enabled and never trust bounce or complaint payloads from unverified sources.
+</Callout>
+

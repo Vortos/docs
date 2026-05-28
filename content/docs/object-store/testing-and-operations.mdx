@@ -1,0 +1,87 @@
+---
+title: Testing And Operations
+description: Test fakes, commands, worker setup, and operational runbooks for Vortos Object Store.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing And Operations
+
+## Test Driver
+
+Use the `null` driver for most automated tests:
+
+```php title="config/test/object_store.php"
+use Vortos\ObjectStore\DependencyInjection\VortosObjectStoreConfig;
+
+return static function (VortosObjectStoreConfig $config): void {
+    $config->driver('null');
+};
+```
+
+The package includes `Vortos\ObjectStore\Testing\ObjectStoreFake` for assertions.
+
+## Commands
+
+Object metadata:
+
+```bash
+php bin/console vortos:object-store:head assets/users/123/avatar.jpg
+```
+
+Presign:
+
+```bash
+php bin/console vortos:object-store:presign assets/reports/report.pdf
+php bin/console vortos:object-store:presign tmp/uploads/video.mp4 --upload --content-type=video/mp4 --max-size=209715200
+```
+
+Outbox relay:
+
+```bash
+php bin/console vortos:object-store:relay
+php bin/console vortos:object-store:relay --once
+```
+
+Lifecycle:
+
+```bash
+php bin/console vortos:object-store:lifecycle show
+php bin/console vortos:object-store:lifecycle plan
+php bin/console vortos:object-store:lifecycle apply --confirm
+```
+
+Multipart maintenance:
+
+```bash
+php bin/console vortos:object-store:multipart list --prefix=imports/
+php bin/console vortos:object-store:multipart abort-stale --older-than="-24 hours" --dry-run
+```
+
+Worker management:
+
+```bash
+php bin/console vortos:worker:list
+php bin/console vortos:worker:install --worker=object-store-outbox-relay
+```
+
+## Deployment Runbook
+
+1. Deploy code.
+2. Run migrations.
+3. Verify object-store env vars and credentials.
+4. Run a presign smoke test.
+5. Run `vortos:object-store:lifecycle plan`.
+6. Apply lifecycle changes only when the plan is correct.
+7. Install or update supervisor worker config.
+8. Reload worker processes.
+9. Watch outbox lag, provider errors, and `tmp/` object growth.
+
+## Provider Integration Tests
+
+Do not use LocalStack as the package's source of truth. Use real R2 or S3 credentials in protected CI jobs and skip those tests when credentials are absent.
+
+<Callout type="info" title="Keep provider tests explicit">
+Fast tests should use fakes and null/log drivers. Real provider tests should run in a separate pipeline with throwaway prefixes and cleanup.
+</Callout>
+

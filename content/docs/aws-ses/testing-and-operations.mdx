@@ -1,0 +1,104 @@
+---
+title: Testing And Operations
+description: Test fakes, commands, migrations, worker setup, and production runbooks for Vortos SES.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing And Operations
+
+## Test Driver
+
+Use the `null` driver in automated tests:
+
+```php title="config/test/ses.php"
+use Vortos\Ses\DependencyInjection\VortosSesConfig;
+
+return static function (VortosSesConfig $config): void {
+    $config->driver('null');
+};
+```
+
+The package includes `Vortos\Ses\Testing\SesMailerFake` for assertions.
+
+## Functional Test Pattern
+
+```php
+use Vortos\Ses\Testing\SesMailerFake;
+
+final class RegistrationNotificationTest extends TestCase
+{
+    public function test_it_queues_approval_email(): void
+    {
+        self::getContainer()->get(CommandBus::class)
+            ->dispatch(new ApproveRegistration('reg_123'));
+
+        $mailer = self::getContainer()->get(SesMailerFake::class);
+
+        self::assertTrue($mailer->sent()->hasRecipient('athlete@example.com'));
+    }
+}
+```
+
+## Commands
+
+```bash
+php bin/console vortos:ses:send:test you@example.com
+php bin/console vortos:ses:quota
+php bin/console vortos:ses:outbox:relay
+php bin/console vortos:ses:outbox:relay --once
+php bin/console vortos:ses:suppression:sync
+php bin/console vortos:ses:suppression:sync --dry-run
+php bin/console vortos:ses:suppression:list
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+Make commands, when the Make package is installed:
+
+```bash
+php bin/console vortos:ses:make:bounce-handler NotifySupport --context=Notification
+php bin/console vortos:ses:make:complaint-handler UnsubscribeUser --context=Notification
+php bin/console vortos:ses:make:email-middleware TenantHeader --context=Notification --priority=500
+```
+
+## Supervisor
+
+List registered workers:
+
+```bash
+php bin/console vortos:worker:list
+```
+
+Install the SES relay:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+Preview without writing:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay --dry-run
+```
+
+See [Worker Supervisor](/docs/workers/supervisor) for managed block behavior and deployment notes.
+
+## Deployment Runbook
+
+1. Deploy code.
+2. Run migrations.
+3. Verify SES env vars and IAM credentials.
+4. Run `vortos:ses:quota`.
+5. Run `vortos:ses:send:test` to a controlled recipient.
+6. Install or update the supervisor worker config.
+7. Restart or reload worker processes.
+8. Watch outbox lag and provider errors.
+
+## Integration Tests
+
+Do not use LocalStack for package CI. Provider integration tests should be gated behind real SES credentials in CI and skipped when credentials are absent.
+
+<Callout type="info" title="Separate fast tests from provider tests">
+Use unit and functional tests for normal CI speed. Run real SES integration tests in a protected CI job with restricted credentials and known verified identities.
+</Callout>
+

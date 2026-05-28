@@ -38,7 +38,9 @@ php bin/console vortos:make:context Order
 src/Order/
 ├── Domain/
 │   └── Shared/
-│       └── ValueObjects/       ← value objects shared across aggregates
+│       ├── ValueObject/        ← value objects shared across aggregates
+│       ├── Error/              ← domain errors shared across aggregates
+│       └── Service/            ← domain services used by more than one aggregate
 ├── Application/
 │   ├── Command/
 │   ├── EventHandler/
@@ -94,7 +96,8 @@ src/Training/
 └── Domain/
     └── TrainingSession/
         ├── TrainingSession.php
-        ├── TrainingSessionId.php
+        ├── ValueObject/
+        │   └── TrainingSessionId.php
         └── Repository/
             └── TrainingSessionRepositoryInterface.php
 ```
@@ -206,8 +209,9 @@ php bin/console vortos:make:entity ExerciseSet --context=Training --aggregate=Tr
 src/Training/
 └── Domain/
     └── TrainingSession/
-        └── Entities/
-            ├── ExerciseSet.php
+        ├── Entity/
+        │   └── ExerciseSet.php
+        └── ValueObject/
             └── ExerciseSetId.php
 ```
 
@@ -217,7 +221,9 @@ No repository interface is generated — child entities are persisted through th
 <Tab value="Plain">
 ```php
 // ExerciseSet.php
-namespace App\Training\Domain\TrainingSession\Entities;
+namespace App\Training\Domain\TrainingSession\Entity;
+
+use App\Training\Domain\TrainingSession\ValueObject\ExerciseSetId;
 
 final class ExerciseSet
 {
@@ -235,7 +241,7 @@ final class ExerciseSet
 <Tab value="ORM">
 ```php
 // ExerciseSet.php (with vortos/persistence-orm installed)
-namespace App\Training\Domain\TrainingSession\Entities;
+namespace App\Training\Domain\TrainingSession\Entity;
 
 use Doctrine\ORM\Mapping as ORM;
 
@@ -302,7 +308,7 @@ php bin/console vortos:make:value-object <name> --context=<context> (--aggregate
 | `name` | Value object class name. PascalCase. E.g., `Email`, `Duration`. |
 | `--context` / `-c` | Bounded context folder name. Required. |
 | `--aggregate` / `-a` | Aggregate this value object belongs to. Use when only one aggregate needs it. |
-| `--shared` | Generate into `Domain/Shared/ValueObjects/`. Use when multiple aggregates share it. |
+| `--shared` | Generate into `Domain/Shared/ValueObject/`. Use when multiple aggregates share it. |
 | `--embeddable` | Generate as a Doctrine embeddable. Requires `vortos/persistence-orm`. |
 
 Exactly one of `--aggregate` or `--shared` is required. Providing neither (or both) is an error with an explanation.
@@ -314,10 +320,10 @@ Exactly one of `--aggregate` or `--shared` is required. Providing neither (or bo
 php bin/console vortos:make:value-object Duration --context=Training --aggregate=TrainingSession
 ```
 
-**Creates:** `src/Training/Domain/TrainingSession/ValueObjects/Duration.php`
+**Creates:** `src/Training/Domain/TrainingSession/ValueObject/Duration.php`
 
 ```php
-namespace App\Training\Domain\TrainingSession\ValueObjects;
+namespace App\Training\Domain\TrainingSession\ValueObject;
 
 use Vortos\Domain\ValueObject\ValueObject;
 
@@ -348,10 +354,10 @@ final readonly class Duration extends ValueObject
 php bin/console vortos:make:value-object Email --context=Training --shared
 ```
 
-**Creates:** `src/Training/Domain/Shared/ValueObjects/Email.php`
+**Creates:** `src/Training/Domain/Shared/ValueObject/Email.php`
 
 ```php
-namespace App\Training\Domain\Shared\ValueObjects;
+namespace App\Training\Domain\Shared\ValueObject;
 
 use Vortos\Domain\ValueObject\ValueObject;
 
@@ -363,10 +369,10 @@ final readonly class Email extends ValueObject { ... }
 php bin/console vortos:make:value-object Address --context=User --aggregate=User --embeddable
 ```
 
-**Creates:** `src/User/Domain/User/ValueObjects/Address.php`
+**Creates:** `src/User/Domain/User/ValueObject/Address.php`
 
 ```php
-namespace App\User\Domain\User\ValueObjects;
+namespace App\User\Domain\User\ValueObject;
 
 use Doctrine\ORM\Mapping as ORM;
 use Vortos\Domain\ValueObject\ValueObject;
@@ -400,11 +406,9 @@ php bin/console vortos:make:domain-event <name> --context=<context> --aggregate=
 
 | | |
 |---|---|
-| `name` | Event name **without** the `Event` suffix. PascalCase. E.g., `UserRegistered`. |
+| `name` | Event name. PascalCase. E.g., `UserRegistered`, `SessionStarted`. No suffix — the `Event/` folder implies the type. |
 | `--context` / `-c` | Bounded context folder name. Required. |
 | `--aggregate` / `-a` | Aggregate root that emits this event. Required. |
-
-The `Event` suffix is appended automatically — pass `UserRegistered`, get `UserRegisteredEvent`.
 
 **Example**
 
@@ -415,7 +419,7 @@ php bin/console vortos:make:domain-event SessionStarted --context=Training --agg
 **Creates**
 
 ```
-src/Training/Domain/TrainingSession/Event/SessionStartedEvent.php
+src/Training/Domain/TrainingSession/Event/SessionStarted.php
 ```
 
 **Generated class**
@@ -423,7 +427,7 @@ src/Training/Domain/TrainingSession/Event/SessionStartedEvent.php
 ```php
 namespace App\Training\Domain\TrainingSession\Event;
 
-final readonly class SessionStartedEvent
+final readonly class SessionStarted
 {
     public function __construct(
         // public string $property,
@@ -440,7 +444,7 @@ Add your event properties as public readonly constructor-promoted parameters. No
 Generates a structured domain error with a stable error code, typed context, and automatic HTTP status mapping.
 
 ```bash
-php bin/console vortos:make:domain-error <name> --context=<context> --aggregate=<aggregate> [--status=<http-status>]
+php bin/console vortos:make:domain-error <name> --context=<context> (--aggregate=<aggregate> | --shared) [--status=<http-status>]
 ```
 
 **Arguments & Options**
@@ -449,19 +453,30 @@ php bin/console vortos:make:domain-error <name> --context=<context> --aggregate=
 |---|---|
 | `name` | Error name **without** the `Error` suffix. PascalCase. E.g., `UserNotFound`. |
 | `--context` / `-c` | Bounded context folder name. Required. |
-| `--aggregate` / `-a` | Aggregate root this error belongs to. Required. |
+| `--aggregate` / `-a` | Aggregate root this error belongs to. Use when the error is specific to one aggregate. |
+| `--shared` | Generate into `Domain/Shared/Error/`. Use when the error is shared across aggregates in the context. |
 | `--status` / `-s` | HTTP status code the error maps to. Defaults to `422`. |
 
-**Example**
+Exactly one of `--aggregate` or `--shared` is required. Providing neither (or both) is an error.
+
+**Examples**
 
 ```bash
+# Aggregate-specific error
 php bin/console vortos:make:domain-error SessionNotFound --context=Training --aggregate=TrainingSession --status=404
+
+# Shared error (used by more than one aggregate in the context)
+php bin/console vortos:make:domain-error Unauthorised --context=Training --shared --status=403
 ```
 
 **Creates**
 
 ```
+# aggregate-specific
 src/Training/Domain/TrainingSession/Error/SessionNotFoundError.php
+
+# shared
+src/Training/Domain/Shared/Error/UnauthorisedError.php
 ```
 
 **Generated class**
@@ -493,3 +508,66 @@ public static function forId(string $id): self
     );
 }
 ```
+
+---
+
+## `vortos:make:domain-service`
+
+Generates a stateless domain service decorated with `#[AsDomainService]` — for pure domain logic that doesn't belong on a single aggregate (e.g. a calculation, a policy check, a cross-aggregate rule).
+
+```bash
+php bin/console vortos:make:domain-service <name> --context=<context> (--aggregate=<aggregate> | --shared)
+```
+
+**Arguments & Options**
+
+| | |
+|---|---|
+| `name` | Service class name. PascalCase. E.g., `AgeGroupCalculator`, `PricingPolicy`. |
+| `--context` / `-c` | Bounded context folder name. Required. |
+| `--aggregate` / `-a` | Aggregate this service is specific to. Use when only one aggregate uses it. |
+| `--shared` | Generate into `Domain/Shared/Service/`. Use when the service spans multiple aggregates. |
+
+Exactly one of `--aggregate` or `--shared` is required.
+
+**Examples**
+
+```bash
+# Aggregate-specific domain service
+php bin/console vortos:make:domain-service PricingCalculator --context=Order --aggregate=Order
+
+# Shared domain service (used by multiple aggregates)
+php bin/console vortos:make:domain-service CurrencyConverter --context=Order --shared
+```
+
+**Creates**
+
+```
+# aggregate-specific
+src/Order/Domain/Order/Service/PricingCalculator.php
+
+# shared
+src/Order/Domain/Shared/Service/CurrencyConverter.php
+```
+
+**Generated class**
+
+```php
+namespace App\Order\Domain\Order\Service;
+
+use Vortos\Domain\Attribute\AsDomainService;
+
+#[AsDomainService]
+final class PricingCalculator
+{
+    public function __construct(
+        // inject domain dependencies here
+    ) {}
+}
+```
+
+The `#[AsDomainService]` attribute marks the class for auto-registration by the framework's `DomainServiceCompilerPass`. No manual DI wiring is needed.
+
+<Callout type="warn" title="No Infrastructure Dependencies">
+Domain services must be pure domain logic. They must not depend on repositories, HTTP clients, cache, the event bus, or any other infrastructure. If you need those, the logic belongs in an application service (command handler) instead.
+</Callout>

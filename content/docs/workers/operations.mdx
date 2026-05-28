@@ -1,0 +1,79 @@
+---
+title: Worker Operations
+description: Deployment, scaling, monitoring, and performance guidance for Vortos workers.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Worker Operations
+
+Workers turn durable outbox rows into external side effects. Treat them as production processes with explicit ownership.
+
+## Deployment Checklist
+
+1. Run migrations before starting workers that depend on new tables.
+2. Run `php bin/console vortos:worker:list`.
+3. Run `php bin/console vortos:worker:install --dry-run`.
+4. Install selected workers.
+5. Deploy supervisor config.
+6. Restart the worker container or reload supervisor.
+7. Verify `supervisorctl status`.
+8. Watch lag, retries, failures, and provider throttles.
+
+## Scaling
+
+Start with one process per relay. Increase only when metrics show a bottleneck.
+
+Before scaling up, check:
+
+- Database lock contention.
+- Provider quotas.
+- Idempotency behavior.
+- Retry rates.
+- Oldest pending row age.
+- CPU and memory per process.
+
+Outbox workers are normally I/O-bound. More processes can improve throughput, but they can also increase provider throttling or database contention.
+
+## Supervisor Settings
+
+Recommended defaults for relay processes:
+
+```ini
+autostart=true
+autorestart=true
+startsecs=3
+stopwaitsecs=30
+```
+
+Use `stopwaitsecs` high enough for graceful shutdown. Relay commands are designed to run continuously and stop cleanly on termination signals where supported.
+
+## Monitoring
+
+Monitor each package's own queue:
+
+- Messaging outbox pending count and oldest age.
+- SES outbox pending count, retries, and send failures.
+- Object-store outbox pending count, promotion failures, and provider errors.
+
+Also monitor process health:
+
+- Supervisor status.
+- Container restarts.
+- Worker stderr logs.
+- Memory growth.
+- CPU usage.
+
+## Runbook: Worker Down
+
+1. Confirm the worker is registered with `vortos:worker:list`.
+2. Confirm supervisor config includes the worker block.
+3. Confirm the container has the latest code and config.
+4. Run the worker command manually with `--once` if supported.
+5. Check credentials and network access from the worker container.
+6. Restart or reload supervisor.
+
+<Callout type="warn" title="Do not hide worker restarts inside package boot">
+Worker process management is infrastructure. Packages provide definitions and commands; deployments decide when to write files and restart processes.
+</Callout>
+

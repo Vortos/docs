@@ -161,6 +161,26 @@ docker compose logs -f worker
 
 The generated `.env` contains agnostic Vortos variables such as `VORTOS_WRITE_DB_PASSWORD` and `VORTOS_READ_DB_USER`. Compose maps those values to service-specific variables like `POSTGRES_PASSWORD` and `MONGO_INITDB_ROOT_USERNAME`.
 
+## Package Workers
+
+Installed Vortos packages can contribute long-running worker processes. Use the worker management commands to keep `docker/worker/supervisord.conf` aligned with the packages in the project:
+
+```bash
+php bin/console vortos:worker:list
+php bin/console vortos:worker:install --dry-run
+php bin/console vortos:worker:install
+```
+
+Examples:
+
+```bash
+php bin/console vortos:worker:install --worker=messaging-outbox-relay
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:install --worker=object-store-outbox-relay
+```
+
+See [Workers](/docs/workers) for supervisor management, package-discovered workers, deployment reloads, and troubleshooting.
+
 ## Production
 
 The `docker-compose.prod.yaml` extends the base compose file with production-specific overrides — resource limits, restart policies, no volume mounts for source code.

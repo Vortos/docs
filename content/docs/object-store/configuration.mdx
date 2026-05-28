@@ -1,0 +1,194 @@
+---
+title: Object Store Configuration
+description: Full configuration reference for Vortos Object Store.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Object Store Configuration
+
+`config/object_store.php` receives `Vortos\ObjectStore\DependencyInjection\VortosObjectStoreConfig`.
+
+```php title="config/object_store.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\ObjectStore\Config\ObjectStoreObservabilitySection;
+use Vortos\ObjectStore\DependencyInjection\VortosObjectStoreConfig;
+
+return static function (VortosObjectStoreConfig $config): void {
+    $config
+        ->driver($_ENV['VORTOS_OBJECT_STORE_DRIVER'] ?? 'log')
+        ->provider($_ENV['OBJECT_STORE_PROVIDER'] ?? 'r2')
+        ->region($_ENV['OBJECT_STORE_REGION'] ?? 'auto')
+        ->endpoint($_ENV['OBJECT_STORE_ENDPOINT'] ?? null)
+        ->bucket($_ENV['OBJECT_STORE_BUCKET'] ?? '');
+
+    $config->client()
+        ->accountId($_ENV['OBJECT_STORE_ACCOUNT_ID'] ?? null)
+        ->credentials(
+            $_ENV['OBJECT_STORE_ACCESS_KEY_ID'] ?? null,
+            $_ENV['OBJECT_STORE_SECRET_ACCESS_KEY'] ?? null,
+        )
+        ->httpTimeout(10.0)
+        ->connectTimeout(2.0)
+        ->maxRetries(3)
+        ->pathStyleEndpoint(false);
+
+    $config->bucketConfig()
+        ->keyPrefix($_ENV['OBJECT_STORE_KEY_PREFIX'] ?? '')
+        ->temporaryKeyPrefix($_ENV['OBJECT_STORE_TEMPORARY_KEY_PREFIX'] ?? 'tmp')
+        ->publicBaseUrl($_ENV['OBJECT_STORE_PUBLIC_BASE_URL'] ?? null)
+        ->maxUploadSizeBytes(5_368_709_120)
+        ->defaultPresignTtlSeconds(900)
+        ->maxPresignTtlSeconds(3600)
+        ->orphanTtlSeconds(86400);
+
+    $config->retry()
+        ->maxAttempts(3)
+        ->backoffBaseMilliseconds(100)
+        ->backoffCapMilliseconds(2000);
+
+    $config->outbox()
+        ->enabled(true)
+        ->batchSize(50)
+        ->sleepSecondsWhenEmpty(2)
+        ->maxDeliveryAttempts(5)
+        ->backoffBaseSeconds(30)
+        ->backoffCapSeconds(3600)
+        ->maxInlinePayloadBytes(1_048_576);
+
+    $config->lifecycle()
+        ->enabled(true)
+        ->manageTemporaryUploads(true)
+        ->ruleId('vortos-object-store-expire-temporary-uploads')
+        ->requireConfirmation(true)
+        ->roundUpMinimumLifecycleDay(false);
+
+    $config->multipart()
+        ->thresholdBytes(104_857_600)
+        ->partSizeBytes(16_777_216)
+        ->abortOnFailure(true)
+        ->maxObjectSizeBytes(5_497_558_138_880)
+        ->maxInlineBodyBytes(16_777_216)
+        ->maxAttempts(3)
+        ->concurrency(4)
+        ->backoffBaseMilliseconds(100)
+        ->backoffCapMilliseconds(2000)
+        ->checksumAlgorithm(null);
+
+    $config->audit()->enabled(true);
+
+    $config->observability()
+        ->logging(true)
+        ->tracing(true)
+        ->metrics(true)
+        ->disableLoggingFor(ObjectStoreObservabilitySection::Presign);
+};
+```
+
+## Top-Level Settings
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `driver()` | `$_ENV['VORTOS_OBJECT_STORE_DRIVER'] ?? 'log'` | `s3`, `log`, or `null`. |
+| `provider()` | `$_ENV['OBJECT_STORE_PROVIDER'] ?? 'r2'` | Provider hint, usually `r2` or `s3`. |
+| `region()` | `$_ENV['OBJECT_STORE_REGION'] ?? 'auto'` | Region. R2 commonly uses `auto`. |
+| `endpoint()` | `$_ENV['OBJECT_STORE_ENDPOINT'] ?? null` | Custom S3-compatible endpoint. |
+| `bucket()` | `$_ENV['OBJECT_STORE_BUCKET'] ?? ''` | Bucket name. |
+
+## Client
+
+| Method | Default |
+| --- | --- |
+| `accountId()` | `$_ENV['OBJECT_STORE_ACCOUNT_ID'] ?? null` |
+| `credentials()` | `OBJECT_STORE_ACCESS_KEY_ID`, `OBJECT_STORE_SECRET_ACCESS_KEY` |
+| `httpTimeout()` | `10.0` |
+| `connectTimeout()` | `2.0` |
+| `maxRetries()` | `3` |
+| `pathStyleEndpoint()` | `false` |
+
+## Bucket
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `keyPrefix()` | empty | Prefix applied to all managed keys. |
+| `temporaryKeyPrefix()` | `tmp` | Required prefix for direct-upload temporary keys. |
+| `publicBaseUrl()` | `null` | Base URL for public URL generation. |
+| `maxUploadSizeBytes()` | `5368709120` | Maximum direct upload size, 5 GiB by default. |
+| `defaultPresignTtlSeconds()` | `900` | Default presigned URL TTL. |
+| `maxPresignTtlSeconds()` | `3600` | Maximum allowed presign TTL. |
+| `orphanTtlSeconds()` | `86400` | Temporary object cleanup TTL. |
+
+## Outbox
+
+| Method | Default |
+| --- | --- |
+| `enabled()` | `true` |
+| `tableName()` | `object_store_outbox` |
+| `batchSize()` | `50` |
+| `sleepSecondsWhenEmpty()` | `2` |
+| `maxDeliveryAttempts()` | `5` |
+| `backoffBaseSeconds()` | `30` |
+| `backoffCapSeconds()` | `3600` |
+| `maxInlinePayloadBytes()` | `1048576` |
+
+<Callout type="info" title="Outbox payloads are bounded">
+The package rejects oversized inline outbox payloads instead of serializing huge binary bodies into the database. Large public uploads should use direct-to-cloud URLs.
+</Callout>
+
+## Lifecycle
+
+| Method | Default |
+| --- | --- |
+| `enabled()` | `true` |
+| `manageTemporaryUploads()` | `true` |
+| `ruleId()` | `vortos-object-store-expire-temporary-uploads` |
+| `requireConfirmation()` | `true` |
+| `roundUpMinimumLifecycleDay()` | `false` |
+
+R2 and S3 lifecycle expiration uses day-level semantics. A TTL below one day is rejected unless `roundUpMinimumLifecycleDay(true)` is explicitly enabled.
+
+## Multipart
+
+Multipart config applies to trusted backend transfers through `ServerSideMultipartUploadManagerInterface`. It is not the public browser upload path.
+
+| Method | Default |
+| --- | --- |
+| `thresholdBytes()` | `104857600` |
+| `partSizeBytes()` | `16777216` |
+| `abortOnFailure()` | `true` |
+| `maxObjectSizeBytes()` | `5497558138880` |
+| `maxInlineBodyBytes()` | `16777216` |
+| `maxAttempts()` | `3` |
+| `concurrency()` | `4` |
+| `backoffBaseMilliseconds()` | `100` |
+| `backoffCapMilliseconds()` | `2000` |
+| `checksumAlgorithm()` | `null` |
+
+## Observability
+
+```php
+use Vortos\ObjectStore\Config\ObjectStoreObservabilitySection;
+
+$config->observability()
+    ->logging(false)
+    ->tracing(false)
+    ->metrics(false);
+
+$config->observability()
+    ->disableLoggingFor(ObjectStoreObservabilitySection::Presign)
+    ->disableTracingFor(ObjectStoreObservabilitySection::DirectUpload)
+    ->disableMetricsFor(ObjectStoreObservabilitySection::Outbox);
+```
+
+Sections:
+
+- `Driver`
+- `Presign`
+- `DirectUpload`
+- `Outbox`
+- `Multipart`
+- `Lifecycle`
+

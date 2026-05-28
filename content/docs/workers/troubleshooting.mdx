@@ -1,0 +1,86 @@
+---
+title: Worker Troubleshooting
+description: Diagnose missing worker definitions, supervisor config drift, and failing relay processes.
+---
+
+# Worker Troubleshooting
+
+## `vortos:worker:list` Shows No Workers
+
+Check:
+
+- `vortos/vortos-docker` is installed and registered.
+- The package that contributes the worker is installed and registered.
+- The container has a fresh compiled service container.
+- You are running the command in the application root.
+
+## SES Or Object Store Worker Is Missing
+
+Those packages are optional. Install and register the relevant package:
+
+```php
+new Vortos\Ses\DependencyInjection\SesPackage(),
+new Vortos\ObjectStore\DependencyInjection\ObjectStorePackage(),
+```
+
+Then run:
+
+```bash
+php bin/console vortos:worker:list
+```
+
+## Supervisor Config Did Not Change
+
+Run dry-run first:
+
+```bash
+php bin/console vortos:worker:install --dry-run
+```
+
+Then check:
+
+- The selected worker name is correct.
+- The `--path` points to the file mounted by the worker container.
+- The process has write permission to the file.
+- The config is not already up to date.
+
+## Worker Block Exists But Process Is Not Running
+
+The file write step does not reload supervisor. Run your deployment reload:
+
+```bash
+docker compose restart worker
+```
+
+or inside the supervisor container:
+
+```bash
+supervisorctl reread
+supervisorctl update
+supervisorctl status
+```
+
+## Process Restarts Repeatedly
+
+Run the worker command manually inside the worker container:
+
+```bash
+php /var/www/html/bin/console vortos:ses:outbox:relay --once
+php /var/www/html/bin/console vortos:object-store:relay --once
+php /var/www/html/bin/console vortos:outbox:relay --once
+```
+
+Check:
+
+- Database connection.
+- Migrations.
+- Provider credentials.
+- Package config.
+- PHP extensions.
+- Memory limits.
+- Network DNS and egress rules.
+
+## Removing A Worker Did Not Stop It
+
+`vortos:worker:remove` edits supervisor config. Reload supervisor or restart the worker container to stop the process.
+

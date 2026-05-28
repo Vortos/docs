@@ -1,0 +1,84 @@
+---
+title: SES Troubleshooting
+description: Diagnose common SES, outbox, webhook, and worker issues.
+---
+
+# SES Troubleshooting
+
+## Emails Do Not Send
+
+Check the driver:
+
+```bash
+php bin/console debug:container Vortos\\Ses\\Contract\\MailerInterface
+```
+
+Then confirm env:
+
+```dotenv
+VORTOS_MAILER_DRIVER=ses
+AWS_SES_REGION=us-east-1
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+SES_FROM_ADDRESS=no-reply@example.com
+```
+
+If the driver is `log`, email is intentionally written to logs. If the driver is `null`, email is intentionally dropped for tests.
+
+## `MailerInterface` Throws Outside Transaction
+
+This is expected for the transactional path. Call it from a command handler through the command bus, or inject:
+
+- `StandaloneMailerInterface` for standalone async outbox writes.
+- `ImmediateMailerInterface` for direct provider calls.
+
+## Outbox Rows Are Pending Forever
+
+Check:
+
+- Is `ses-outbox-relay` installed in supervisor?
+- Is the worker container running?
+- Does `php bin/console vortos:ses:outbox:relay --once` process rows?
+- Are provider credentials valid inside the worker container?
+- Is the SES account throttling the worker?
+
+## Provider Says Address Is Not Verified
+
+The account is likely in SES sandbox or the sender identity is not verified in that region. Verify the domain or email identity and request production access from AWS.
+
+## Bounces Do Not Update Local Suppression
+
+Check:
+
+- SNS topic is attached to the SES identity or configuration set.
+- SNS subscription is confirmed.
+- Webhook URL is reachable over HTTPS.
+- `webhooks()->enabled(true)`.
+- Route path matches AWS.
+- Signature verification succeeds.
+- A bounce or complaint handler is registered.
+
+## Rate Limit Errors
+
+Run:
+
+```bash
+php bin/console vortos:ses:quota
+```
+
+Then lower:
+
+```php
+$config->rateLimit()->maxSendRate(10)->burst(10);
+```
+
+Increase only after SES quota is raised and worker metrics are stable.
+
+## Duplicate Emails
+
+Outbox delivery is at-least-once. Handlers and providers can fail after a side effect. Use business-level idempotency where duplicate notification would be harmful, and include stable metadata such as a domain event ID.
+
+## Attachments Fail Or Memory Spikes
+
+Email attachments are held in memory as encoded MIME content. Keep attachments small. For large files, store the file in object storage and send a temporary download link.
+

@@ -1,0 +1,11 @@
+{
+  "title": "Workers",
+  "pages": [
+    "index",
+    "supervisor",
+    "registered-workers",
+    "operations",
+    "troubleshooting",
+    "faq"
+  ]
+}

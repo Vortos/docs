@@ -1,6 +1,6 @@
 ---
 title: Make
-description: 22 code generation commands that scaffold your entire application — domain, CQRS, messaging, HTTP, persistence, and authorization — from a single CLI.
+description: 24 code generation commands that scaffold your entire application — domain, CQRS, messaging, HTTP, persistence, and authorization — from a single CLI.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -21,7 +21,7 @@ Generated files compile and run immediately. They do not contain `// TODO` marke
 composer require vortos/vortos-make --dev
 ```
 
-The package is auto-discovered. All 23 commands are immediately available in `bin/console`.
+The package is auto-discovered. All 24 commands are immediately available in `bin/console`.
 
 ## How It Works
 
@@ -56,13 +56,13 @@ Several commands accept `--event` as either a short name (`UserRegisteredEvent`)
 php bin/console vortos:make:consumer SendEmail \
     --context=User \
     --consumer=user.events \
-    --event=UserRegisteredEvent
+    --event=UserRegistered
 
 # Full FQCN — used as-is, no scanning
 php bin/console vortos:make:consumer SendEmail \
     --context=User \
     --consumer=user.events \
-    --event="App\\User\\Domain\\Event\\UserRegisteredEvent"
+    --event="App\\User\\Domain\\Event\\UserRegistered"
 ```
 
 If the short name matches zero classes, the command fails with a helpful error. If it matches more than one, it fails listing all ambiguous matches so you can use the full FQCN.
@@ -74,11 +74,12 @@ If the short name matches zero classes, the command fails with a helpful error. 
 | Command | What it generates |
 |---|---|
 | `vortos:make:context` | Full bounded context directory structure |
-| `vortos:make:aggregate` | Aggregate root + typed AggregateId + repository interface, inside `Domain/{Name}/` |
-| `vortos:make:entity` | Child entity + typed EntityId inside `Domain/{Aggregate}/Entities/` — requires `--aggregate` |
+| `vortos:make:aggregate` | Aggregate root + typed AggregateId (in `ValueObject/`) + repository interface, inside `Domain/{Name}/` |
+| `vortos:make:entity` | Child entity inside `Domain/{Aggregate}/Entity/` + typed EntityId in `ValueObject/` — requires `--aggregate` |
 | `vortos:make:value-object` | Immutable value object — requires `--aggregate` or `--shared` |
-| `vortos:make:domain-event` | Domain event inside `Domain/{Aggregate}/Event/` — requires `--aggregate` |
-| `vortos:make:domain-error` | Structured domain error inside `Domain/{Aggregate}/Error/` — requires `--aggregate` |
+| `vortos:make:domain-event` | Domain event inside `Domain/{Aggregate}/Event/` — requires `--aggregate`. No `Event` suffix — pass `UserRegistered`, get `UserRegistered.php` |
+| `vortos:make:domain-error` | Structured domain error — requires `--aggregate` or `--shared` |
+| `vortos:make:domain-service` | Stateless domain service with `#[AsDomainService]` — requires `--aggregate` or `--shared` |
 
 ### CQRS
 
@@ -146,7 +147,7 @@ php bin/console vortos:make:controller RegisterUser --context=User --route=/user
 php bin/console vortos:make:consumer SendWelcomeEmail \
     --context=User \
     --consumer=user.events \
-    --event=UserRegisteredEvent
+    --event=UserRegistered
 ```
 
 Starting a brand-new bounded context? Generate the directory tree first:
@@ -158,7 +159,7 @@ php bin/console vortos:make:context Order
 ## Detailed Pages
 
 <Cards>
-  <Card title="Domain" href="/docs/make/domain" description="context, aggregate, entity, value-object, domain-event, domain-error." />
+  <Card title="Domain" href="/docs/make/domain" description="context, aggregate, entity, value-object, domain-event, domain-error, domain-service." />
   <Card title="CQRS" href="/docs/make/cqrs" description="command, query, projection-handler." />
   <Card title="Messaging" href="/docs/make/messaging" description="consumer, messaging-config, middleware, hook." />
   <Card title="HTTP" href="/docs/make/http" description="controller and request DTO." />

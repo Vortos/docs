@@ -1,0 +1,130 @@
+---
+title: Server-Side Multipart
+description: Trusted backend multipart transfers for imports, exports, migrations, and CLI jobs.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Server-Side Multipart
+
+`ServerSideMultipartUploadManagerInterface` is for trusted backend-owned streams or files. It is not the public browser upload mechanism.
+
+Use it for:
+
+- Import jobs where the backend already owns a stream.
+- Export jobs writing generated archives.
+- Migration tools moving large files between systems.
+- CLI maintenance where backpressure and progress reporting matter.
+
+Do not use it for:
+
+- Public user uploads from browsers.
+- Mobile app file uploads.
+- Upload proxy endpoints.
+
+<Callout type="warn" title="Public uploads should stay direct-to-cloud">
+If a browser sends a 2 GB file through PHP, PHP workers are tied up for the duration of the transfer. Use direct upload intents for public traffic.
+</Callout>
+
+## Upload Example
+
+```php
+use Vortos\ObjectStore\Contract\ServerSideMultipartUploadManagerInterface;
+use Vortos\ObjectStore\ValueObject\ContentType;
+use Vortos\ObjectStore\ValueObject\PutObjectOptions;
+use Vortos\ObjectStore\ValueObject\ServerSideMultipartUploadOptions;
+
+final class ExportArchiveUploader
+{
+    public function __construct(
+        private readonly ServerSideMultipartUploadManagerInterface $uploads,
+    ) {}
+
+    public function upload(string $path, string $exportId): void
+    {
+        $stream = fopen($path, 'rb');
+
+        try {
+            $this->uploads->upload(
+                key: sprintf('exports/%s/archive.zip', $exportId),
+                body: $stream,
+                options: new PutObjectOptions(
+                    contentType: new ContentType('application/zip'),
+                    metadata: ['export-id' => $exportId],
+                ),
+                transferOptions: new ServerSideMultipartUploadOptions(
+                    partSizeBytes: 32 * 1024 * 1024,
+                    concurrency: 4,
+                    maxAttempts: 3,
+                    onPartUploaded: static function (int $partNumber, int $bytes): void {
+                        // Report progress to logs or a job tracker.
+                    },
+                ),
+            );
+        } finally {
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }
+    }
+}
+```
+
+## Safety Features
+
+- Validates S3 multipart limits.
+- Keeps memory bounded by configured part size.
+- Supports bounded concurrent part upload.
+- Retries retryable part failures.
+- Aborts failed multipart uploads when `abortOnFailure(true)`.
+- Enforces maximum object size.
+- Rejects oversized inline bodies.
+- Supports optional checksum algorithm.
+- Supports progress callback per uploaded part.
+
+## Configuration
+
+```php
+$config->multipart()
+    ->thresholdBytes(104_857_600)
+    ->partSizeBytes(16_777_216)
+    ->abortOnFailure(true)
+    ->maxObjectSizeBytes(5_497_558_138_880)
+    ->maxInlineBodyBytes(16_777_216)
+    ->maxAttempts(3)
+    ->concurrency(4)
+    ->backoffBaseMilliseconds(100)
+    ->backoffCapMilliseconds(2000)
+    ->checksumAlgorithm(null);
+```
+
+## Maintenance Commands
+
+List active multipart uploads:
+
+```bash
+php bin/console vortos:object-store:multipart list
+php bin/console vortos:object-store:multipart list --prefix=imports/
+```
+
+Abort one upload:
+
+```bash
+php bin/console vortos:object-store:multipart abort --key=imports/big.csv --upload-id=<id> --confirm
+```
+
+Abort stale uploads:
+
+```bash
+php bin/console vortos:object-store:multipart abort-stale --older-than="-24 hours" --dry-run
+php bin/console vortos:object-store:multipart abort-stale --older-than="-24 hours" --confirm
+```
+
+## Operational Guidance
+
+- Keep concurrency modest until provider and network behavior is measured.
+- Use larger part sizes for very large objects to stay below S3 part count limits.
+- Put imports and exports under predictable prefixes.
+- Run stale multipart cleanup on a schedule.
+- Alert if stale multipart uploads accumulate.
+

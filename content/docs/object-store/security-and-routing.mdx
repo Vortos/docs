@@ -1,0 +1,99 @@
+---
+title: Security And Routing
+description: Object key policy, malware quarantine extension points, data residency routing, and IAM guidance.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Security And Routing
+
+Object storage is internet-adjacent infrastructure. Treat object keys and upload intents as security boundaries.
+
+## Key Design
+
+Use deterministic, server-generated permanent keys:
+
+```text
+assets/users/{userId}/avatar/{random}.jpg
+assets/tenants/{tenantId}/documents/{documentId}.pdf
+exports/{exportId}/archive.zip
+tmp/users/{userId}/{random}
+```
+
+Avoid:
+
+- Permanent keys supplied by the browser.
+- User email addresses in keys.
+- Guessable IDs for private files.
+- Mixing temporary and permanent files under the same prefix.
+
+## Promotion Policy
+
+The package exposes `ObjectPromotionPolicyInterface` so applications can enforce domain-specific checks before promotion.
+
+Use this extension point for:
+
+- Tenant ownership checks.
+- Required metadata checks.
+- Content-type allow lists.
+- File category restrictions.
+- Quarantine or malware scan status checks.
+
+<Callout type="info" title="Malware and quarantine can be optional userland policy">
+If an application accepts identity documents, medical files, or arbitrary PDFs, add a malware/quarantine policy or middleware in that application. The framework package provides the extension points; the scanner choice and quarantine workflow are application-specific.
+</Callout>
+
+## IAM
+
+Use a dedicated object-store credential. Give the application only the bucket-level operations it needs.
+
+Common permissions:
+
+- Read object metadata and content.
+- Put objects.
+- Copy objects.
+- Delete objects.
+- List objects under operational prefixes.
+- Manage bucket lifecycle only for deployment credentials that run lifecycle commands.
+- List and abort multipart uploads only for operational credentials that need multipart maintenance.
+
+Separate runtime and infrastructure credentials when possible. The HTTP app usually does not need lifecycle mutation permissions.
+
+## Data Residency And Routing
+
+The default router is a single object store. For multi-region or data residency requirements, replace the router implementation behind `ObjectStoreRouterInterface`.
+
+Example routing policy:
+
+```text
+EU tenant -> eu bucket and eu endpoint
+US tenant -> us bucket and us endpoint
+Public marketing assets -> global bucket
+```
+
+Keep routing decisions at the infrastructure boundary. Domain objects should store object keys or asset references, not provider SDK objects.
+
+## Public URLs
+
+Set a CDN or public base URL only for prefixes that are safe to expose.
+
+```php
+$config->bucketConfig()
+    ->publicBaseUrl('https://cdn.example.com');
+```
+
+For private files, prefer temporary download URLs with short TTLs.
+
+## Abuse Controls
+
+For public upload intent endpoints:
+
+- Authenticate the caller.
+- Rate-limit intent creation.
+- Validate content type.
+- Validate declared size.
+- Use short TTLs.
+- Generate random temporary keys.
+- Store intent metadata if the application needs ownership checks.
+- Reject promotion when the temporary key does not belong to the authenticated actor.
+

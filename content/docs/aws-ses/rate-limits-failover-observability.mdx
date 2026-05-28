@@ -1,0 +1,111 @@
+---
+title: Rate Limits, Failover, Observability
+description: Production tuning for SES throughput, multi-region fallback, logs, metrics, and tracing.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Rate Limits, Failover, Observability
+
+## Rate Limits
+
+SES accounts have send-rate quotas. Configure Vortos to match your account instead of discovering the limit through throttling.
+
+```php title="config/ses.php"
+$config->rateLimit()
+    ->maxSendRate(14)
+    ->burst(14)
+    ->waitTimeoutMs(5000);
+```
+
+Check provider quota:
+
+```bash
+php bin/console vortos:ses:quota
+```
+
+Best practices:
+
+- Start with one relay worker.
+- Match `maxSendRate()` to the lowest SES quota across active regions.
+- Increase worker count only after observing database locks, outbox lag, provider throttles, and application metrics.
+- Treat throttling as a capacity signal, not a normal control loop.
+
+## Multi-Region Failover
+
+Set a fallback SES region:
+
+```php
+$config
+    ->region('us-east-1')
+    ->fallbackRegion('us-west-2');
+```
+
+The circuit breaker prevents repeated attempts against a failing region:
+
+```php
+$config->circuitBreaker()
+    ->failureThreshold(5)
+    ->resetTimeoutSeconds(60);
+```
+
+<Callout type="info" title="Verify identities in every sending region">
+SES identity verification, DKIM, configuration sets, and production access are region-specific. A fallback region that is not fully configured is not a real fallback.
+</Callout>
+
+## Observability Defaults
+
+The package integrates with the framework logger, tracing, and metrics packages. All are enabled by default at the SES package level.
+
+```php
+$config->observability()
+    ->logging(true)
+    ->tracing(true)
+    ->metrics(true);
+```
+
+Global opt-out:
+
+```php
+$config->observability()
+    ->logging(false)
+    ->tracing(false)
+    ->metrics(false);
+```
+
+Section-level opt-out:
+
+```php
+use Vortos\Ses\Config\SesObservabilitySection;
+
+$config->observability()
+    ->disableLoggingFor(SesObservabilitySection::RateLimit)
+    ->disableTracingFor(SesObservabilitySection::Webhook)
+    ->disableMetricsFor(SesObservabilitySection::Audit);
+```
+
+Typed sections:
+
+- `Send`
+- `Outbox`
+- `Webhook`
+- `Suppression`
+- `RateLimit`
+- `Audit`
+
+## Operational Signals
+
+Track at least:
+
+- Outbox pending count.
+- Oldest pending outbox age.
+- Relay success and failure counts.
+- Provider throttles.
+- Suppressed recipient rejections.
+- Bounce and complaint counts.
+- Send latency by driver and region.
+
+## Privacy
+
+Email addresses are personal data. Keep logs and traces high-signal but avoid putting full message bodies or sensitive payloads into log lines. Use IDs, hashes, or domain-level counters where possible.
+

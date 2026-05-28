@@ -1,0 +1,168 @@
+---
+title: SES Configuration
+description: Full configuration reference for the Vortos AWS SES package.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# SES Configuration
+
+`config/ses.php` receives `Vortos\Ses\DependencyInjection\VortosSesConfig`. Every setting has a default, so simple projects can install the package, set environment variables, and start using it.
+
+```php title="config/ses.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\Ses\Config\SesObservabilitySection;
+use Vortos\Ses\DependencyInjection\VortosSesConfig;
+
+return static function (VortosSesConfig $config): void {
+    $config
+        ->driver($_ENV['VORTOS_MAILER_DRIVER'] ?? 'log')
+        ->region($_ENV['AWS_SES_REGION'] ?? 'us-east-1')
+        ->fallbackRegion($_ENV['AWS_SES_FALLBACK_REGION'] ?? null)
+        ->defaultFrom($_ENV['SES_FROM_ADDRESS'] ?? '', $_ENV['SES_FROM_NAME'] ?? '')
+        ->replyTo($_ENV['SES_REPLY_TO'] ?? null)
+        ->configurationSet($_ENV['SES_CONFIGURATION_SET'] ?? null)
+        ->templateDir(__DIR__ . '/../templates/email');
+
+    $config->awsClient()
+        ->endpointOverride($_ENV['AWS_ENDPOINT'] ?? null)
+        ->httpTimeout(2.0)
+        ->maxRetries(3);
+
+    $config->outbox()
+        ->enabled(true)
+        ->batchSize(50)
+        ->sleepSecondsWhenEmpty(2)
+        ->maxDeliveryAttempts(5)
+        ->retryStrategy('exponential')
+        ->backoffBaseSeconds(30)
+        ->backoffCapSeconds(3600)
+        ->staleMessageTimeoutSeconds(300);
+
+    $config->rateLimit()
+        ->maxSendRate(14)
+        ->burst(14)
+        ->waitTimeoutMs(5000);
+
+    $config->suppression()
+        ->syncOnStartup(false)
+        ->onSuppressed('throw');
+
+    $config->webhooks()
+        ->enabled(true)
+        ->routePath('/webhooks/aws/ses');
+
+    $config->auditLog()->enabled(true);
+
+    $config->circuitBreaker()
+        ->failureThreshold(5)
+        ->resetTimeoutSeconds(60);
+
+    $config->observability()
+        ->logging(true)
+        ->tracing(true)
+        ->metrics(true)
+        ->disableLoggingFor(SesObservabilitySection::RateLimit);
+};
+```
+
+## Top-Level Settings
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `driver()` | `$_ENV['VORTOS_MAILER_DRIVER'] ?? 'log'` | `ses`, `log`, or `null`. |
+| `region()` | `$_ENV['AWS_SES_REGION'] ?? 'us-east-1'` | Primary SES region. |
+| `fallbackRegion()` | `$_ENV['AWS_SES_FALLBACK_REGION'] ?? null` | Enables multi-region failover when set. |
+| `defaultFrom()` | `SES_FROM_ADDRESS`, `SES_FROM_NAME` | Sender used when an `Email` does not set `from`. |
+| `replyTo()` | `$_ENV['SES_REPLY_TO'] ?? null` | Default Reply-To. |
+| `configurationSet()` | `$_ENV['SES_CONFIGURATION_SET'] ?? null` | SES configuration set for AWS-level tracking. |
+| `templateDir()` | `null` | Directory for PHP email templates. |
+
+## AWS Client
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `endpointOverride()` | `$_ENV['AWS_ENDPOINT'] ?? null` | Custom SES endpoint. Do not use LocalStack in official CI for this package. |
+| `httpTimeout()` | `2.0` | Provider request timeout in seconds. |
+| `maxRetries()` | `3` | AWS SDK retry attempts. |
+
+## Outbox
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `enabled()` | `true` | Routes `MailerInterface` through transactional outbox. |
+| `tableName()` | `ses_outbox` | Outbox table. |
+| `batchSize()` | `50` | Relay batch size. |
+| `sleepSecondsWhenEmpty()` | `2` | Worker idle sleep. |
+| `maxDeliveryAttempts()` | `5` | Attempts before terminal failure. |
+| `retryStrategy()` | `exponential` | Retry calculation strategy. |
+| `backoffBaseSeconds()` | `30` | Initial retry delay. |
+| `backoffCapSeconds()` | `3600` | Maximum retry delay. |
+| `staleMessageTimeoutSeconds()` | `300` | Lease timeout for stuck in-progress messages. |
+
+<Callout type="info" title="Outbox is the default">
+For business workflows, keep outbox enabled and inject `MailerInterface` from command handlers. Use `ImmediateMailerInterface` only when you explicitly want a direct provider call.
+</Callout>
+
+## Rate Limit
+
+Set `maxSendRate()` to the SES account's production send rate. This protects you from provider throttling and helps keep worker behavior predictable.
+
+| Method | Default |
+| --- | --- |
+| `maxSendRate()` | `14` |
+| `burst()` | `14` |
+| `waitTimeoutMs()` | `5000` |
+
+## Suppression
+
+| Method | Default | Purpose |
+| --- | --- | --- |
+| `tableName()` | `ses_suppression_list` | Local suppression table. |
+| `syncOnStartup()` | `false` | Whether to sync from SES during boot. Usually leave false and run explicit commands. |
+| `onSuppressed()` | `throw` | `throw` rejects the email; `strip` removes suppressed recipients. |
+
+## Audit Log
+
+| Method | Default |
+| --- | --- |
+| `enabled()` | `true` |
+| `tableName()` | `ses_audit_log` |
+
+## Webhooks
+
+| Method | Default |
+| --- | --- |
+| `enabled()` | `true` |
+| `routePath()` | `/webhooks/aws/ses` |
+
+## Observability
+
+Observability uses the framework logger, tracing, and metrics packages. The SES package enables all three by default and lets you opt out globally or by typed section.
+
+```php
+use Vortos\Ses\Config\SesObservabilitySection;
+
+$config->observability()
+    ->logging(false)
+    ->tracing(false)
+    ->metrics(false);
+
+$config->observability()
+    ->disableLoggingFor(SesObservabilitySection::Send)
+    ->disableTracingFor(SesObservabilitySection::Outbox)
+    ->disableMetricsFor(SesObservabilitySection::Webhook);
+```
+
+Sections:
+
+- `SesObservabilitySection::Send`
+- `SesObservabilitySection::Outbox`
+- `SesObservabilitySection::Webhook`
+- `SesObservabilitySection::Suppression`
+- `SesObservabilitySection::RateLimit`
+- `SesObservabilitySection::Audit`
+

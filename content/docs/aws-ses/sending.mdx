@@ -1,0 +1,155 @@
+---
+title: Sending Email
+description: Compose and send typed emails with Vortos SES.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Sending Email
+
+Business code sends email through typed value objects. Avoid raw provider arrays in application code.
+
+## Basic Email
+
+```php title="src/Billing/Application/Handler/SendReceiptHandler.php"
+<?php
+
+declare(strict_types=1);
+
+namespace App\Billing\Application\Handler;
+
+use Vortos\Ses\Contract\MailerInterface;
+use Vortos\Ses\ValueObject\Email;
+
+final class SendReceiptHandler
+{
+    public function __construct(private readonly MailerInterface $mailer) {}
+
+    public function handle(SendReceipt $command): void
+    {
+        $email = Email::new()
+            ->to($command->customerEmail)
+            ->subject('Your receipt')
+            ->htmlBody('<p>Thank you for your payment.</p>')
+            ->textBody('Thank you for your payment.');
+
+        $this->mailer->send($email);
+    }
+}
+```
+
+When `from` is omitted, the package uses `defaultFrom()` from `config/ses.php`.
+
+## Recipients
+
+```php
+Email::new()
+    ->to('customer@example.com', 'Customer Name')
+    ->cc('accounting@example.com')
+    ->bcc('audit@example.com')
+    ->replyTo('support@example.com', 'Support')
+    ->subject('Invoice')
+    ->textBody('Attached is your invoice.');
+```
+
+`EmailAddress` normalizes and validates addresses. Invalid addresses are rejected before SES is called.
+
+## Attachments
+
+```php
+use Vortos\Ses\ValueObject\Attachment;
+use Vortos\Ses\ValueObject\Email;
+
+$email = Email::new()
+    ->to('customer@example.com')
+    ->subject('Invoice')
+    ->textBody('Attached is your invoice.')
+    ->attach(Attachment::fromPath(
+        filePath: '/app/storage/invoices/inv-1001.pdf',
+        filename: 'invoice-1001.pdf',
+        mimeType: 'application/pdf',
+    ));
+```
+
+<Callout type="warn" title="Keep email attachments small">
+Email is not object storage. For large exports or user media, upload to object storage and email a short-lived download link instead.
+</Callout>
+
+## Inline Images
+
+```php
+$logo = file_get_contents('/app/assets/logo.png');
+
+$email = Email::new()
+    ->to('user@example.com')
+    ->subject('Welcome')
+    ->htmlBody('<img src="cid:logo"> Welcome')
+    ->attach(Attachment::inline('logo.png', 'image/png', $logo, 'logo'));
+```
+
+## Metadata For Middleware
+
+Metadata is internal to Vortos. It is passed through middleware and is not sent to SES.
+
+```php
+$email = Email::new()
+    ->to('user@example.com')
+    ->subject('Welcome')
+    ->textBody('Welcome')
+    ->withMeta('domain_event_id', $event->id()->toString());
+```
+
+## Service Selection
+
+Use `MailerInterface` inside command handlers when the email intent must commit atomically with domain state.
+
+Use `StandaloneMailerInterface` in maintenance commands when the outbox write should be reliable but independent.
+
+Use `ImmediateMailerInterface` for diagnostics or operational probes.
+
+```php
+use Vortos\Ses\Contract\ImmediateMailerInterface;
+use Vortos\Ses\ValueObject\Email;
+
+final class SesProbe
+{
+    public function __construct(private readonly ImmediateMailerInterface $mailer) {}
+
+    public function __invoke(string $recipient): void
+    {
+        $this->mailer->send(
+            Email::new()
+                ->to($recipient)
+                ->subject('SES probe')
+                ->textBody('Probe email from Vortos.'),
+        );
+    }
+}
+```
+
+## Custom Middleware
+
+Use middleware for cross-cutting policy, not ad hoc checks in every handler.
+
+```php
+use Vortos\Ses\Attribute\AsEmailMiddleware;
+use Vortos\Ses\Contract\EmailMiddlewareInterface;
+use Vortos\Ses\ValueObject\Email;
+use Vortos\Ses\ValueObject\SentEmail;
+
+#[AsEmailMiddleware(priority: 500)]
+final class TenantHeaderMiddleware implements EmailMiddlewareInterface
+{
+    public function send(Email $email, callable $next): SentEmail
+    {
+        return $next($email->header('X-Tenant', 'acme'));
+    }
+}
+```
+
+You can generate a middleware skeleton when the Make package is installed:
+
+```bash
+php bin/console vortos:ses:make:email-middleware TenantHeader --context=Notification --priority=500
+```
+

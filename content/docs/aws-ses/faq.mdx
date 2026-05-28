@@ -1,0 +1,60 @@
+---
+title: SES FAQ
+description: Common questions about the Vortos AWS SES package.
+---
+
+# SES FAQ
+
+## Can I Use SES With No Config File?
+
+Yes. Install the package, register `SesPackage`, set the required env vars, and use `MailerInterface`.
+
+## Is The Package Optional?
+
+Yes. Projects that do not install or register `vortos/vortos-ses` do not get SES services, commands, tables, or workers.
+
+## Can I Disable Logs, Metrics, Or Tracing?
+
+Yes.
+
+```php
+$config->observability()
+    ->logging(false)
+    ->tracing(false)
+    ->metrics(false);
+```
+
+You can also disable only specific sections with `SesObservabilitySection`.
+
+## Why Are There Separate Messaging, SES, And Object Store Outbox Tables?
+
+They have different payloads, retry semantics, workers, and operational indexes. Atomicity comes from writing the rows inside the same database transaction, not from sharing one physical table.
+
+## Does Supervisor Setup Happen Automatically?
+
+No. Vortos can generate and maintain managed supervisor blocks, but production process management is an explicit deployment action:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+## Can I Send Directly Without Outbox?
+
+Yes. Inject `ImmediateMailerInterface`. Use it deliberately because it does not provide outbox retry or transaction atomicity.
+
+## Can I Use Outbox Without Joining A Domain Transaction?
+
+Yes. Inject `StandaloneMailerInterface`. It writes an outbox row inside its own short transaction.
+
+## Does Vortos Verify SNS Webhook Signatures?
+
+Yes. The webhook path uses SNS signature verification. Keep this enabled.
+
+## Should I Sync Suppression Lists On Startup?
+
+Usually no. Prefer explicit operations commands. Startup sync can slow boot and create provider pressure.
+
+## Does The Package Use LocalStack?
+
+No. The package is designed for real-provider integration tests gated by credentials, not LocalStack.
+

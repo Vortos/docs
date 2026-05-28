@@ -1,0 +1,96 @@
+---
+title: Object Store
+description: First-class object storage for Vortos with Cloudflare R2 defaults, S3-compatible semantics, direct uploads, lifecycle cleanup, outbox promotion, and observability.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Object Store
+
+`vortos/vortos-object-store` is the first-class object storage package for Vortos. It uses S3-compatible semantics so Cloudflare R2, AWS S3, and other compatible providers can share one application contract.
+
+The package is optimized for the default enterprise upload path: the backend creates short-lived upload intent objects, browsers upload directly to object storage, and command handlers promote validated temporary files to permanent keys through an outbox.
+
+<Callout type="info" title="Direct-to-cloud is the default design">
+Large public uploads should not stream through PHP workers. The backend issues a presigned upload URL or POST policy, then stores object keys. This keeps web workers available under heavy upload traffic.
+</Callout>
+
+## What The Package Covers
+
+- S3-compatible driver with Cloudflare R2 defaults.
+- Typed object keys, content types, metadata, byte ranges, upload constraints, and presigned URLs.
+- Direct upload lifecycle: create intent, promote temporary object, abort temporary object.
+- Transactional object-store outbox for writes, deletes, copies, moves, promotions, and aborts.
+- Explicit service interfaces for transactional, standalone async, and immediate provider behavior.
+- Temporary upload lifecycle rule planning and application.
+- Trusted server-side multipart transfers for backend-owned streams and files.
+- Provider exception mapping into Vortos exceptions.
+- Logging, tracing, and metrics with global and section-level opt-outs.
+- Testing fake for application tests.
+
+## Provider Strategy
+
+The package exposes S3 bucket semantics intentionally. R2 is S3-compatible for object APIs, and AWS S3 remains the broadest interoperability contract in the object storage ecosystem.
+
+The result is one Vortos API:
+
+```php
+use Vortos\ObjectStore\Contract\ObjectStoreInterface;
+
+$object = $objects->head('assets/invoices/inv-1001.pdf');
+```
+
+and provider-specific configuration at the edge:
+
+```php
+$config
+    ->driver('s3')
+    ->provider('r2')
+    ->region('auto')
+    ->bucket($_ENV['OBJECT_STORE_BUCKET']);
+```
+
+## Documentation Map
+
+<Cards>
+  <Card title="Quickstart" href="/docs/object-store/quickstart" description="Install, configure, and create your first direct upload intent." />
+  <Card title="Configuration" href="/docs/object-store/configuration" description="Full config reference for client, bucket, retry, outbox, lifecycle, multipart, and observability settings." />
+  <Card title="Direct Uploads" href="/docs/object-store/direct-uploads" description="Browser-to-R2/S3 upload flow with content type and size constraints." />
+  <Card title="Outbox Promotions" href="/docs/object-store/outbox-and-promotions" description="Atomic promotion from tmp keys to permanent keys inside command handlers." />
+  <Card title="Lifecycle Cleanup" href="/docs/object-store/lifecycle-cleanup" description="Managed tmp object expiration rules with explicit commands." />
+  <Card title="Multipart" href="/docs/object-store/server-side-multipart" description="Trusted backend multipart transfers and stale upload cleanup." />
+</Cards>
+
+## Service Guarantees
+
+The injected interface is the delivery guarantee.
+
+```php
+use Vortos\ObjectStore\Contract\ObjectStoreInterface;
+use Vortos\ObjectStore\Contract\DirectUploadManagerInterface;
+use Vortos\ObjectStore\Contract\StandaloneObjectStoreInterface;
+use Vortos\ObjectStore\Contract\StandaloneDirectUploadManagerInterface;
+use Vortos\ObjectStore\Contract\ImmediateObjectStoreInterface;
+use Vortos\ObjectStore\Contract\ImmediateDirectUploadManagerInterface;
+```
+
+`ObjectStoreInterface` and `DirectUploadManagerInterface` are the normal business workflow path. Mutations write to the object-store outbox and require the active command transaction.
+
+`StandaloneObjectStoreInterface` and `StandaloneDirectUploadManagerInterface` write to the outbox in their own short transaction.
+
+`ImmediateObjectStoreInterface` and `ImmediateDirectUploadManagerInterface` call the provider directly with no outbox.
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\ObjectStore\DependencyInjection\ObjectStorePackage;
+
+$packages = [
+    // ... other packages
+    new ObjectStorePackage(),
+];
+```
+
+The package is optional. Projects that do not install or register it do not get object-store services, commands, tables, lifecycle tooling, or workers.
+

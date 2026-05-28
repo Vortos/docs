@@ -1,0 +1,126 @@
+---
+title: AWS SES
+description: First-class email delivery for Vortos with AWS SES, transactional outbox, suppression lists, bounce handling, rate limits, failover, and observability.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# AWS SES
+
+`vortos/vortos-ses` is the first-class email package for Vortos. It gives application code a small typed API while the package owns the enterprise concerns: SES transport mapping, transactional outbox, worker relay, rate limiting, suppression lists, bounce and complaint webhooks, audit logging, metrics, logs, traces, and testing fakes.
+
+<Callout type="info" title="The application API stays small">
+Most business code injects `Vortos\Ses\Contract\MailerInterface` and calls `send()`. The selected driver, middleware stack, outbox behavior, retry policy, and observability are configured once at the package boundary.
+</Callout>
+
+## What The Package Guarantees
+
+The package separates email intent from delivery. A command handler can save a domain aggregate and enqueue an email in the same database transaction. A worker later relays the email to SES with bounded retries. If SES is down, the database transaction still commits and the outbox relay keeps trying.
+
+The package also prevents common production mistakes:
+
+- Invalid email addresses are rejected before the provider call.
+- Suppressed recipients are detected before sending.
+- SES account rate limits are respected by middleware.
+- Provider errors are mapped into Vortos exceptions.
+- Bounce and complaint notifications can update the local suppression list.
+- Logs, traces, and metrics are enabled by default but can be disabled globally or by typed section enum.
+
+## Drivers
+
+`ses` sends through AWS SES.
+
+`log` writes email attempts to the PSR logger and is the development default.
+
+`null` silently drops email and wires test-friendly fake services.
+
+## Service Guarantees
+
+Vortos does not hide delivery guarantees behind one ambiguous config switch. The interface you inject tells reviewers exactly what will happen.
+
+```php
+use Vortos\Ses\Contract\MailerInterface;
+use Vortos\Ses\Contract\StandaloneMailerInterface;
+use Vortos\Ses\Contract\ImmediateMailerInterface;
+
+final class RegistrationHandler
+{
+    public function __construct(
+        private MailerInterface $mailer,
+    ) {}
+}
+```
+
+`MailerInterface` is the normal application path. When outbox is enabled, it writes to `ses_outbox` and requires an active CommandBus or UnitOfWork transaction.
+
+`StandaloneMailerInterface` opens a short transaction for only the email outbox row. Use it for maintenance commands or scripts that want async reliability without joining a domain transaction.
+
+`ImmediateMailerInterface` calls the configured transport directly. Use it for diagnostics, probes, or rare workflows where email must be attempted immediately and no outbox row should exist.
+
+<Callout type="warn" title="Do not send user-facing business email from HTTP controllers directly">
+Send from command handlers through `MailerInterface` so domain persistence and email intent are committed atomically. Controllers should translate HTTP into commands.
+</Callout>
+
+## Architecture
+
+```text
+Command Handler
+    |
+    | MailerInterface::send(Email)
+    v
+Email Middleware Stack
+    | validate
+    | suppression check
+    | deduplication
+    | rate limit
+    | audit/log/trace/metrics
+    v
+Transactional Outbox Writer
+    |
+    | same DB transaction as domain save
+    v
+ses_outbox
+    |
+    | vortos:ses:outbox:relay
+    v
+SES Driver
+    |
+    v
+AWS SES
+```
+
+Webhook flow:
+
+```text
+AWS SNS -> /webhooks/aws/ses -> SNS signature verifier
+    |
+    +-> Bounce handlers
+    +-> Complaint handlers
+    +-> local suppression list
+```
+
+## Documentation Map
+
+<Cards>
+  <Card title="Quickstart" href="/docs/aws-ses/quickstart" description="Install the package, register it, set environment variables, and send your first email." />
+  <Card title="Configuration" href="/docs/aws-ses/configuration" description="Every config section, default, and production tuning option." />
+  <Card title="Sending" href="/docs/aws-ses/sending" description="Typed Email value objects, attachments, templates, and service guarantee choices." />
+  <Card title="Outbox" href="/docs/aws-ses/outbox-and-transactions" description="Atomic database transactions, relay workers, retries, and supervisor integration." />
+  <Card title="Webhooks" href="/docs/aws-ses/webhooks-and-suppression" description="SNS bounce and complaint handling with local suppression behavior." />
+  <Card title="Operations" href="/docs/aws-ses/testing-and-operations" description="Commands, tests, fakes, migrations, and production runbooks." />
+</Cards>
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Ses\DependencyInjection\SesPackage;
+
+$packages = [
+    // ... other packages
+    new SesPackage(),
+];
+```
+
+The package is optional. If a project does not install or register it, no SES services, tables, commands, middleware, or workers are added.
+

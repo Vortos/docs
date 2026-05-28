@@ -1,0 +1,68 @@
+---
+title: Object Store Observability
+description: Logs, metrics, tracing, and opt-out behavior for Vortos Object Store.
+---
+
+# Object Store Observability
+
+The object-store package integrates with the Vortos logger, tracing, and metrics packages. Package-level observability is enabled by default. Framework-level no-op implementations still make it safe for applications without a concrete telemetry backend.
+
+## Global Opt-Out
+
+```php
+$config->observability()
+    ->logging(false)
+    ->tracing(false)
+    ->metrics(false);
+```
+
+## Section Opt-Out
+
+Section opt-outs use typed enums, not string values.
+
+```php
+use Vortos\ObjectStore\Config\ObjectStoreObservabilitySection;
+
+$config->observability()
+    ->disableLoggingFor(ObjectStoreObservabilitySection::Presign)
+    ->disableTracingFor(ObjectStoreObservabilitySection::DirectUpload)
+    ->disableMetricsFor(ObjectStoreObservabilitySection::Outbox)
+    ->disableLoggingFor(ObjectStoreObservabilitySection::Lifecycle);
+```
+
+Sections:
+
+- `ObjectStoreObservabilitySection::Driver`
+- `ObjectStoreObservabilitySection::Presign`
+- `ObjectStoreObservabilitySection::DirectUpload`
+- `ObjectStoreObservabilitySection::Outbox`
+- `ObjectStoreObservabilitySection::Multipart`
+- `ObjectStoreObservabilitySection::Lifecycle`
+
+## Recommended Signals
+
+Track:
+
+- Presign count by route and result.
+- Direct upload intent count.
+- Promotion success and failure count.
+- Outbox pending count.
+- Oldest pending object-store outbox row age.
+- Provider latency by operation.
+- Provider throttles and access denied errors.
+- Lifecycle plan/apply failures.
+- Multipart upload failure and abort count.
+- Stale multipart upload count.
+
+## Logging Policy
+
+Log keys carefully. Object keys can contain tenant IDs, document IDs, or user-derived file names. Prefer structured logs with:
+
+- Operation name.
+- Bucket alias or provider.
+- Prefix category.
+- Correlation ID.
+- Exception class.
+
+Avoid logging full public URLs or signed query strings. Presigned URLs are credentials until they expire.
+

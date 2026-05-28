@@ -1,0 +1,113 @@
+---
+title: Outbox And Promotions
+description: Atomically adopt temporary direct-upload objects into permanent storage keys.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Outbox And Promotions
+
+Promotion copies an uploaded temporary object to a permanent key and optionally deletes the temporary source. With outbox enabled, promotion is recorded in `object_store_outbox` inside the command transaction.
+
+## Command Handler Example
+
+```php
+use Vortos\ObjectStore\Contract\DirectUploadManagerInterface;
+use Vortos\ObjectStore\ValueObject\PromoteObjectRequest;
+
+final class SubmitProfilePhotoHandler
+{
+    public function __construct(
+        private readonly ProfileRepository $profiles,
+        private readonly DirectUploadManagerInterface $uploads,
+    ) {}
+
+    public function handle(SubmitProfilePhoto $command): void
+    {
+        $profile = $this->profiles->get($command->userId);
+
+        $permanentKey = sprintf(
+            'assets/users/%s/avatar/%s.jpg',
+            $command->userId,
+            bin2hex(random_bytes(16)),
+        );
+
+        $this->uploads->promote(PromoteObjectRequest::fromKeys(
+            temporaryKey: $command->temporaryKey,
+            permanentKey: $permanentKey,
+        ));
+
+        $profile->changeAvatarKey($permanentKey);
+
+        $this->profiles->save($profile);
+    }
+}
+```
+
+When invoked through the command bus, both writes commit together:
+
+- Domain row references the permanent key.
+- `object_store_outbox` row records the promotion.
+
+If the database transaction rolls back, neither survives.
+
+## Temporary And Permanent Key Rules
+
+`PromoteObjectRequest` enforces:
+
+- Source key must be under the temporary prefix.
+- Permanent key cannot remain under the temporary prefix.
+- Temporary prefix cannot be empty.
+
+```php
+PromoteObjectRequest::fromKeys(
+    temporaryKey: 'tmp/users/123/upload.bin',
+    permanentKey: 'assets/users/123/avatar.bin',
+    temporaryPrefix: 'tmp',
+);
+```
+
+## Service Choice
+
+Use the transactional interface for domain workflows:
+
+```php
+DirectUploadManagerInterface $uploads;
+```
+
+Use standalone outbox for maintenance:
+
+```php
+StandaloneDirectUploadManagerInterface $uploads;
+```
+
+Use direct provider calls for diagnostics:
+
+```php
+ImmediateDirectUploadManagerInterface $uploads;
+```
+
+<Callout type="warn" title="Do not promote before domain validation">
+Temporary uploads are quarantine-adjacent. Validate ownership, expected content type, expected size, and domain permission before promoting into permanent prefixes.
+</Callout>
+
+## Relay Worker
+
+```bash
+php bin/console vortos:object-store:relay
+php bin/console vortos:object-store:relay --once
+php bin/console vortos:object-store:relay --sleep=2
+```
+
+Install supervisor config:
+
+```bash
+php bin/console vortos:worker:install --worker=object-store-outbox-relay
+```
+
+## Why A Separate Outbox Table?
+
+Object-store operations have different payloads and retry semantics than email or domain events. A failed `copyObject` retry is operationally different from a failed SES send or Kafka publish. Separate tables keep indexes, workers, monitoring, and retention policies clean.
+
+Atomicity is still one transaction because the UnitOfWork owns the database transaction across all participating package writers.
+

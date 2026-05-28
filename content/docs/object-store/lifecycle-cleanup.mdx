@@ -1,0 +1,105 @@
+---
+title: Lifecycle Cleanup
+description: Manage temporary upload expiration rules for R2 and S3.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Lifecycle Cleanup
+
+Direct upload flows can create orphaned temporary files. A browser may upload to `tmp/` and then close before submitting the final command. Lifecycle cleanup deletes stale temporary objects automatically at the provider.
+
+## Managed Rule
+
+Default rule ID:
+
+```text
+vortos-object-store-expire-temporary-uploads
+```
+
+Default prefix:
+
+```text
+tmp/
+```
+
+Default TTL:
+
+```text
+86400 seconds
+```
+
+Configure:
+
+```php
+$config->bucketConfig()
+    ->temporaryKeyPrefix('tmp')
+    ->orphanTtlSeconds(86400);
+
+$config->lifecycle()
+    ->enabled(true)
+    ->manageTemporaryUploads(true)
+    ->ruleId('vortos-object-store-expire-temporary-uploads')
+    ->requireConfirmation(true);
+```
+
+## Commands
+
+Show current provider lifecycle rules:
+
+```bash
+php bin/console vortos:object-store:lifecycle show
+php bin/console vortos:object-store:lifecycle show --json
+```
+
+Plan changes:
+
+```bash
+php bin/console vortos:object-store:lifecycle plan
+php bin/console vortos:object-store:lifecycle plan --json
+```
+
+Apply:
+
+```bash
+php bin/console vortos:object-store:lifecycle apply --confirm
+```
+
+Remove the managed rule:
+
+```bash
+php bin/console vortos:object-store:lifecycle remove --confirm
+```
+
+Dry-run mutations:
+
+```bash
+php bin/console vortos:object-store:lifecycle apply --dry-run
+php bin/console vortos:object-store:lifecycle remove --dry-run
+```
+
+## Enterprise Safety Behavior
+
+The lifecycle manager reads existing provider lifecycle config, modifies only the Vortos-managed rule, preserves unrelated rules, and writes the merged configuration back.
+
+It does not run automatically during:
+
+- HTTP requests.
+- Worker boot.
+- Container compilation.
+- Cache warmup.
+
+Infrastructure mutation belongs in deployment or operations workflows.
+
+<Callout type="warn" title="R2 and S3 use day-level lifecycle expiration">
+Provider lifecycle expiration is day-based. If `orphanTtlSeconds()` is less than one day, Vortos rejects the config unless `roundUpMinimumLifecycleDay(true)` is set deliberately.
+</Callout>
+
+## Recommended Policy
+
+- Put all direct uploads under `tmp/`.
+- Set lifecycle cleanup to one day unless your UX requires longer resumability.
+- Promote valid uploads to permanent keys after the domain command succeeds.
+- Never use `tmp/` as a permanent prefix.
+- Alert on unusually high `tmp/` object growth because it may indicate frontend failures or abuse.
+

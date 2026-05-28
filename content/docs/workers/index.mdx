@@ -1,0 +1,76 @@
+---
+title: Workers
+description: Manage Vortos long-running worker processes with package-discovered supervisor definitions.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Workers
+
+Vortos packages can contribute worker process definitions. The Docker package exposes `vortos:worker:*` commands that list, install, and remove those definitions from `docker/worker/supervisord.conf` as managed supervisor blocks.
+
+This gives projects an explicit, repeatable deployment step without forcing optional packages into every application.
+
+<Callout type="info" title="Optional packages stay optional">
+Messaging is part of the framework baseline. SES, Object Store, and future packages such as payments only contribute workers when installed and registered.
+</Callout>
+
+## Core Commands
+
+```bash
+php bin/console vortos:worker:list
+php bin/console vortos:worker:install
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+php bin/console vortos:worker:remove ses-outbox-relay
+```
+
+## Registered Workers
+
+Current package workers:
+
+| Worker | Command | Package |
+| --- | --- | --- |
+| `messaging-outbox-relay` | `php /var/www/html/bin/console vortos:outbox:relay` | Messaging |
+| `ses-outbox-relay` | `php /var/www/html/bin/console vortos:ses:outbox:relay` | AWS SES |
+| `object-store-outbox-relay` | `php /var/www/html/bin/console vortos:object-store:relay` | Object Store |
+
+## Documentation Map
+
+<Cards>
+  <Card title="Supervisor" href="/docs/workers/supervisor" description="How managed supervisor blocks are generated, updated, removed, and deployed." />
+  <Card title="Registered Workers" href="/docs/workers/registered-workers" description="Worker definitions contributed by installed Vortos packages." />
+  <Card title="Operations" href="/docs/workers/operations" description="Deployment, reloads, monitoring, and scaling runbooks." />
+  <Card title="Troubleshooting" href="/docs/workers/troubleshooting" description="Diagnose missing workers, stale supervisor config, and process failures." />
+</Cards>
+
+## Why This Exists
+
+Before package-level workers, every package had to document a supervisor snippet and every application had to manually merge it. That is error-prone at scale.
+
+The worker registry centralizes:
+
+- Discovering workers from installed packages.
+- Rendering supervisor program blocks.
+- Preserving unrelated supervisor config.
+- Updating only Vortos-managed blocks.
+- Supporting dry-run review before writing.
+
+## Install Everything Registered
+
+```bash
+php bin/console vortos:worker:install
+```
+
+Install one or more workers:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay --worker=object-store-outbox-relay
+```
+
+Preview:
+
+```bash
+php bin/console vortos:worker:install --dry-run
+```
+

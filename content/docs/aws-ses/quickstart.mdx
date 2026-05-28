@@ -1,0 +1,182 @@
+---
+title: AWS SES Quickstart
+description: Install and configure Vortos AWS SES for production, development, and test environments.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# AWS SES Quickstart
+
+This guide gets a project from zero to a production-ready SES integration with the default Vortos behavior.
+
+<Steps>
+
+<Step>
+
+### Install The Package
+
+```bash
+composer require vortos/vortos-ses
+```
+
+</Step>
+
+<Step>
+
+### Register The Package
+
+```php title="bootstrap/app.php"
+use Vortos\Ses\DependencyInjection\SesPackage;
+
+$packages = [
+    // ... other packages
+    new SesPackage(),
+];
+```
+
+</Step>
+
+<Step>
+
+### Set Environment Variables
+
+Production:
+
+```dotenv title=".env"
+VORTOS_MAILER_DRIVER=ses
+AWS_SES_REGION=us-east-1
+AWS_ACCESS_KEY_ID=your-access-key
+AWS_SECRET_ACCESS_KEY=your-secret-key
+SES_FROM_ADDRESS=no-reply@example.com
+SES_FROM_NAME="Example App"
+```
+
+Development:
+
+```dotenv title=".env"
+VORTOS_MAILER_DRIVER=log
+SES_FROM_ADDRESS=no-reply@example.test
+```
+
+Testing:
+
+```dotenv title=".env.test"
+VORTOS_MAILER_DRIVER=null
+SES_FROM_ADDRESS=no-reply@example.test
+```
+
+</Step>
+
+<Step>
+
+### Publish Or Create Config
+
+The package works from environment variables alone. For explicit project config, create `config/ses.php`:
+
+```php title="config/ses.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\Ses\DependencyInjection\VortosSesConfig;
+
+return static function (VortosSesConfig $config): void {
+    $config
+        ->driver($_ENV['VORTOS_MAILER_DRIVER'] ?? 'log')
+        ->region($_ENV['AWS_SES_REGION'] ?? 'us-east-1')
+        ->defaultFrom(
+            $_ENV['SES_FROM_ADDRESS'] ?? '',
+            $_ENV['SES_FROM_NAME'] ?? '',
+        );
+};
+```
+
+</Step>
+
+<Step>
+
+### Run Database Migrations
+
+The SES package ships migrations for:
+
+- `ses_suppression_list`
+- `ses_outbox`
+- `ses_audit_log`
+
+Run your normal Vortos migration command after registering the package.
+
+</Step>
+
+<Step>
+
+### Install The Worker
+
+If outbox is enabled, production needs the relay worker:
+
+```bash
+php bin/console vortos:worker:install --worker=ses-outbox-relay
+```
+
+Then reload your worker container or supervisor process according to your deployment runbook.
+
+</Step>
+
+<Step>
+
+### Send A Test Email
+
+```bash
+php bin/console vortos:ses:send:test you@example.com
+php bin/console vortos:ses:send:test you@example.com --from=no-reply@example.com --subject="SES smoke test"
+```
+
+</Step>
+
+</Steps>
+
+<Callout type="warn" title="AWS SES sandbox">
+New SES accounts often start in sandbox mode. In sandbox mode, AWS only allows sending from verified identities to verified recipients. Move the SES account out of sandbox before relying on production traffic.
+</Callout>
+
+## Minimum IAM Permissions
+
+Use a dedicated IAM principal for the application. The sending path needs permission to send email. Suppression sync and quota commands need additional read permissions.
+
+Typical permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ses:SendEmail",
+        "ses:SendRawEmail",
+        "ses:GetSendQuota",
+        "ses:GetAccount",
+        "ses:ListSuppressedDestinations",
+        "ses:GetSuppressedDestination"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+Keep IAM credentials out of source control. Rotate them through your secret manager.
+
+## Production Checklist
+
+- Verify sender domain or email identity in SES.
+- Configure DKIM, SPF, and DMARC for the domain.
+- Set `VORTOS_MAILER_DRIVER=ses`.
+- Set the correct `AWS_SES_REGION`.
+- Configure `SES_FROM_ADDRESS`.
+- Tune `rateLimit()->maxSendRate()` to match the SES account quota.
+- Run package migrations.
+- Install `ses-outbox-relay` through `vortos:worker:install`.
+- Configure SNS bounce and complaint webhooks.
+- Confirm logs, metrics, and traces are visible in the framework observability stack.
+
