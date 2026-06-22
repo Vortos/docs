@@ -69,6 +69,22 @@ Exit code `0` means every executed framework migration's tables and columns are 
 
 Add `--json` for machine-readable output in CI pipelines. Only framework module migrations are verified — user-authored migrations are skipped.
 
+## PostgreSQL Schema Bootstrap
+
+When your `DATABASE_URL` uses a `pgsql://` or `postgres://` scheme, `vortos:migrate` automatically runs:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS vortos
+```
+
+before executing any migrations. You do not need to create the schema manually or add it to your deployment scripts.
+
+`vortos:migrate:fresh` drops the `vortos` schema completely (including all its tables) before re-running all migrations from scratch. This gives a guaranteed clean slate in development and CI.
+
+<Callout type="info" title="Opting out">
+Add `?vortos_prefix=true` to your DSN to use underscore prefix mode (`vortos_table_name`) instead of schema mode. No schema is created in prefix mode. See the [DBAL docs](/docs/persistence/dbal#framework-table-namespace) for details.
+</Callout>
+
 ## Locking
 
 On PostgreSQL, `vortos:migrate` uses an advisory lock so two deployment runners cannot migrate at the same time.
@@ -113,4 +129,43 @@ Review the generated migration file in `migrations/` before running step 3. The 
 
 <Callout type="info" title="One migrations/ directory">
 Framework table migrations and ORM entity migrations are indistinguishable to `vortos:migrate` — it runs them in timestamp order. Keep generated migration files in version control alongside hand-written ones.
+</Callout>
+
+---
+
+## Creating Migrations
+
+### `vortos:migrate:make`
+
+Generates an empty Doctrine migration class ready to be filled in:
+
+```bash
+php bin/console vortos:migrate:make CreateOrdersTable
+```
+
+Creates `migrations/VersionYYYYMMDDHHIISS.php` with empty `up()` and `down()` stubs.
+
+### `--aggregate` flag
+
+For DBAL aggregate tables, pass `--aggregate` with the table name. The migration is pre-filled with `id` and `lock_version` — the two columns every aggregate table requires:
+
+```bash
+php bin/console vortos:migrate:make orders --aggregate
+```
+
+Generated `up()`:
+
+```sql
+CREATE TABLE IF NOT EXISTS orders (
+    id           VARCHAR(36) NOT NULL,
+    lock_version INTEGER     NOT NULL DEFAULT 0,
+
+    PRIMARY KEY (id)
+)
+```
+
+Add your domain columns below `lock_version`, then run `vortos:migrate`.
+
+<Callout type="info" title="DBAL only">
+The `--aggregate` flag is for DBAL-backed aggregates only. ORM users generate migrations via `vortos:orm:diff` — Doctrine reads `lock_version` from the `#[ORM\Version]` annotation automatically.
 </Callout>

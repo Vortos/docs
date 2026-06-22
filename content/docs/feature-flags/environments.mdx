@@ -1,0 +1,89 @@
+---
+title: Environments
+description: Separate flag state per environment, promotion workflow, and environment-scoped permissions.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Environments
+
+A flag's enabled state, rules, and rollout percentage are independent per environment. Enabling a flag in `staging` has no effect on `production`. This lets you validate a rollout on lower environments before it reaches users.
+
+## Default environments
+
+The engine ships with three environments: `production`, `staging`, and `development`. You can add custom environments in configuration.
+
+The environment determines which copy of a flag's state the evaluator reads. Every `FlagRegistry::isEnabled()` call is scoped to the environment currently active in `FlagScopeContext`.
+
+## Setting the environment in code
+
+```php
+// Explicit environment for a scoped block
+$this->scopeContext->withEnvironment('staging');
+$enabled = $this->flags->isEnabled('new-checkout', $context);
+```
+
+In HTTP requests, the framework middleware populates `FlagScopeContext` from the request — typically via an internal header (`X-Vortos-Env`) or from the application's own environment configuration. Production requests do not need any special header; `production` is the default.
+
+## Managing per-environment state
+
+```bash
+# Enable in staging only
+php vortos vortos:flags:enable new-checkout --env=staging
+
+# Different rollout per environment
+php vortos vortos:flags:enable new-checkout --rollout=100 --env=staging
+php vortos vortos:flags:enable new-checkout --rollout=10  --env=production
+
+# Disable in production, leave staging untouched
+php vortos vortos:flags:disable new-checkout --env=production
+```
+
+## Promotion workflow
+
+The typical workflow moves a flag forward from development → staging → production as confidence grows:
+
+```
+development:   100% (team tests freely)
+staging:       100% (QA validates end-to-end)
+production:    5% → 25% → 50% → 100%
+```
+
+The admin UI has an **Environment Compare** screen that shows the state of all flags side-by-side across environments. Flags that are enabled in staging but disabled in production are highlighted — this is the promotion queue.
+
+To promote a flag's entire rule set from staging to production:
+
+```bash
+php vortos vortos:flags:promote new-checkout \
+  --from=staging \
+  --to=production
+```
+
+The promote command copies the enabled state and all rules from the source environment to the target. It does not delete the source state.
+
+<Callout type="warn" title="Production promotion requires flags.write">
+Promoting to `production` requires the `flags.write` permission. In organizations that use change requests, production promotions may also require 4-eyes approval. See [Change Requests](/docs/feature-flags/change-requests).
+</Callout>
+
+## Environment-level permissions
+
+You can grant `flags.write` for staging but require `flags.manage` for production. This lets a developer iterate freely on lower environments while production changes go through an approval process.
+
+Configure permission scoping in your authorization catalog:
+
+```php
+$catalog->define('flags.write.production', 'Modify flags in production environment');
+$catalog->define('flags.write.staging',    'Modify flags in staging environment');
+```
+
+The management authz gate checks the scoped permission before accepting any write that targets production.
+
+## Environment Compare in the admin UI
+
+Navigate to `/admin/flags/compare` to see all flags across environments in a single table. The view highlights:
+
+- Flags enabled in staging but not in production (promotion candidates)
+- Flags with different rollout percentages across environments
+- Flags missing from an environment entirely
+
+Use this view during release reviews to ensure staging has been properly validated before production promotion.

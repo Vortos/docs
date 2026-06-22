@@ -1,0 +1,12 @@
+{
+  "title": "Paddle Billing",
+  "pages": [
+    "index",
+    "quickstart",
+    "configuration",
+    "services",
+    "webhooks",
+    "outbox",
+    "testing-and-operations"
+  ]
+}

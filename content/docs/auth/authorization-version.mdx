@@ -11,13 +11,7 @@ Access tokens are stateless. Without a version check, a user whose role was remo
 
 ## The claim
 
-When `JwtService::issue()` creates an access token, it copies the identity attribute:
-
-```php
-$identity->getAttribute('authz_version', 0)
-```
-
-into the JWT:
+`authz_version` is a first-class JWT claim owned entirely by the authorization module. It is passed explicitly to `issue()` and `refresh()` — it is not an identity attribute and does not go through `getClaims()`.
 
 ```json
 {
@@ -28,7 +22,7 @@ into the JWT:
 }
 ```
 
-When the token is validated, `JwtService` preserves unknown claims as identity attributes. `PolicyEngine` can then read the token version from the current identity.
+When `JwtService::validate()` decodes the token it returns a `ValidatedToken` value object carrying `authzVersion` as a typed `int` field, separate from the identity. `AuthMiddleware` stores it in the request-scoped context where `PolicyEngine` reads it through `RequestAuthzVersionProvider`.
 
 ## Runtime version
 
@@ -51,7 +45,7 @@ The user must refresh or reauthenticate to get a token with the latest version.
 
 ## Issue tokens correctly
 
-When you issue or refresh tokens, include the current runtime version:
+Pass the current runtime version as the second argument to `issue()` and `refresh()`:
 
 ```php
 use Vortos\Auth\Identity\UserIdentity;
@@ -71,14 +65,30 @@ final class LoginController
         $identity = new UserIdentity(
             id: $user->id(),
             roles: $user->roles(),
-            attributes: [
-                'authz_version' => $this->versions->versionForUser($user->id()),
-            ],
         );
 
-        return new JsonResponse($this->jwt->issue($identity)->toArray());
+        return new JsonResponse(
+            $this->jwt->issue(
+                $identity,
+                $this->versions->versionForUser($user->id()),
+            )->toArray()
+        );
     }
 }
+```
+
+On refresh:
+
+```php
+$userId   = $this->jwt->getUserIdFromRefreshToken($refreshToken);
+$user     = $this->users->get($userId);
+$identity = new UserIdentity($userId, $user->roles());
+
+$newToken = $this->jwt->refresh(
+    $refreshToken,
+    $identity,
+    $this->versions->versionForUser($userId),
+);
 ```
 
 ## Configure the check

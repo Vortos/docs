@@ -1,0 +1,109 @@
+---
+title: Audit Log
+description: Every flag change is recorded with actor, timestamp, reason, and a before/after diff. Query it via the CQRS read model or browse it in the admin UI.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Audit Log
+
+Every write that goes through `FlagWriteService` produces an immutable audit entry. The entry records:
+
+- **What changed** — flag name, field, old value, new value
+- **Who changed it** — actor ID
+- **When** — UTC timestamp
+- **Why** — optional free-text reason (from the CLI `--reason` flag or the admin UI form)
+- **How** — source (CLI, admin UI, management API, GitOps sync)
+
+The audit log is append-only. Entries cannot be modified or deleted. This is the compliance record.
+
+## CQRS read model
+
+The audit log is separate from the main flag storage. Writes go to `FlagStorageInterface`; audit entries go to the append-only log. Reads come from two query-optimised repositories:
+
+```php
+use Vortos\FeatureFlags\ReadModel\FlagStateViewRepositoryInterface;
+use Vortos\FeatureFlags\ReadModel\FlagAuditLogRepositoryInterface;
+```
+
+**`FlagStateViewRepositoryInterface`** returns the current state of flags, denormalised for fast reads. Use this for dashboards and list views — it never hits the main storage table.
+
+```php
+// All flags for the current environment/project
+$views = $this->stateView->findAll($env, $project);
+
+// Single flag view
+$view = $this->stateView->findByName('new-checkout', $env);
+```
+
+**`FlagAuditLogRepositoryInterface`** returns the history of changes for a flag or actor.
+
+```php
+// Full history for a flag
+$entries = $this->auditLog->findByFlag('new-checkout', limit: 50);
+
+// All changes by an actor
+$entries = $this->auditLog->findByActor($actorId, since: new \DateTimeImmutable('-7 days'));
+
+// Changes in a time window
+$entries = $this->auditLog->findSince(
+    new \DateTimeImmutable('-24 hours'),
+    env: 'production'
+);
+```
+
+## Adding a reason to CLI changes
+
+Every CLI command accepts `--reason`:
+
+```bash
+php vortos vortos:flags:enable new-checkout \
+  --rollout=10 \
+  --reason="Initial rollout — ticket PROJ-1234"
+
+php vortos vortos:flags:disable new-checkout \
+  --reason="Incident INC-0042 — disabling while we investigate"
+```
+
+Reasons appear in the audit log and in the admin UI history timeline. They are not required but are strongly recommended for production changes.
+
+## History timeline in the admin UI
+
+The **History** tab on a flag's detail page shows the full audit timeline: every enable, disable, rule change, variant update, and schedule change, with actor and reason.
+
+The global history view at `/admin/flags/history` shows recent changes across all flags, filterable by actor, environment, and time range.
+
+## Exporting audit logs
+
+For compliance, audit entries can be exported as JSON or CSV:
+
+```bash
+php vortos vortos:flags:audit:export \
+  --env=production \
+  --since="2026-01-01" \
+  --until="2026-06-01" \
+  --format=json \
+  --output=audit-2026-h1.json
+```
+
+The export includes all fields: flag name, environment, project, actor, change type, old value, new value, reason, and timestamp.
+
+<Callout type="info" title="Audit log retention">
+Audit entries are kept indefinitely by default. Configure `feature_flags.audit_retention_days` to truncate old entries during database maintenance. Truncation is logged as a system entry.
+</Callout>
+
+## OpenTelemetry spans
+
+When the OTel integration is active, every flag evaluation produces a span:
+
+```
+vortos.flag.evaluate
+  flag.name        = "new-checkout"
+  flag.result      = true
+  flag.variant     = "control"
+  flag.rule_type   = "percentage"
+  flag.env         = "production"
+  user.id          = "user-abc"
+```
+
+Exposure events (when the user actually sees the flagged feature) produce separate `vortos.flag.exposure` spans. Use these for experiment analysis — the evaluation span tells you the flag was checked; the exposure span tells you the feature was shown.

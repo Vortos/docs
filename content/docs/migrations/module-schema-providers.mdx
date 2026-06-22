@@ -37,7 +37,7 @@ return new class extends AbstractModuleSchemaProvider {
 
     public function define(Schema $schema): void
     {
-        $roles = $schema->createTable('role_permissions');
+        $roles = $schema->createTable($this->t('role_permissions'));
         $roles->addColumn('role', 'string', ['length' => 150]);
         $roles->addColumn('permission', 'string', ['length' => 190]);
         $roles->addColumn('created_at', 'datetime_immutable');
@@ -46,6 +46,21 @@ return new class extends AbstractModuleSchemaProvider {
     }
 };
 ```
+
+### `$this->t()` — Framework Table Naming
+
+All framework module migrations must use `$this->t('table_name')` instead of a plain string in `createTable()`. `t()` applies the platform-specific framework namespace automatically:
+
+| Platform | `$this->t('role_permissions')` |
+|---|---|
+| PostgreSQL | `vortos.role_permissions` |
+| All others | `vortos_role_permissions` |
+
+The prefix is set once before providers are loaded — no runtime overhead.
+
+<Callout type="warn" title="Required for framework tables">
+Plain `$schema->createTable('role_permissions')` creates the table in the default schema with no prefix — it will not be recognised as a framework-owned table, drift detection will not track it, and it will conflict with your application tables. Always use `$this->t()`.
+</Callout>
 
 The provider gives Vortos structured ownership metadata:
 

@@ -1,0 +1,213 @@
+---
+title: Testing
+description: Test flag-gated code without hitting Redis or the database. In-memory storage, forced flag state, and integration patterns.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing
+
+## In-memory storage
+
+The engine ships with an in-memory storage implementation for tests. It has zero external dependencies — no Redis, no database, no infrastructure:
+
+```php
+use Vortos\FeatureFlags\Storage\InMemoryFlagStorage;
+use Vortos\FeatureFlags\FlagRegistry;
+use Vortos\FeatureFlags\FlagEvaluator;
+
+$storage  = new InMemoryFlagStorage();
+$registry = new FlagRegistry($storage, new FlagEvaluator());
+```
+
+## Forcing flag state in tests
+
+The simplest approach: create the flag in the in-memory storage directly with the state you want:
+
+```php
+use Vortos\FeatureFlags\FeatureFlag;
+use Vortos\FeatureFlags\FlagKind;
+use Vortos\FeatureFlags\FlagValueType;
+
+final class CheckoutControllerTest extends TestCase
+{
+    private FlagRegistry $flags;
+    private InMemoryFlagStorage $storage;
+
+    protected function setUp(): void
+    {
+        $this->storage = new InMemoryFlagStorage();
+        $this->flags   = new FlagRegistry($this->storage, new FlagEvaluator());
+    }
+
+    public function test_shows_new_checkout_when_flag_enabled(): void
+    {
+        $this->storage->save(
+            new FeatureFlag(
+                id:        'flag-1',
+                name:      'new-checkout',
+                enabled:   true,
+                rules:     [],
+                kind:      FlagKind::Release,
+                valueType: FlagValueType::Bool,
+            )
+        );
+
+        $result = $this->flags->isEnabled('new-checkout');
+
+        $this->assertTrue($result);
+    }
+
+    public function test_shows_legacy_checkout_when_flag_disabled(): void
+    {
+        // Flag does not exist in storage → evaluates to false
+        $result = $this->flags->isEnabled('new-checkout');
+
+        $this->assertFalse($result);
+    }
+}
+```
+
+## Testing with rules
+
+Create a flag with the exact rules you want to test:
+
+```php
+use Vortos\FeatureFlags\FlagRule;
+use Vortos\FeatureFlags\FlagContext;
+
+public function test_percentage_rollout(): void
+{
+    $flag = new FeatureFlag(
+        id:      'flag-1',
+        name:    'new-checkout',
+        enabled: true,
+        rules:   [
+            FlagRule::fromArray([
+                'type'       => FlagRule::TYPE_PERCENTAGE,
+                'percentage' => 50,
+            ]),
+        ],
+        kind:      FlagKind::Release,
+        valueType: FlagValueType::Bool,
+    );
+
+    $this->storage->save($flag);
+
+    // Deterministic — same userId always gives same result
+    $context = new FlagContext(userId: 'user-abc');
+    $result  = $this->flags->isEnabled('new-checkout', $context);
+
+    // Assert the specific outcome for this userId
+    // (compute hash('new-checkout' . 'user-abc') % 100 to know expected bucket)
+    $this->assertIsBool($result);
+}
+```
+
+## Testing variants
+
+```php
+public function test_variant_assignment(): void
+{
+    $flag = new FeatureFlag(
+        id:       'flag-1',
+        name:     'cta-button',
+        enabled:  true,
+        rules:    [],
+        variants: ['control' => 34, 'variant-a' => 33, 'variant-b' => 33],
+        kind:     FlagKind::Experiment,
+        valueType: FlagValueType::String,
+    );
+
+    $this->storage->save($flag);
+
+    $variant = $this->flags->variant('cta-button', new FlagContext(userId: 'user-abc'));
+
+    $this->assertContains($variant, ['control', 'variant-a', 'variant-b']);
+}
+```
+
+## Integration tests with FlagWriteService
+
+For tests that exercise the write path:
+
+```php
+use Vortos\FeatureFlags\Application\FlagWriteService;
+
+final class FlagWriteServiceTest extends TestCase
+{
+    private FlagWriteService $writeService;
+    private InMemoryFlagStorage $storage;
+
+    protected function setUp(): void
+    {
+        $this->storage      = new InMemoryFlagStorage();
+        $this->writeService = new FlagWriteService(
+            $this->storage,
+            new InMemoryAuditLogStorage(),
+            new NullCacheInvalidator(),
+            new NullChangeNotifier(),
+        );
+    }
+
+    public function test_enable_creates_audit_entry(): void
+    {
+        $this->writeService->create(
+            new FeatureFlag(id: 'f1', name: 'my-flag', enabled: false, ...),
+            actorId: 'user-1',
+        );
+
+        $this->writeService->enable('my-flag', actorId: 'user-1', reason: 'Test enable');
+
+        $flag = $this->storage->findByName('my-flag');
+        $this->assertTrue($flag->enabled);
+    }
+}
+```
+
+## PHPUnit test helpers
+
+The engine provides a `FlagTestHelper` trait for common assertions in HTTP tests:
+
+```php
+use Vortos\FeatureFlags\Testing\FlagTestHelper;
+
+final class CheckoutFeatureTest extends WebTestCase
+{
+    use FlagTestHelper;
+
+    public function test_new_checkout_is_gated(): void
+    {
+        $this->withFlag('new-checkout', enabled: false);
+
+        $response = $this->get('/checkout');
+
+        $this->assertStringContainsString('legacy', $response->getContent());
+    }
+
+    public function test_new_checkout_visible_when_enabled(): void
+    {
+        $this->withFlag('new-checkout', enabled: true);
+
+        $response = $this->get('/checkout');
+
+        $this->assertStringContainsString('new-checkout', $response->getContent());
+    }
+}
+```
+
+`withFlag()` populates the in-memory storage with a pre-configured flag for the duration of the test. It replaces any existing flag with the same name and resets after each test via `tearDown`.
+
+## What not to test
+
+**Do not test `FlagEvaluator` logic in your application tests.** The engine has its own test suite covering percentage bucketing, attribute operators, and rule ordering. Your application tests should test behaviour: "when the flag is on, the user sees X" — not "does hash(userId + flagName) % 100 work correctly."
+
+**Do not test the admin UI templates.** Twig template rendering is tested in the admin package's own test suite. Your application's concern is that the flag state is correct, not that the HTMX fragment renders the right HTML.
+
+<Callout type="info" title="Running in Docker">
+Run tests inside the `vortos-backend-1` container to avoid Redis connectivity errors that only appear on the host. Tests that use in-memory storage do not need Redis, but the test suite as a whole may have other infrastructure dependencies.
+
+```bash
+docker exec -it vortos-backend-1 ./vendor/bin/phpunit packages/Vortos/src/FeatureFlags
+```
+</Callout>

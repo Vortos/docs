@@ -9,6 +9,7 @@
     "security",
     "messaging",
     "aws-ses",
+    "paddle",
     "object-store",
     "cqrs",
     "persistence",

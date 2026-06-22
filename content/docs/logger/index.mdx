@@ -1,6 +1,6 @@
 ---
 title: Logger
-description: Named channels, correlation ID injection, log rotation, buffered writes, and alerting handlers — Monolog 3.x backed, enterprise-grade out of the box.
+description: Named channels routed to configurable sinks — rotation, compression, sampling, buffering, hash-chained audit logs, and alerting handlers, Monolog 3.x backed.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -8,7 +8,7 @@ import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # Logger
 
-`vortos-logger` wires [Monolog 3](https://seldaek.github.io/monolog/) as the PSR-3 `LoggerInterface`. No setup is required for basic usage — sensible defaults cover every environment. For production-grade setups you configure named channels, alerting, and correlation ID injection via `VortosLoggingConfig`.
+`vortos-logger` wires [Monolog 3](https://seldaek.github.io/monolog/) as the PSR-3 `LoggerInterface`. No setup is required for basic usage — sensible defaults cover every environment. For production-grade setups you configure channels and the **sinks** they route to via `VortosLoggingConfig`.
 
 ## Core concepts
 
@@ -20,7 +20,11 @@ A logger is a named pipe for log records. When you call `$logger->error('Payment
 
 **Channels**
 
-A channel is just a name attached to a logger instance. `$logger->info('...')` written to the `payment` channel produces a record labelled `channel=payment`. In your log aggregator (Datadog, Loki, CloudWatch) you can filter `channel=payment` to see only payment-related logs, without sifting through cache hits and HTTP routing noise. Vortos creates one logger per channel and lets each one have its own minimum level and handlers.
+A channel is just a name attached to a logger instance. `$logger->info('...')` written to the `payment` channel produces a record labelled `channel=payment`. In your log aggregator (Datadog, Loki, CloudWatch) you can filter `channel=payment` to see only payment-related logs, without sifting through cache hits and HTTP routing noise. Vortos creates one logger per channel and lets each one have its own minimum level and routing.
+
+**Sinks**
+
+A sink is a named destination — a file, a stream, syslog, or a custom handler service (OTLP, Kafka, SIEM). Each sink owns its own handler stack: formatter, sampling, buffering, rotation/compression, and (for Audit) hash-chaining. Channels route to one or more sinks. By default every channel gets its own same-named sink, but you can fan a channel out to additional sinks (e.g. ship `security` to both a local file and a SIEM shipper).
 
 **Log levels**
 
@@ -49,7 +53,7 @@ $logger->error('Payment failed', ['payment_id' => $id, 'amount' => $amount]);
 $logger->error("Payment {$id} for {$amount} failed");
 ```
 
-This is also a security rule. Vortos redacts structured `context` and `extra` arrays before a record leaves the process. It also escapes carriage returns and newlines in the message string to reduce log injection risk, but it does not scan arbitrary message text for PII at runtime. Runtime regex over every log message is too expensive for high-throughput workers.
+This is also a security rule. Vortos redacts sensitive `context`/`extra` keys, and also scans message text and values for common secret/PII patterns (JWTs, AWS keys, auth headers, card numbers, emails) before a record leaves the process — see [Redaction](#redaction).
 
 Use static messages and put all user-controlled values in context:
 
@@ -84,6 +88,14 @@ $packages = [
 ];
 ```
 
+`LoggerExtension` requires `kernel.project_dir` and either `kernel.log_path` or a `var/log` directory under the project. Set these container parameters in your bootstrap if they aren't already:
+
+```php title="bootstrap/app.php"
+$container->setParameter('kernel.env', $_ENV['APP_ENV'] ?? 'prod');
+$container->setParameter('kernel.project_dir', __DIR__ . '/..');
+$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
+```
+
 ---
 
 ## Configuration
@@ -101,17 +113,21 @@ use Vortos\Logger\DependencyInjection\VortosLoggingConfig;
 
 return static function (VortosLoggingConfig $config): void {
 
-    // Override minimum level for a specific channel
-    $config->channel(LogChannel::Query, Level::Warning);   // only log slow/failed queries
+    // Per-channel minimum level override
+    $config->channel(LogChannel::Query)->level(Level::Warning);
 
     // Disable channels that are too noisy for your app
-    $config->disableChannel(LogChannel::Cache);
+    $config->channel(LogChannel::Cache)->disable();
 
-    // Log rotation (dev only — prod uses stderr which Docker handles)
-    $config->rotation(enabled: true, maxFiles: 14);
+    // Configure a sink: rotation, sampling, custom path
+    $config->sink(LogChannel::Cache->value)
+        ->toFile('cache.log')
+        ->sample(100)
+        ->rotation(maxFiles: 7, maxAgeDays: 14);
 
-    // Buffer writes — flush all at request end instead of per-record
-    $config->buffer(true);
+    // Fan security logs out to a SIEM shipper as well as the local sink
+    $config->sink('siem')->customHandler('app.logging.siem_handler');
+    $config->channel(LogChannel::Security)->alsoRouteTo('siem');
 
     // Inject trace_id into every log record (requires vortos-tracing)
     $config->correlationId(true);
@@ -123,27 +139,31 @@ return static function (VortosLoggingConfig $config): void {
 };
 ```
 
-Environment-specific overrides go in `config/{env}/logging.php`. For example, `config/dev/logging.php` will be merged on top of the base config when `kernel.env = dev`.
+Environment-specific overrides go in `config/{env}/logging.php`. For example, `config/dev/logging.php` is merged on top of the base config when `kernel.env = dev`.
 
 ---
 
 ## Channels
 
-Vortos defines seven built-in channels. Framework components write to their own channel — your application code writes to `app`.
+Vortos defines nine built-in channels. Framework components write to their own channel — your application code writes to `app`.
 
-| Channel | Constant | Written by | Volume |
+| Channel | Constant | Written by | Default buffering |
 |---|---|---|---|
-| `app` | `LogChannel::App` | Your code | Medium |
-| `http` | `LogChannel::Http` | HTTP middleware | High |
-| `cqrs` | `LogChannel::Cqrs` | CommandBus | Medium |
-| `messaging` | `LogChannel::Messaging` | EventBus, Kafka, Outbox | High |
-| `cache` | `LogChannel::Cache` | Cache decorators | Very high |
-| `security` | `LogChannel::Security` | Auth, rate limiting | Low |
-| `query` | `LogChannel::Query` | DBAL, MongoDB | High |
+| `app` | `LogChannel::App` | Your code | Batched |
+| `http` | `LogChannel::Http` | HTTP middleware | Batched |
+| `cqrs` | `LogChannel::Cqrs` | CommandBus | Batched |
+| `messaging` | `LogChannel::Messaging` | EventBus, Kafka, Outbox | Batched |
+| `cache` | `LogChannel::Cache` | Cache decorators | Batched |
+| `security` | `LogChannel::Security` | Auth, rate limiting | Write-through |
+| `audit` | `LogChannel::Audit` | Authorization audit trail | Write-through + hash chain |
+| `query` | `LogChannel::Query` | DBAL, MongoDB | Batched |
+| `tooling` | `LogChannel::Tooling` | Make/migration/setup commands | Batched |
+
+`Security` and `Audit` default to **write-through** — every record is written immediately, with zero loss on crash. `Audit` additionally hash-chains every record and enforces a 365-day file retention floor (see [Audit hash chain](#audit-hash-chain-and-retention-floor)).
 
 ### Injecting a specific channel
 
-`LoggerInterface` always resolves to the `app` channel. To inject a named channel, use its service ID directly.
+`LoggerInterface` always resolves to the `app` channel. To inject a named channel, reference its service ID directly.
 
 ```php title="config/services.php"
 use Psr\Log\LoggerInterface;
@@ -157,17 +177,111 @@ $services->set(OrderController::class)
     ->arg('$logger', service(LoggerInterface::class));
 ```
 
-All channel loggers are registered as `vortos.logger.{channel}`. For example `vortos.logger.security`, `vortos.logger.query`, `vortos.logger.messaging`.
+All channel loggers are registered as `vortos.logger.{channel}` — e.g. `vortos.logger.security`, `vortos.logger.query`, `vortos.logger.audit`.
 
 ### Disabling a channel
 
 When a channel is disabled, a `NullHandler` is registered for it — log calls still compile and run, but records are immediately discarded with zero I/O.
 
 ```php
+$config->channel(LogChannel::Cache)->disable();
+$config->channel(LogChannel::Query)->disable();
+
+// Or via the legacy helper, which silences multiple channels at once
 $config->disableChannel(LogChannel::Cache, LogChannel::Query);
+
+// Or by observability module — maps to the channel that module logs to
+$config->disableModule(ObservabilityModule::Make, ObservabilityModule::Persistence);
 ```
 
 The `App` channel cannot be disabled — it is the last-resort channel for your application code and alerting handlers always attach to it.
+
+### Custom channels
+
+Pass any string to `channel()`/`sink()` to register an application-defined channel — it gets its own same-named sink and default level/buffering just like a framework channel.
+
+```php
+$config->channel('payments')->level(Level::Info);
+```
+
+---
+
+## Sinks
+
+A sink is configured via `$config->sink($id)`, which returns a `SinkBuilder`. Calling `sink($id)` with the id of a framework channel (e.g. `LogChannel::Cache->value`) configures that channel's default sink. Any other id is a free-standing sink you can route channels to.
+
+### Destinations
+
+```php
+// File — relative paths resolve under kernel.log_path (var/log)
+$config->sink('app')->toFile('app.log');
+
+// Stream — any PHP stream URI
+$config->sink('app')->toStream('php://stderr');
+
+// Syslog
+$config->sink('security')->toSyslog('myapp');
+
+// Custom handler — reference a DI service implementing HandlerInterface.
+// The framework wraps it in the same sampling/buffering pipeline as any
+// other sink. Use this for OTLP collectors, Kafka topics, SIEM shippers.
+$config->sink('siem')->customHandler('app.logging.siem_handler');
+```
+
+If no destination is configured, the env-driven default applies: a rotating file under `var/log/{id}.log` in `dev`, `php://stderr` in production.
+
+### Level and buffering
+
+```php
+$config->sink('app')->level(Level::Warning);
+
+// Every record written immediately — zero loss on crash. Default for
+// Security/Audit sinks.
+$config->sink('security')->writeThrough();
+
+// Buffer in memory, flush every N seconds via FlushScheduler. Default for
+// all other sinks (2s).
+$config->sink('app')->batched(flushIntervalSeconds: 10);
+```
+
+### Rotation and compression
+
+File sinks rotate daily by default: 14 files, 30-day max age, 1GB total size cap, gzip-compressed rotated files.
+
+```php
+$config->sink('app')->rotation(
+    maxFiles: 7,
+    maxAgeDays: 14,
+    maxTotalSizeMb: 256,
+    compress: true,
+);
+
+// Disable rotation entirely
+$config->sink('app')->rotation(enabled: false);
+```
+
+`RotatingFileHandler` enforces `maxFiles` for files it rotates during the current process. `maxAgeDays` and `maxTotalSizeMb` — and `maxFiles` across process restarts — are enforced by running [`vortos:logs:prune`](#operations-commands) on a schedule.
+
+### Sampling
+
+```php
+// Only ~1/100 records reach the handler — use for high-volume, low-value channels.
+$config->sink(LogChannel::Cache->value)->sample(100);
+```
+
+Do not sample Security or Audit sinks — every record on those channels matters.
+
+### Routing a channel to multiple sinks
+
+```php
+$config->sink('siem')->customHandler('app.logging.siem_handler');
+
+// Add 'siem' alongside the channel's default sink
+$config->channel(LogChannel::Security)->alsoRouteTo('siem');
+
+// Or replace the default routing entirely
+$config->channel(LogChannel::Security)->routeTo('siem');
+```
 
 ---
 
@@ -175,16 +289,11 @@ The `App` channel cannot be disabled — it is the last-resort channel for your 
 
 | | Dev (`kernel.env = dev`) | Production |
 |---|---|---|
-| Formatter | `LineFormatter` (human-readable) | `JsonFormatter` (structured) |
-| Destination | `{log_path}/app-{date}.log` | `stderr` |
-| Rotation | On by default, 30 files | Off — Docker/container runtime handles it |
-| Buffer | On — flushes at request end | On — flushes at request end |
-| Min level | `DEBUG` | `ERROR` (framework channels), `WARNING` (app channel) |
-
-**Dev output:**
-```
-[2026-05-07 14:32:01] app.DEBUG: Handler dispatched {"command":"RegisterUser","userId":"user-123"} {"trace_id":"abc123","file":"CommandBus.php","line":87}
-```
+| Formatter | `JsonFormatter` (structured) | `JsonFormatter` (structured) |
+| Default destination | file `var/log/{sink}.log` | `php://stderr` |
+| Rotation | On by default — 14 files / 30 days / 1GB, gzip | On for any file sink (off by default for stream sinks) |
+| Buffering | Batched (2s flush), Security/Audit write-through | Same |
+| Min level | `DEBUG` | `ERROR` (framework channels), `WARNING` (`app`) |
 
 **Production output:**
 ```json
@@ -193,26 +302,43 @@ The `App` channel cannot be disabled — it is the last-resort channel for your 
 
 ---
 
-## BufferHandler — why buffering matters
+## Buffering and the flush scheduler
 
-By default every `$logger->info(...)` call synchronously writes to disk or stderr. Under high request volume this creates one file write syscall per log statement — potentially hundreds per request.
+Batched sinks collect records in memory via Monolog's `BufferHandler` and flush in a single I/O operation rather than one syscall per log statement. `FlushScheduler` guarantees buffered sinks are flushed within their configured interval regardless of process lifecycle, via three triggers:
 
-`BufferHandler` collects all records in memory and writes them all in a single I/O operation at the end of the request. The buffer is capped at **500 records** — if you exceed that it flushes early and resets. This prevents memory growth in long-running FrankenPHP workers.
+1. **Request/command end** — `FlushBootListener` flushes due sinks after every kernel request and console command.
+2. **Periodic** — a `SIGALRM`-driven check flushes sinks whose interval has elapsed, for long-running FrankenPHP workers and daemons.
+3. **Shutdown** — a `register_shutdown_function` performs a final flush so no buffered records are lost when a process exits.
 
-The trade-off: if PHP crashes mid-request (fatal error, OOM kill), buffered records are lost. For most applications this is acceptable. If you need guaranteed delivery on crash, disable buffering with `$config->buffer(false)`.
+```php
+// Default flush interval (seconds) for batched sinks that don't configure
+// their own via SinkBuilder::batched(). Default: 2.
+$config->flushInterval(5);
+```
+
+The trade-off: if PHP crashes mid-request (fatal error, OOM kill) before a flush trigger fires, buffered records since the last flush are lost — bounded by the flush interval. Security and Audit sinks are write-through by default specifically to avoid this.
 
 ---
 
-## Log rotation
+## Audit hash chain and retention floor
 
-In development, `RotatingFileHandler` creates dated log files:
-```
-var/log/app-2026-05-07.log
-var/log/app-2026-05-06.log
-var/log/app-2026-05-05.log
+The `Audit` channel's default sink hash-chains every record: each record's `extra.record_hash` is `sha256(prev_hash + canonical_json(record))`, where `prev_hash` is the previous record's hash (or a fixed genesis value for the first record). Tampering with or deleting a historical record breaks the chain for every subsequent record — `vortos:logs:diagnose` and your log aggregator can detect this by recomputing hashes.
+
+```json
+{"message":"Permission denied","channel":"audit","extra":{"prev_hash":"3f2a...","record_hash":"9c1b..."}}
 ```
 
-Once the file count exceeds `maxFiles` (default 30), the oldest is deleted automatically. In production, log rotation is handled externally — Docker log drivers, logrotate, or your cloud provider.
+The Audit sink also enforces a **365-day minimum file retention** (`maxAgeDays`). Reducing it below the floor throws `InvalidLoggingConfigException` unless explicitly acknowledged:
+
+```php
+$config->sink(LogChannel::Audit->value)
+    ->rotation(maxAgeDays: 90)
+    ->acknowledgeComplianceRisk();
+```
+
+<Callout type="warn" title="Hash chain state is in-memory by default">
+`InMemoryHashChainState` resets `prev_hash` to genesis on every process restart. For a continuous chain across restarts, implement `HashChainStateInterface` against persistent storage (e.g. Redis, a database row) and register it under `vortos.logger.hash_chain_state`.
+</Callout>
 
 ---
 
@@ -230,14 +356,21 @@ All three records share the same `trace_id` — filter on it and you see the com
 
 This works transparently — no code changes needed. The `CorrelationIdProcessor` reads the current span ID from `TracingInterface` and injects it. When tracing is disabled (NoOpTracer), `currentCorrelationId()` returns `null` and the processor silently skips.
 
+```php
+$config->correlationId(bool $enabled = true); // default: enabled
+```
+
+---
+
 ## Redaction
 
-`RedactionProcessor` scrubs structured log data by key:
+`RedactionProcessor` scrubs sensitive data from every record before it leaves the process — both by **key** (structured `context`/`extra`) and by **pattern** (free-text message and values):
 
-- exact sensitive keys use a normalized lookup table
-- wildcard custom keys use regex fallback only when configured
+- exact sensitive keys use a normalized `O(1)` lookup table
+- custom keys add a wildcard regex fallback
 - nested arrays are processed recursively up to a fixed depth
-- message strings have `\r` and `\n` escaped to reduce CRLF log injection
+- message and value strings are scanned for JWTs, AWS access key IDs, `Bearer`/`Basic` auth headers, card-number-like sequences, and email addresses
+- message strings additionally have `\r`/`\n` escaped to reduce CRLF log injection
 
 Default sensitive keys include passwords, tokens, authorization headers, API keys, private keys, email, phone, SSN, cookies, and client secrets.
 
@@ -251,13 +384,18 @@ Default sensitive keys include passwords, tokens, authorization headers, API key
 }
 ```
 
+```php
+// Enable/disable redaction (enabled by default) and add custom keys
+$config->redaction(true, keys: ['card_number', 'iban', 'national_id']);
+```
+
 Redaction is not a replacement for safe logging style. Treat the PSR-3 message as a static event name and put all dynamic values in context.
 
 ---
 
 ## Alerting handlers
 
-Alerting handlers deliver log records above a threshold to external systems. They are added to every channel above their configured minimum level.
+Alerting handlers deliver log records above a threshold to external systems. They are added to every non-disabled channel above their configured minimum level.
 
 ### Sentry
 
@@ -285,11 +423,36 @@ Use [Slack Incoming Webhooks](https://api.slack.com/messaging/webhooks). At `CRI
 $config->email(to: 'ops@example.com', minLevel: Level::Error);
 ```
 
-Uses PHP's `mail()` function. In production, point PHP's `sendmail_path` at a proper relay (Postfix, SES). This is a synchronous call — use only at `CRITICAL` and above if latency matters.
+Uses PHP's `mail()` function. In production, point PHP's `sendmail_path` at a proper relay (Postfix, SES). This is a synchronous, buffered-and-flushed call — use only at `CRITICAL` and above if latency matters.
 
 <Callout type="warn" title="Empty DSN/webhook strings are silently skipped">
 All alerting handlers check for an empty string before registering. `$_ENV['SENTRY_DSN'] ?? ''` is safe — if the env var is unset, the handler is simply not registered. No error is thrown.
 </Callout>
+
+<Callout type="warn" title="failOnMissingIntegrations">
+By default, configuring `sentry()` without `sentry/sentry-php` installed throws at container compile time. Set `$config->failOnMissingIntegrations(false)` to downgrade this to a silent skip — useful for local prototypes.
+</Callout>
+
+---
+
+## Operations commands
+
+### `vortos:logs:prune`
+
+Sweeps every rotating file sink's directory and enforces `maxFiles`, `maxAgeDays`, and `maxTotalSizeMb` — independent of `RotatingFileHandler`'s in-process rotation, so a cron job keeps disk usage bounded even if the app never restarts.
+
+```bash
+php bin/console vortos:logs:prune
+php bin/console vortos:logs:prune --dry-run
+```
+
+### `vortos:logs:diagnose`
+
+Prints the fully-resolved channel → sink topology: routing, levels, buffer policy, sampling, hash-chain, and rotation settings for every sink. Use this to confirm what `logging.php` actually resolves to in a given environment.
+
+```bash
+php bin/console vortos:logs:diagnose
+```
 
 ---
 
@@ -306,8 +469,9 @@ Register `LoggerPackage` first in your bootstrap — other packages depend on `L
 ### 2. Set container parameters
 
 ```php title="bootstrap/app.php"
-$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
 $container->setParameter('kernel.env', $_ENV['APP_ENV'] ?? 'prod');
+$container->setParameter('kernel.project_dir', __DIR__ . '/..');
+$container->setParameter('kernel.log_path', __DIR__ . '/../var/log');
 ```
 
 ### 3. Create the config file (optional)
@@ -338,21 +502,20 @@ final class OrderService
 
 ## How to verify it's working
 
-**Dev environment:**
+**Diagnose the resolved pipeline:**
 ```bash
-# Watch the log file in real time
-tail -f var/log/app-$(date +%Y-%m-%d).log
-
-# Or if var/log doesn't exist yet:
-php artisan serve  # or your dev server
-# make a request, then:
-ls var/log/
+php bin/console vortos:logs:diagnose
 ```
 
-**Check rotation is working:**
+**Dev environment — watch the log file in real time:**
+```bash
+tail -f var/log/app.log
+```
+
+**Check rotation/retention:**
 ```bash
 ls -la var/log/
-# Should see: app-2026-05-07.log  app-2026-05-06.log  etc.
+php bin/console vortos:logs:prune --dry-run
 ```
 
 **Check JSON format in production:**
@@ -363,7 +526,7 @@ APP_ENV=prod php bin/console cache:clear 2>&1 | head -5
 
 **Check trace_id is injected:**
 ```bash
-grep '"trace_id"' var/log/app-$(date +%Y-%m-%d).log | head -3
+grep '"trace_id"' var/log/app.log | head -3
 ```
 
 **Check alerting handlers are registered (Sentry):**
@@ -377,25 +540,28 @@ $logger->error('Test Sentry alert', ['test' => true]);
 ## Services registered
 
 ```
-vortos.logger.formatter.json          — JsonFormatter (production)
-vortos.logger.formatter.line          — LineFormatter (dev)
-vortos.logger.processor.introspection — adds file/line/class to every record
-vortos.logger.processor.correlation_id — adds trace_id when TracingInterface is active
-vortos.logger.handler.file            — RotatingFileHandler or StreamHandler (dev)
-vortos.logger.handler.stderr          — StreamHandler → stderr (production)
-vortos.logger.app                     — Logger (channel: app) — public
-vortos.logger.http                    — Logger (channel: http)
-vortos.logger.cqrs                    — Logger (channel: cqrs)
-vortos.logger.messaging               — Logger (channel: messaging)
-vortos.logger.cache                   — Logger (channel: cache)
-vortos.logger.security                — Logger (channel: security)
-vortos.logger.query                   — Logger (channel: query)
-LoggerInterface                       — alias → vortos.logger.app
+vortos.logger.formatter.json              — JsonFormatter
+vortos.logger.processor.introspection     — adds file/line/class to every record
+vortos.logger.processor.redaction         — key- and pattern-based redaction
+vortos.logger.processor.structured        — ECS/OTel service fields
+vortos.logger.processor.request_context   — HTTP/user/tenant context
+vortos.logger.processor.correlation_id    — adds trace_id when TracingInterface is active
+vortos.logger.processor.hash_chain        — chained record hashes (Audit, if configured)
+vortos.logger.hash_chain_state            — InMemoryHashChainState (if any sink hash-chains)
+vortos.logger.sink.{id}.handler           — base handler for sink {id} (file/stream/syslog/null)
+vortos.logger.sink.{id}.sampled           — SamplingHandler wrapper (if sampled)
+vortos.logger.sink.{id}.buffered          — BufferHandler wrapper (if batched)
+vortos.logger.{channel}                   — Logger for {channel} — App channel is public
+LoggerInterface                           — alias → vortos.logger.app
+monolog.logger                            — alias → vortos.logger.app (legacy)
+FlushScheduler                            — coordinates periodic/shutdown/request-end flushes
+LogPruneCommand    (vortos:logs:prune)    — enforces file-sink retention
+LogDiagnoseCommand (vortos:logs:diagnose) — dumps the resolved topology
 ```
 
 ## Further Reading
 
 <Cards>
-  <Card title="Processors" href="/docs/logger/processors" description="IntrospectionProcessor, CorrelationIdProcessor, RequestContextProcessor, StructuredLogProcessor, RedactionProcessor — what each adds and how to configure it." />
+  <Card title="Processors" href="/docs/logger/processors" description="IntrospectionProcessor, CorrelationIdProcessor, RequestContextProcessor, StructuredLogProcessor, RedactionProcessor, HashChainProcessor — what each adds and how to configure it." />
   <Card title="Testing" href="/docs/logger/testing" description="NullLogger for unit tests, TestHandler for capturing log output in integration tests." />
 </Cards>

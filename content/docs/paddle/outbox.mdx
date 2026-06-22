@@ -1,0 +1,137 @@
+---
+title: Outbox
+description: How the Paddle transactional outbox works — delivery, backoff, status tracking, and dead-letter retry.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Outbox
+
+All Transactional and Standalone service calls queue the Paddle API call in the `paddle_outbox` table rather than calling Paddle directly. The relay worker reads these rows and dispatches them to Paddle — decoupling your business transaction from the external API call.
+
+## How It Works
+
+```
+BEGIN TRANSACTION (your command handler)
+  1. Write domain row to your tables
+  2. Write outbox row to paddle_outbox (status=pending)
+COMMIT
+
+[Relay worker — separately]
+  3. SELECT pending outbox rows
+  4. Call Paddle API via ImmediateXxxService
+  5. SET status=delivered (success) or retry/fail (error)
+```
+
+If the database transaction rolls back, the outbox row rolls back with it. The Paddle API is never called for work that did not commit.
+
+## Outbox Table
+
+| Column | Description |
+|--------|-------------|
+| `id` | Auto-increment primary key. |
+| `operation` | Operation name, e.g. `customer.create`, `subscription.cancel`. |
+| `payload` | JSON-encoded parameters. |
+| `idempotency_key` | UUID v7 — prevents duplicate writes to the same row. |
+| `status` | `pending` → `delivered` (success) or `failed` (permanently failed). |
+| `attempts` | Delivery attempt count. |
+| `last_error` | Error message from the most recent failed attempt. |
+| `next_attempt_at` | Scheduled time for the next delivery attempt. |
+| `delivered_at` | Timestamp set when the row is successfully relayed. |
+| `failed_at` | Timestamp set when all attempts are exhausted. |
+| `created_at` | When the outbox row was written. |
+
+## Relay Command
+
+Run as a long-running worker (recommended):
+
+```bash
+php bin/console vortos:paddle:outbox:relay
+```
+
+Run a single batch and exit (for cron):
+
+```bash
+php bin/console vortos:paddle:outbox:relay --once
+```
+
+Control the idle poll interval:
+
+```bash
+php bin/console vortos:paddle:outbox:relay --sleep=5
+```
+
+The worker handles `SIGTERM` and `SIGINT` gracefully — it finishes the current batch before exiting.
+
+## Backoff Strategy
+
+Failed deliveries use exponential backoff:
+
+| Attempt | Backoff (default 60s base) |
+|---------|---------------------------|
+| 1 | 60 seconds |
+| 2 | 120 seconds |
+| 3 | 240 seconds |
+| 4 | 480 seconds |
+| 5 | 960 seconds → capped at `backoffCapSeconds` (default 1 hour) |
+
+Rate-limit responses (`429`) use Paddle's `Retry-After` header directly instead of the exponential formula.
+
+Configure via `config/paddle.php`:
+
+```php
+$config->outbox()
+    ->maxAttempts(5)
+    ->backoffBaseSeconds(60)
+    ->backoffCapSeconds(3600);
+```
+
+## Dead-Letter Retry
+
+When a row exhausts all attempts it is marked `status=failed`. The relay no longer picks it up. Use the retry command to inspect and reset these rows:
+
+### Inspect failed entries
+
+```bash
+# Show all permanently failed entries
+php bin/console vortos:paddle:outbox:retry --dry-run
+
+# Filter by operation
+php bin/console vortos:paddle:outbox:retry --dry-run --operation=subscription.cancel
+
+# Inspect a specific entry
+php bin/console vortos:paddle:outbox:retry --dry-run --id=42
+```
+
+### Reset for re-delivery
+
+```bash
+# Reset all failed entries (prompts for confirmation)
+php bin/console vortos:paddle:outbox:retry
+
+# Reset without confirmation
+php bin/console vortos:paddle:outbox:retry --force
+
+# Reset only a specific operation
+php bin/console vortos:paddle:outbox:retry --operation=customer.create --force
+
+# Reset a single entry
+php bin/console vortos:paddle:outbox:retry --id=42 --force
+
+# Limit how many rows are reset at once
+php bin/console vortos:paddle:outbox:retry --limit=10 --force
+```
+
+Resetting sets `status=pending`, clears `failed_at`, `last_error`, and `delivered_at`, resets `attempts=0`, and sets `next_attempt_at=now`. The relay picks the rows up on its next cycle.
+
+<Callout type="info" title="Why entries fail permanently">
+Entries reach `status=failed` when all retry attempts are exhausted. Common causes: the Paddle resource no longer exists (e.g. a subscription already cancelled), invalid payload, or a persistent Paddle API outage. Check `last_error` to understand the failure before resetting.
+</Callout>
+
+## Status Reference
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Waiting for delivery or scheduled for retry. |
+| `delivered` | Successfully relayed to Paddle. |
+| `failed` | All attempts exhausted — manual retry required. |

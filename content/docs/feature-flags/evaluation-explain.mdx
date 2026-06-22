@@ -1,0 +1,90 @@
+---
+title: Evaluation Explain
+description: Debug why a flag returned true or false for a specific user — step-by-step rule trace with the matching rule highlighted.
+---
+
+# Evaluation Explain
+
+When a flag behaves unexpectedly for a specific user, `EvaluationExplainer` shows you exactly what happened during evaluation: which rules were checked, why each matched or didn't, and which rule produced the final result.
+
+## Using the explainer in code
+
+```php
+use Vortos\FeatureFlags\Explain\EvaluationExplainer;
+use Vortos\FeatureFlags\FlagContext;
+
+$context = new FlagContext(
+    userId: 'user-123',
+    attributes: ['plan' => 'enterprise', 'region' => 'eu-west'],
+);
+
+$explanation = $this->explainer->explain('new-checkout', $context);
+
+echo $explanation->result;       // true
+echo $explanation->matchedRule;  // "attribute: plan = enterprise"
+
+foreach ($explanation->steps as $step) {
+    echo $step->rule;    // "users whitelist"
+    echo $step->matched; // false
+    echo $step->reason;  // "userId 'user-123' not in whitelist [eng-1, eng-2]"
+}
+```
+
+The `steps` array contains one entry per rule that was evaluated, in order. The first step with `matched = true` is the one that produced the result. Subsequent rules are shown but marked as skipped.
+
+## Explain via the management API
+
+```
+POST /api/flags/management/new-checkout/explain
+Authorization: Bearer <management-key>
+Content-Type: application/json
+
+{
+  "userId": "user-123",
+  "attributes": {
+    "plan": "enterprise",
+    "region": "eu-west"
+  },
+  "env": "production"
+}
+```
+
+Response:
+
+```json
+{
+  "flag":    "new-checkout",
+  "result":  true,
+  "matched_rule": "attribute: plan = enterprise",
+  "steps": [
+    {
+      "rule":    "users whitelist",
+      "matched": false,
+      "reason":  "userId 'user-123' not in whitelist [eng-1, eng-2]"
+    },
+    {
+      "rule":    "attribute: plan = enterprise",
+      "matched": true,
+      "reason":  "attributes.plan 'enterprise' equals 'enterprise'"
+    },
+    {
+      "rule":    "percentage 25%",
+      "matched": null,
+      "reason":  "skipped — earlier rule matched"
+    }
+  ]
+}
+```
+
+## Explain in the admin UI
+
+Open a flag's detail page and click the **Explain** tab. Enter a user ID and any attributes, then click **Evaluate**. The UI shows the rule trace in a step-by-step timeline, with the matching rule highlighted and non-matching rules showing why they failed.
+
+This is useful for:
+- A support ticket: "Why can't user X see the new dashboard?"
+- QA: "Is user Y in the 25% bucket?"
+- Product: "Which rule is matching for enterprise users?"
+
+## Explain does not count as an evaluation
+
+The explain endpoint evaluates the flag logic but does not record the result in the cache, does not emit an audit entry, and does not trigger exposure tracking. It is a read-only diagnostic tool.

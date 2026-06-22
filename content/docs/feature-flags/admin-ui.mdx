@@ -1,0 +1,152 @@
+---
+title: Admin UI
+description: Browser-based management dashboard — HTMX + Twig with React islands for the rule builder and insights chart. Install, configure, and use all screens.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Admin UI
+
+`vortos/vortos-feature-flags-admin` is a browser-based management dashboard for the feature flags engine. It runs co-located with your application — same VPS, same PHP process, same database — mounted at `/admin/flags` by default.
+
+## Installation
+
+```bash
+composer require vortos/vortos-feature-flags-admin
+php vortos vortos:assets:publish
+```
+
+`vortos:assets:publish` copies the pre-built JavaScript assets from the package into your application's `public/bundles/` directory. Production servers need no Node.js — the assets are committed to the PHP package and shipped via Composer.
+
+Navigate to `/admin/flags` in your browser. You should see the dashboard.
+
+## Technology stack
+
+The UI is built on three layers, chosen to minimise JavaScript complexity while keeping interactions smooth:
+
+**HTMX + Twig (~90% of the UI)** — every form, toggle, filter, and navigation link uses HTMX to make partial HTTP requests. The server renders a Twig fragment and HTMX swaps it into the DOM. No JavaScript state management, no client-side routing, no bundler required for this layer.
+
+**React islands (~10% of the UI)** — two screens use React components mounted into HTMX-rendered pages:
+- **Rule builder** — drag-and-drop rule ordering via `dnd-kit`
+- **Insights chart** — exposure and evaluation time series via `Recharts`
+
+Islands hydrate from `data-island` markers in the Twig output. They are self-contained — they do not share state with each other or with the HTMX layer.
+
+**Server-Sent Events** — the dashboard opens an SSE connection to `/admin/flags/stream` and uses it to trigger HTMX reloads of the flag table when any flag changes. Open two browser tabs — enable a flag in one and the other updates automatically within seconds.
+
+## Security
+
+Every request to `/admin/flags/*` goes through:
+
+1. **AdminAuthMiddleware** — checks the user has a valid session and the `flags.read` permission. Returns 401/403 otherwise.
+2. **CsrfMiddleware** — validates CSRF tokens on all state-changing requests (POST, PUT, DELETE, PATCH).
+3. **AdminCspMiddleware** — adds a `Content-Security-Policy` header with a per-request nonce. All `<script>` tags in Twig templates use `{{ csp_nonce() }}` — no inline scripts run without the nonce.
+
+## Screens
+
+### Dashboard (`/admin/flags`)
+
+The main flag list. Shows all flags for the selected environment with name, kind, status, rollout percentage, and last changed time.
+
+- **Environment tabs** — switch between production, staging, development
+- **Search** — live HTMX search, debounced 300ms
+- **Kind filter** — release / experiment / ops / permission
+- **Status filter** — enabled / disabled / archived
+- **+ New Flag button** — opens a modal form (HTMX fragment) to create a flag
+
+The table updates automatically via SSE when any flag changes in the current environment — no manual refresh needed.
+
+### Flag detail (`/admin/flags/detail/{name}`)
+
+Everything about a single flag on one page, organised into tabs:
+
+**Overview**
+- Enable/disable toggle (immediate, audited)
+- Rollout percentage slider (HTMX, updates on release)
+- Current rule list in evaluation order
+
+**Rules**
+- Drag-and-drop rule ordering via the React rule builder island
+- Add / remove rules
+- Segment references
+
+**Variants**
+- Editable variant name / weight table
+- Weights must sum to 100 (client-side validation)
+- Save sends JSON via `fetch()` — the endpoint reads raw JSON body
+
+**Schedule**
+- Set `enable_at` and `disable_at` datetimes
+- Add ramp stops: (time → percentage) pairs for automatic gradual rollout
+- The schedule engine processes these in a background worker
+
+**History**
+- Full audit timeline for this flag: every change, actor, reason, and diff
+
+**Explain**
+- Debug tool: enter a userId and attributes, get a rule trace showing why the flag returned true or false
+
+**Danger Zone**
+- Archive the flag (removes from evaluation, keeps history)
+- Delete the flag (permanent, confirmation required)
+
+### Kill Switch panel (`/admin/flags/kill-switches`)
+
+All `ops` kind flags in one view, sorted by last modified. One-click disable for any flag with no other navigation needed. Designed for incident response — you should be able to kill a flag in under 5 seconds.
+
+### Environment Compare (`/admin/flags/compare`)
+
+Side-by-side view of flag state across all environments. Highlights:
+- Flags enabled in staging but not production (promotion candidates)
+- Percentage mismatches between environments
+- Flags present in one environment but missing from another
+
+### Segments (`/admin/flags/segments`)
+
+Create and manage reusable user segments. Each segment has a name, description, and a set of rules (same types as flag rules). Segments appear as options in the flag rule builder.
+
+### Approvals (`/admin/flags/approvals`)
+
+Pending change requests awaiting approval. Shows the proposed change with a before/after diff, who submitted it, when, and why. Approve or reject with an optional reason.
+
+### History (`/admin/flags/history`)
+
+Global change log across all flags, filterable by:
+- Flag name
+- Actor (who made the change)
+- Environment
+- Event type (enabled, disabled, rules changed, etc.)
+- Time range
+
+### Insights (`/admin/flags/insights`)
+
+Per-flag exposure and evaluation charts powered by the React Recharts island. Shows:
+- Evaluation count over time
+- Exposure count (how many users actually saw the feature)
+- Variant distribution for experiment flags
+
+## Configuration
+
+```php title="config/services.php"
+// Change the admin URL prefix (default: /admin/flags)
+$container->setParameter('feature_flags_admin.prefix', '/internal/flags');
+
+// Required role to access the admin (default: ROLE_ADMIN)
+$container->setParameter('feature_flags_admin.required_role', 'ROLE_FLAGS_ADMIN');
+
+// Disable the admin entirely
+$container->setParameter('feature_flags_admin.enabled', false);
+```
+
+## Rebuilding the JavaScript assets
+
+The React island source is in `packages/feature-flags-admin/` at the monorepo root. To rebuild:
+
+```bash
+cd packages/feature-flags-admin
+npm install
+npm run build
+php vortos vortos:assets:publish
+```
+
+Production deployments should use pre-built assets from Composer. Rebuilding is only necessary if you are contributing to the admin UI itself.

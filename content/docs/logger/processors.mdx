@@ -1,27 +1,28 @@
 ---
 title: Processors
-description: The four built-in Monolog processors — what they add to every log record, how they are ordered, and how to configure each one.
+description: The built-in Monolog processors — what they add to every log record, how they are ordered, and how to configure each one.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Processors
 
-Monolog processors run on every log record before it reaches a handler. They add structured fields to the record's `extra` array — data like trace IDs, file locations, service metadata, and request context. Vortos ships four processors and applies them in a fixed order.
+Monolog processors run on every log record before it reaches a handler. They add structured fields to the record's `extra` array — data like trace IDs, file locations, service metadata, request context, and (for the Audit channel) hash-chain links. Vortos ships six processors and applies them in a fixed order.
 
 ## Processor Execution Order
 
 Processors are added in reverse push order, so they execute as follows:
 
 ```
-1. IntrospectionProcessor      adds file, line, class, function
-2. CorrelationIdProcessor      adds trace_id (when tracing is active)
-3. RequestContextProcessor     adds http, user, tenant context
-4. StructuredLogProcessor      adds ECS/OTel service fields
-5. RedactionProcessor          redacts sensitive values   ← runs last
+1. StructuredLogProcessor      adds ECS/OTel service fields
+2. RequestContextProcessor     adds http, user, tenant context
+3. CorrelationIdProcessor      adds trace_id (when tracing is active)
+4. IntrospectionProcessor      adds file, line, class, function
+5. RedactionProcessor          redacts sensitive values
+6. HashChainProcessor          chains the final record       ← Audit channel only, runs last
 ```
 
-Redaction always runs last — it operates on the complete record including fields added by earlier processors.
+Redaction runs after every other processor has added its fields, so it can scrub anything they introduce. The hash chain (Audit channel only) runs after redaction, so `record_hash` covers the final, fully-enriched and redacted record.
 
 ---
 
@@ -195,5 +196,30 @@ $config->redaction(true, ['card_number', 'iban', 'national_id']);
 ```
 
 <Callout type="warn" title="Redaction Is Not a Safety Net">
-Redaction catches structured context keys. It does not scan free-text message strings. If you concatenate sensitive data into the message string — `$logger->info("User {$email} logged in")` — it will not be redacted. Always use structured context and static message strings.
+Pattern-based redaction catches common shapes (JWTs, AWS keys, auth headers, card numbers, emails) but not arbitrary PII. If you concatenate sensitive data into the message string — `$logger->info("User {$email} logged in")` — only values matching a known pattern are redacted. Always use structured context and static message strings.
 </Callout>
+
+---
+
+## HashChainProcessor
+
+Appends a tamper-evident hash chain to every record on a sink configured with `hashChain(true)` — the Audit sink, by default. Each record's hash covers the previous record's hash, so altering or deleting a historical record invalidates every subsequent hash.
+
+**Fields added to `extra`:**
+
+```json
+{
+  "prev_hash": "3f2a9c...",
+  "record_hash": "9c1b4e..."
+}
+```
+
+`record_hash = sha256(prev_hash + canonical_json(record))`. The first record in a chain uses a fixed genesis value for `prev_hash`.
+
+**Configuration:**
+
+```php
+$config->sink(LogChannel::Audit->value)->hashChain(true); // default for Audit
+```
+
+State (the running `prev_hash`) is held by a `HashChainStateInterface` implementation, registered as `vortos.logger.hash_chain_state`. The default `InMemoryHashChainState` resets on process restart — implement the interface against persistent storage for a continuous chain across restarts.

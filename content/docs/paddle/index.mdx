@@ -1,0 +1,69 @@
+---
+title: Paddle Billing
+description: First-class Paddle billing integration for Vortos — customers, subscriptions, transactions, catalog, and webhooks with a full transactional outbox.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Paddle Billing
+
+`vortos/vortos-paddle` integrates [Paddle](https://www.paddle.com/) billing into Vortos. It covers the full Paddle surface area: customers, addresses, businesses, subscriptions, transactions, adjustments, catalog products, prices, discounts, checkout sessions, portal sessions, and reports.
+
+Every mutating service call goes through a three-tier delivery model: write inside a database transaction (Transactional), write in a standalone transaction (Standalone), or call the Paddle API directly (Immediate). The transactional and standalone tiers route writes through a database outbox so Paddle API calls are decoupled from the business transaction.
+
+<Callout type="info" title="Paddle Billing API v1">
+The package targets the Paddle Billing API (the current API). Classic Paddle is not supported.
+</Callout>
+
+## What The Package Covers
+
+- Full Paddle service hierarchy for all domains: Customer, Address, Business, Transaction, Adjustment, Product, Price, Discount, Subscription, Checkout, and Report.
+- Three-tier delivery contract per domain (Immediate / Transactional / Standalone).
+- Transactional outbox with exponential backoff, configurable retry limits, and a long-running worker command.
+- Dead-letter retry command to reset permanently failed outbox entries.
+- Webhook controller with IP allowlist, replay-attack protection, and idempotency deduplication.
+- Attribute-based webhook handler discovery.
+- Circuit breaker and SDK exception mapping.
+- Audit log for all received webhook events.
+- API idempotency key store.
+
+## Package Registration
+
+```php title="bootstrap/app.php"
+use Vortos\Paddle\DependencyInjection\PaddlePackage;
+
+$packages = [
+    // ... other packages
+    new PaddlePackage(),
+];
+```
+
+## Documentation Map
+
+<Cards>
+  <Card title="Quickstart" href="/docs/paddle/quickstart" description="Install, configure, and make your first Paddle API call." />
+  <Card title="Configuration" href="/docs/paddle/configuration" description="Full config reference for API client, webhooks, security, circuit breaker, outbox, and observability." />
+  <Card title="Services" href="/docs/paddle/services" description="The three-tier service hierarchy and when to use each." />
+  <Card title="Webhooks" href="/docs/paddle/webhooks" description="Receive and handle Paddle webhook events with idempotency and IP verification." />
+  <Card title="Outbox" href="/docs/paddle/outbox" description="Transactional outbox relay, backoff strategy, and dead-letter retry." />
+  <Card title="Testing & Operations" href="/docs/paddle/testing-and-operations" description="Commands, sandbox setup, and operational runbooks." />
+</Cards>
+
+## Service Guarantees
+
+The injected interface determines the delivery guarantee.
+
+```php
+use Vortos\Paddle\Customer\Contract\CustomerServiceInterface;
+use Vortos\Paddle\Customer\Contract\StandaloneCustomerServiceInterface;
+use Vortos\Paddle\Customer\Contract\ImmediateCustomerServiceInterface;
+```
+
+`CustomerServiceInterface` (Transactional) — writes to the outbox inside the active database transaction. Use inside command handlers.
+
+`StandaloneCustomerServiceInterface` (Standalone) — wraps the write in its own short transaction. Use in console commands or event listeners that run outside the main unit of work.
+
+`ImmediateCustomerServiceInterface` (Immediate) — calls the Paddle API directly. Use for reads and diagnostics only.
+
+The same three interfaces exist for every domain: Address, Business, Transaction, Adjustment, Product, Price, Discount, and Subscription.

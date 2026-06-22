@@ -1,181 +1,76 @@
 ---
 title: Feature Flags
-description: Percentage rollout, user targeting, attribute rules, kill switch — database-backed with Redis cache.
+description: Ship every feature to production and control visibility through configuration — no redeploy, no downtime, instant kill switch.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Feature Flags
 
-`vortos/vortos-feature-flags` lets you ship every feature to production and control visibility through configuration — no redeploy, no downtime, instant kill switch.
+`vortos/vortos-feature-flags` lets you deploy code and control who sees it separately. The feature lands in production behind a flag — disabled. You enable it for internal users, then 5%, then 50%, then everyone. If something goes wrong, you disable it in seconds without touching the codebase.
 
-Feature flags are **temporary rollout gates**: they exist during a feature's rollout and are removed once it is fully live. For permanent capability grants (RBAC, subscription tiers), see [Authorization](/docs/authorization).
+This is a different discipline from authorization. Authorization answers "is this user allowed to do this?" Feature flags answer "is this feature turned on for this user right now?" They solve different problems and should stay separate — see [Authorization](/docs/authorization) for RBAC.
+
+## Two packages
+
+The platform ships as two independent Composer packages:
+
+| Package | Purpose | Required |
+|---|---|---|
+| `vortos/vortos-feature-flags` | Engine: evaluation, storage, rules, audit, SDK delivery | Yes |
+| `vortos/vortos-feature-flags-admin` | Browser-based management UI | No — optional |
+
+The engine has no UI dependency. You can run it headlessly and manage flags via CLI or the management API. The admin UI package is an optional add-on.
 
 ## Architecture
 
 ```
-php vortos vortos:flags:create new-checkout
-php vortos vortos:flags:enable new-checkout --rollout=25
-         ↓ stored in DB
-
-Request → FlagRegistry::isEnabled('new-checkout', $context)
-         ↓ Redis cache (60s TTL) → DB on miss
-         ↓ FlagEvaluator walks rules in order
-         → true/false
+┌─────────────────────────────────────────────────────────┐
+│                    Management layer                      │
+│  CLI commands  ·  REST API  ·  Admin UI  ·  GitOps sync  │
+└──────────────────────────┬──────────────────────────────┘
+                           │ FlagWriteService (single write boundary)
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                     Storage layer                        │
+│   FlagStorageInterface (DB)  ·  Audit log  ·  Read model │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                   Evaluation layer                       │
+│   FlagRegistry  →  FlagEvaluator  →  Redis cache (60s)   │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Delivery layer                        │
+│   isEnabled()  ·  variant()  ·  /api/flags  ·  SSE stream│
+└─────────────────────────────────────────────────────────┘
 ```
 
-Flags are stored in the database and cached in Redis with a 60-second TTL. Cold misses hit the DB; everything else is a sub-millisecond cache read.
+Every write goes through `FlagWriteService` — a single boundary that validates, persists, emits audit entries, invalidates the cache, and notifies SSE consumers. Nothing writes to flag storage directly.
 
-## Installation
+Reads hit Redis first (60-second TTL). Cache misses fall through to the database. A typical `isEnabled()` call costs under a millisecond.
 
-```bash
-composer require vortos/vortos-feature-flags
-```
+## Quick orientation
 
-Run the module migration to create the flags tables:
+If you are new to the platform, read in this order:
 
-```bash
-php vortos vortos:migrate
-```
+1. [Installation](/docs/feature-flags/installation) — get the packages installed and migrated
+2. [Concepts](/docs/feature-flags/concepts) — understand flag kinds, value types, environments, and lifecycle
+3. [Managing Flags](/docs/feature-flags/managing-flags) — CLI commands for day-to-day operations
+4. [Targeting Rules](/docs/feature-flags/targeting) — percentage rollout, user lists, attribute matching
+5. [Variants](/docs/feature-flags/variants) — A/B testing and multi-variant experiments
+6. [Admin UI](/docs/feature-flags/admin-ui) — browser-based management dashboard
+7. [Frontend](/docs/feature-flags/frontend) — `@vortos/flags` React SDK
 
-<Callout type="info" title="Migration source">
-The migration file is `20240101000000_create_feature_flags.sql` located in the module's `Resources/migrations/` directory. `vortos:migrate` picks it up automatically.
-</Callout>
+For production operations, continue with:
 
-## Quick Start
-
-```bash
-# 1. Create a flag (disabled by default)
-php vortos vortos:flags:create new-checkout
-
-# 2. Enable for 10% of users
-php vortos vortos:flags:enable new-checkout --rollout=10
-
-# 3. Ramp to full rollout
-php vortos vortos:flags:enable new-checkout --rollout=100
-```
-
-## Checking Flags in Code
-
-Inject `FlagRegistry` anywhere — controllers, services, query handlers:
-
-```php
-use Vortos\FeatureFlags\FlagRegistry;
-use Vortos\FeatureFlags\FlagContext;
-
-final class CheckoutController
-{
-    public function __construct(private readonly FlagRegistry $flags) {}
-
-    public function index(): Response
-    {
-        // Anonymous check — no user context
-        if ($this->flags->isEnabled('new-checkout')) {
-            return $this->render('checkout/new.html.twig');
-        }
-
-        return $this->render('checkout/legacy.html.twig');
-    }
-}
-```
-
-Pass a `FlagContext` to enable user targeting and attribute rules:
-
-```php
-$context = new FlagContext(
-    userId: $user->getId(),
-    attributes: ['plan' => $user->plan, 'role' => $user->role],
-);
-
-$this->flags->isEnabled('new-checkout', $context);
-```
-
-For A/B variants:
-
-```php
-$variant = $this->flags->variant('cta-button', $context);
-// returns 'control' | 'blue' | 'green'
-```
-
-## Built-in Frontend Endpoint
-
-The module registers `GET /api/flags` automatically. No controller code needed.
-
-The endpoint evaluates flags for the current request using the registered `FlagContextResolver` and returns every enabled flag name plus every active variant in a single response:
-
-```json
-{
-  "flags": ["new-dashboard", "dark-mode"],
-  "variants": {
-    "checkout-layout": "variant-b",
-    "cta-button": "blue"
-  }
-}
-```
-
-`flags` lists every flag that evaluated to `true` for this request. `variants` maps flag names to their assigned variant string — only flags that have active variants appear here.
-
-The frontend SDK reads this endpoint and makes flag state available locally through React context. See [Frontend Integration](/docs/feature-flags/frontend) for setup.
-
-For patterns on when to use this endpoint vs. inline handler checks vs. a filtered custom endpoint, see [Usage Patterns](/docs/feature-flags/patterns).
-
-## `#[RequiresFlag]` on Controllers
-
-Annotate a controller to gate the entire route behind a flag. Returns 404 if the flag is off — no extra code in the action:
-
-```php
-use Vortos\FeatureFlags\Attribute\RequiresFlag;
-
-#[RequiresFlag('new-dashboard')]
-final class NewDashboardController
-{
-    public function __invoke(): Response
-    {
-        // Only reachable when 'new-dashboard' is enabled
-        return $this->render('dashboard/new.html.twig');
-    }
-}
-```
-
-<Callout type="info" title="Compile-Time Resolution">
-`#[RequiresFlag]` is resolved at container compile time by `FeatureFlagsCompilerPass` — not at request time. The compiler pass reads all `#[RequiresFlag]` attributes from your controllers at build time and injects a static lookup map into `FeatureFlagMiddleware`. This means zero reflection happens per-request — the middleware does a single array lookup. The map is rebuilt automatically whenever the container is recompiled.
-</Callout>
-
-<Callout type="info" title="Context in attribute checks">
-`#[RequiresFlag]` uses the registered `FlagContextResolver` to build the context automatically. Wire up a resolver to make targeting work here too — see below.
-</Callout>
-
-## FlagContextResolver
-
-By default, all requests are evaluated as anonymous (no `userId`, no attributes). Override `FlagContextResolverInterface` to inject real user data — this is required for user targeting and attribute rules to work:
-
-```php title="src/Infrastructure/Flags/UserFlagContextResolver.php"
-use Vortos\FeatureFlags\FlagContext;
-use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
-use Vortos\Http\Request;
-
-final class UserFlagContextResolver implements FlagContextResolverInterface
-{
-    public function __construct(private readonly CurrentUserProvider $auth) {}
-
-    public function resolve(Request $request): FlagContext
-    {
-        $user = $this->auth->current();
-
-        if (!$user->isAuthenticated()) {
-            return new FlagContext();
-        }
-
-        return new FlagContext(
-            userId: (string) $user->getId(),
-            attributes: ['plan' => $user->plan, 'role' => $user->role],
-        );
-    }
-}
-```
-
-```php title="config/services.php"
-$services->alias(FlagContextResolverInterface::class, UserFlagContextResolver::class);
-```
-
-Register once — used by both `FlagRegistry::isEnabled()` (when no context is passed) and `#[RequiresFlag]`.
+- [Environments](/docs/feature-flags/environments) — separate rollout per environment
+- [Audit Log](/docs/feature-flags/audit-log) — full change history with actor and reason
+- [Change Requests](/docs/feature-flags/change-requests) — 4-eyes approval for protected environments
+- [Release Guardrails](/docs/feature-flags/release-guardrails) — policies that block risky rollbacks
+- [SDK Keys](/docs/feature-flags/sdk-keys) — API keys for CI/CD and SDK clients
+- [Webhooks](/docs/feature-flags/webhooks) — notify external systems on flag changes
+- [GitOps](/docs/feature-flags/gitops) — manage flags as YAML in version control

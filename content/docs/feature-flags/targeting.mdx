@@ -1,125 +1,233 @@
 ---
 title: Targeting Rules
-description: Percentage rollout, user whitelists, attribute-based rules, and A/B variants.
+description: Percentage rollout, user whitelists, attribute-based rules, segments, deny rules, and rule evaluation order.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Targeting Rules
 
-Rules are evaluated in insertion order — **first match wins**. If no rule matches, the flag returns `false` even if it is enabled. A flag with no rules and status `enabled` is `true` for everyone.
+Rules determine who receives a flag. They are evaluated in insertion order — **first match wins**. If no rule matches, the flag returns `false` even if its status is `enabled`. A flag with status `enabled` and no rules returns `true` for everyone.
 
 ```
 FlagEvaluator:
-  1. Flag disabled?         → false (short-circuit, no rules evaluated)
-  2. Walk rules in order
+  1. Flag disabled?         → false (short-circuit, rules skipped)
+  2. Deny rule matches?     → false (explicit block, takes priority)
+  3. Walk allow rules in order:
        rule matches?        → true  (stop)
        rule does not match? → next rule
-  3. No rule matched        → false
+  4. No allow rule matched  → false
 ```
 
-## Rule Types
+## Rule types
 
-### Users Whitelist
+### Users whitelist
 
-Specific user IDs always receive the flag, regardless of other rules. Use for internal QA, beta testers, or forcing a flag on for your own account.
+Specific user IDs always receive the flag. Use for internal QA, beta testers, or forcing a flag on for your own account.
 
 ```bash
-php vortos vortos:flags:add-rule new-checkout --type=users --users=user-123,user-456
+php vortos vortos:flags:add-rule new-checkout \
+  --type=users \
+  --users=user-123,user-456
 ```
 
 ```php
 $flags->isEnabled('new-checkout', new FlagContext(userId: 'user-123')); // true
-$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-999')); // false (no other rules match)
+$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-999')); // next rule or false
 ```
 
-<Callout type="info" title="Anonymous users">
-Requests with no `userId` in `FlagContext` never match a users whitelist rule. Pass an empty `new FlagContext()` and the evaluation falls through to the next rule.
+<Callout type="info" title="Anonymous users never match a whitelist">
+Requests with no `userId` in `FlagContext` skip the users rule entirely. The evaluation falls through to the next rule.
 </Callout>
 
-### Percentage Rollout
+### Percentage rollout
 
-Assigns each user deterministically to a bucket via `hash(flagName + userId) % 100`. The same user always gets the same result for the same flag — no session state required.
+Assigns each user deterministically to a bucket via `hash(flagName + userId) % 100`. The same user always gets the same result for the same flag — no session state, no cookies, no database lookup per request.
 
 ```bash
-php vortos vortos:flags:enable new-checkout --rollout=25
-# equivalent to:
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=25
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=25
 ```
 
 ```php
-// Same user always gets the same result
-$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-abc')); // deterministic
+// Same user always gets the same result for the same flag
+$flags->isEnabled('new-checkout', new FlagContext(userId: 'user-abc'));
 ```
 
-<Callout type="info" title="Anonymous users and percentage rules">
-Users with no `userId` always fall outside the percentage bucket. Percentage rollout requires a `userId` in `FlagContext` — wire up a `FlagContextResolver` to make this work automatically.
+The hash uses the flag name as a salt, so a user in bucket 30 for `new-checkout` may be in bucket 70 for `pricing-test`. Each flag has an independent distribution.
+
+<Callout type="info" title="Percentage rules require a userId">
+Anonymous requests (no `userId`) always fall outside the bucket. Wire up a `FlagContextResolver` so authenticated users are identified.
 </Callout>
 
-### Attribute Rules
+### Attribute rules
 
-Target by any attribute in `FlagContext::attributes`. Attributes are arbitrary key/value pairs you populate in your `FlagContextResolver`.
+Target by any attribute in `FlagContext::attributes`. Attributes are arbitrary key/value pairs you provide in your `FlagContextResolver`.
 
 | Operator | Behaviour |
 |---|---|
-| `equals` | Attribute value exactly matches the rule value |
-| `not_equals` | Attribute value does not match the rule value |
-| `in` | Attribute value is in the comma-separated list |
-| `not_in` | Attribute value is not in the comma-separated list |
-| `contains` | Attribute value contains the rule value as a substring |
+| `equals` | Exact match |
+| `not_equals` | Does not match |
+| `in` | Value is in a comma-separated list |
+| `not_in` | Value is not in the list |
+| `contains` | Value contains the string as a substring |
 
 ```bash
-# Enterprise users only
-php vortos vortos:flags:add-rule feature --type=attribute --attribute=plan --operator=equals --value=enterprise
+# Enterprise plan only
+php vortos vortos:flags:add-rule feature \
+  --type=attribute \
+  --attribute=plan \
+  --operator=equals \
+  --value=enterprise
 
-# Everyone except free tier
-php vortos vortos:flags:add-rule feature --type=attribute --attribute=plan --operator=not_equals --value=free
+# Exclude free tier
+php vortos vortos:flags:add-rule feature \
+  --type=attribute \
+  --attribute=plan \
+  --operator=not_equals \
+  --value=free
 
-# Specific regions
-php vortos vortos:flags:add-rule feature --type=attribute --attribute=region --operator=in --value=eu-west,eu-central
+# EU region only
+php vortos vortos:flags:add-rule feature \
+  --type=attribute \
+  --attribute=region \
+  --operator=in \
+  --value=eu-west,eu-central
 
-# Email domain targeting
-php vortos vortos:flags:add-rule feature --type=attribute --attribute=email --operator=contains --value=@acme.com
+# Email domain targeting (useful for beta programs)
+php vortos vortos:flags:add-rule feature \
+  --type=attribute \
+  --attribute=email \
+  --operator=contains \
+  --value=@acme.com
 ```
 
-## Rule Chain Example
+## Segments
 
-Combine rule types to build a staged rollout: enterprise customers and beta users get full access, then 10% of everyone else.
+A segment is a reusable set of targeting criteria. Instead of repeating the same user list or attribute rule across multiple flags, define it once and reference it by name.
 
 ```bash
-php vortos vortos:flags:add-rule new-checkout --type=attribute --attribute=plan --operator=equals --value=enterprise
-php vortos vortos:flags:add-rule new-checkout --type=users --users=beta-user-1,beta-user-2
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=10
+# Create a segment for beta testers
+php vortos vortos:flags:segment:create beta-users \
+  --description="Beta program participants"
+
+php vortos vortos:flags:segment:add-rule beta-users \
+  --type=users \
+  --users=user-1,user-2,user-3
+
+# Reference the segment from a flag rule
+php vortos vortos:flags:add-rule new-checkout \
+  --type=segment \
+  --segment=beta-users
+```
+
+When you add a user to the `beta-users` segment, every flag that references that segment immediately picks up the change. You do not need to update each flag individually.
+
+Segments are also manageable through the admin UI under the Segments screen.
+
+## Deny rules
+
+A deny rule explicitly blocks matched users from receiving the flag, regardless of any allow rules. Deny rules are evaluated before allow rules.
+
+```bash
+# Exclude a specific user from a percentage rollout
+php vortos vortos:flags:add-rule new-checkout \
+  --type=deny \
+  --attribute=userId \
+  --operator=equals \
+  --value=problematic-user-id
+```
+
+Use deny rules to:
+- Exclude users who reported bugs from a rolling experiment
+- Block specific tenants from an early rollout
+- Override a segment match for one-off exceptions
+
+## Rule chain example
+
+Combine rule types to build a staged rollout:
+
+```bash
+# Internal team always in
+php vortos vortos:flags:add-rule new-checkout \
+  --type=segment \
+  --segment=internal-team
+
+# Enterprise customers always in
+php vortos vortos:flags:add-rule new-checkout \
+  --type=attribute \
+  --attribute=plan \
+  --operator=equals \
+  --value=enterprise
+
+# 20% of everyone else
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=20
 ```
 
 ```
 Evaluation order:
-  1. plan = enterprise  → true  (enterprise users always in)
-  2. users whitelist    → true  (beta users always in)
-  3. percentage 10%     → hash  (10% of all other users)
-  4. fallback           → false
+  1. deny rules             → any deny match → false (stop)
+  2. segment: internal-team → matched → true (stop)
+  3. plan = enterprise      → matched → true (stop)
+  4. percentage 20%         → hashed  → true/false (stop)
+  5. fallback               → false
 ```
 
-## Variants (A/B Testing)
+## Checking flags in code
 
-Variants extend percentage rollout across multiple buckets. Each variant is assigned a weight; users are deterministically bucketed into exactly one variant.
+Inject `FlagRegistry` anywhere — controllers, services, query handlers:
 
-<Callout type="info" title="No variant command yet">
-Variants are configured directly in storage. The `vortos:flags:add-rule` command does not support variants yet. Use the admin API or set them directly in the `feature_flag_variants` table.
+```php
+use Vortos\FeatureFlags\FlagRegistry;
+use Vortos\FeatureFlags\FlagContext;
+
+final class CheckoutController
+{
+    public function __construct(private readonly FlagRegistry $flags) {}
+
+    public function index(Request $request): Response
+    {
+        $context = new FlagContext(
+            userId:     $this->currentUser->id(),
+            attributes: ['plan' => $this->currentUser->plan],
+        );
+
+        if ($this->flags->isEnabled('new-checkout', $context)) {
+            return $this->render('checkout/new.html.twig');
+        }
+
+        return $this->render('checkout/legacy.html.twig');
+    }
+}
+```
+
+When called without a context, the registered `FlagContextResolver` is used automatically:
+
+```php
+$this->flags->isEnabled('new-checkout'); // uses FlagContextResolver
+```
+
+## `#[RequiresFlag]` on controllers
+
+Gate an entire route behind a flag. Returns 404 if the flag is off — no code in the action:
+
+```php
+use Vortos\FeatureFlags\Attribute\RequiresFlag;
+
+#[RequiresFlag('new-dashboard')]
+final class NewDashboardController
+{
+    public function __invoke(): Response
+    {
+        // Only reachable when 'new-dashboard' is enabled for this request
+        return $this->render('dashboard/new.html.twig');
+    }
+}
+```
+
+<Callout type="info" title="Compile-time resolution">
+`#[RequiresFlag]` is resolved at container compile time by `FeatureFlagsCompilerPass`. The compiler reads all annotated controllers and builds a static lookup map injected into `FeatureFlagMiddleware`. Zero reflection per request — just an array lookup.
 </Callout>
-
-```php title="Backend"
-// Flag 'cta-button' has variants: control 34%, blue 33%, green 33%
-$variant = $flags->variant('cta-button', $context);
-// 'control' | 'blue' | 'green' — same user always gets the same variant
-```
-
-```tsx title="Frontend"
-const variant = useVariant('cta-button') // 'control' | 'blue' | 'green'
-
-if (variant === 'blue')  return <BlueCta />
-if (variant === 'green') return <GreenCta />
-return <DefaultCta />
-```
-
-Variant bucketing uses the same `hash(flagName + userId) % 100` mechanism as percentage rollout. A user in variant `blue` stays in `blue` across sessions and deployments as long as the variant weights don't change.

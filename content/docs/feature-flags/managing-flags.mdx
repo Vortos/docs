@@ -1,63 +1,98 @@
 ---
 title: Managing Flags
-description: Console commands for creating, enabling, disabling, and targeting feature flags.
+description: Console commands for the full flag lifecycle — create, enable, disable, rollout, rules, environments, and cleanup.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Managing Flags
 
-All flag lifecycle operations are handled via `php vortos vortos:flags:*` commands. Every change takes effect within the Redis TTL (60 seconds); `vortos:flags:disable` is the exception — it busts the cache immediately.
+All flag lifecycle operations are available via `php vortos vortos:flags:*` commands. Every command goes through `FlagWriteService` — changes are audited, cached safely, and pushed to any open admin dashboards via SSE.
 
 ## Create
 
 ```bash
-# Disabled by default — safe to create before the code is deployed
+# Bool flag, disabled by default
 php vortos vortos:flags:create new-checkout
 
-# With a description
-php vortos vortos:flags:create new-checkout --description="New checkout flow v2"
+# With description and kind
+php vortos vortos:flags:create new-checkout \
+  --description="New checkout redesign" \
+  --kind=release
+
+# Experiment with string variants
+php vortos vortos:flags:create cta-button \
+  --kind=experiment \
+  --value-type=string
+
+# Ops kill switch
+php vortos vortos:flags:create disable-payments \
+  --kind=ops \
+  --description="Emergency kill switch for the payment processor"
+
+# Scoped to a project and environment
+php vortos vortos:flags:create new-checkout \
+  --project=checkout \
+  --env=staging
 ```
+
+Always create the flag **before** merging the feature branch. The flag starts disabled, so the code deploys to production with the feature invisible. This decouples deployment from release.
+
+## Show
+
+```bash
+php vortos vortos:flags:show new-checkout
+php vortos vortos:flags:show new-checkout --env=staging
+```
+
+Shows the flag's current state, all rules (in order), variants, environment, and project.
 
 ## List
 
 ```bash
-# Table output
+# All flags
 php vortos vortos:flags:list
 
-# Machine-readable
-php vortos vortos:flags:list --json
-```
+# Filter by environment
+php vortos vortos:flags:list --env=staging
 
-```
-Name           Status    Rules  Description
-─────────────  ────────  ─────  ──────────────────────
-new-checkout   enabled   2      New checkout flow v2
-old-pricing    disabled  0
-cta-button     enabled   3      A/B test — CTA copy
+# Filter by kind
+php vortos vortos:flags:list --kind=ops
+
+# Filter by status
+php vortos vortos:flags:list --status=enabled
+
+# Machine-readable output
+php vortos vortos:flags:list --json
 ```
 
 ## Enable
 
 ```bash
-# Full rollout — enabled for all users
+# Enable for all users (no percentage rule)
 php vortos vortos:flags:enable new-checkout
 
-# Gradual rollout — adds a percentage rule (replaces any existing percentage rule)
+# Enable with a gradual rollout percentage
 php vortos vortos:flags:enable new-checkout --rollout=10
-php vortos vortos:flags:enable new-checkout --rollout=50
-php vortos vortos:flags:enable new-checkout --rollout=100
+
+# Enable in a specific environment
+php vortos vortos:flags:enable new-checkout --env=staging
 ```
+
+`--rollout=N` adds (or replaces) a percentage rule. The flag is both enabled and rolling out — users outside the percentage bucket still get `false`.
 
 ## Disable
 
 ```bash
-# Kill switch — off for everyone immediately, cache busted on write
+# Immediate kill switch — cache is busted on write
 php vortos vortos:flags:disable new-checkout
+
+# Disable in a specific environment only
+php vortos vortos:flags:disable new-checkout --env=staging
 ```
 
-<Callout type="info" title="Instant effect">
-`vortos:flags:disable` writes the disabled state and invalidates the Redis cache in the same operation. Users see the flag as off within the current request cycle.
+<Callout type="warn" title="Disable bypasses the TTL">
+Unlike other writes, `disable` invalidates the Redis cache immediately. The flag reads as `false` within the current request on every instance. Use this as your incident kill switch.
 </Callout>
 
 ## Delete
@@ -67,51 +102,78 @@ php vortos vortos:flags:delete new-checkout --force
 ```
 
 <Callout type="warn" title="Irreversible">
-`--force` is required and skips the confirmation prompt. Deletion is permanent — all rules and history are removed. Remove all `isEnabled()` / `#[RequiresFlag]` calls from the codebase before deleting.
+Deletion removes the flag, all rules, all audit history, and all variant data permanently. `--force` is required. Remove all `isEnabled()` and `variant()` calls from the codebase before deleting. Consider archiving instead — archived flags are removed from evaluation but their history is preserved.
 </Callout>
 
 ## Add Targeting Rules
 
-Rules are appended in insertion order and evaluated in that order — first match wins. See [Targeting Rules](/docs/feature-flags/targeting) for full evaluation logic.
+Rules are evaluated in insertion order — first match wins. See [Targeting Rules](/docs/feature-flags/targeting) for the full evaluation model.
 
 ```bash
 # Whitelist specific user IDs
-php vortos vortos:flags:add-rule new-checkout --type=users --users=user-123,user-456
+php vortos vortos:flags:add-rule new-checkout \
+  --type=users \
+  --users=user-123,user-456
 
 # Percentage rollout (deterministic by userId + flagName hash)
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=25
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=25
 
-# Attribute rule — plan equals enterprise
-php vortos vortos:flags:add-rule new-checkout --type=attribute --attribute=plan --operator=equals --value=enterprise
+# Attribute rule
+php vortos vortos:flags:add-rule new-checkout \
+  --type=attribute \
+  --attribute=plan \
+  --operator=equals \
+  --value=enterprise
 
-# Attribute rule — region in list
-php vortos vortos:flags:add-rule new-checkout --type=attribute --attribute=region --operator=in --value=eu-west,eu-central
+# Region targeting
+php vortos vortos:flags:add-rule new-checkout \
+  --type=attribute \
+  --attribute=region \
+  --operator=in \
+  --value=eu-west,eu-central
 
 # Replace all existing rules before adding the new one
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=100 --clear
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=50 \
+  --clear
 ```
 
-## Typical Gradual Rollout
+## Typical gradual rollout
+
+This is the standard sequence for a feature release:
 
 ```bash
-# 1. Create the flag before merging the feature branch
-php vortos vortos:flags:create new-checkout --description="New checkout redesign"
+# 1. Create before merging — feature is deployed but invisible
+php vortos vortos:flags:create new-checkout \
+  --description="New checkout redesign" \
+  --kind=release
 
-# 2. Internal team first — specific user IDs
-php vortos vortos:flags:add-rule new-checkout --type=users --users=dev-1,dev-2
+# 2. Internal team first
+php vortos vortos:flags:add-rule new-checkout \
+  --type=users \
+  --users=eng-1,eng-2,qa-1
 php vortos vortos:flags:enable new-checkout
 
-# 3. Verify in production, then open to 10%
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=10 --clear
+# 3. Verified in production — open to 10%
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=10 \
+  --clear
 
 # 4. Ramp up
-php vortos vortos:flags:add-rule new-checkout --type=percentage --percentage=50 --clear
+php vortos vortos:flags:add-rule new-checkout \
+  --type=percentage \
+  --percentage=50 \
+  --clear
 
 # 5. Full rollout
 php vortos vortos:flags:enable new-checkout --rollout=100
 
-# 6. Remove flag from code, then clean up
+# 6. Feature is live — remove flag from code, then clean up
 php vortos vortos:flags:delete new-checkout --force
 ```
 
-The `--clear` flag on step 3 removes the user whitelist rule before adding the percentage rule, so the two rules don't overlap.
+The `--clear` on steps 3–4 removes the previous rule set before adding the new percentage, so rules from step 2 do not persist into the ramp phase.

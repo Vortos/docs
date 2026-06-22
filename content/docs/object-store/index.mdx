@@ -25,6 +25,7 @@ Large public uploads should not stream through PHP workers. The backend issues a
 - Explicit service interfaces for transactional, standalone async, and immediate provider behavior.
 - Temporary upload lifecycle rule planning and application.
 - Trusted server-side multipart transfers for backend-owned streams and files.
+- Circuit breaker for fast-fail protection when the provider is unavailable.
 - Provider exception mapping into Vortos exceptions.
 - Logging, tracing, and metrics with global and section-level opt-outs.
 - Testing fake for application tests.
@@ -60,6 +61,7 @@ $config
   <Card title="Outbox Promotions" href="/docs/object-store/outbox-and-promotions" description="Atomic promotion from tmp keys to permanent keys inside command handlers." />
   <Card title="Lifecycle Cleanup" href="/docs/object-store/lifecycle-cleanup" description="Managed tmp object expiration rules with explicit commands." />
   <Card title="Multipart" href="/docs/object-store/server-side-multipart" description="Trusted backend multipart transfers and stale upload cleanup." />
+  <Card title="Circuit Breaker" href="/docs/object-store/circuit-breaker" description="Fast-fail protection when the provider is unavailable." />
 </Cards>
 
 ## Service Guarantees

@@ -4,6 +4,7 @@
     "index",
     "quickstart",
     "configuration",
+    "circuit-breaker",
     "direct-uploads",
     "outbox-and-promotions",
     "lifecycle-cleanup",

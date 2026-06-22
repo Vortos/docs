@@ -42,8 +42,8 @@ php bin/console vortos:make:controller RegisterUser \
 **Creates**
 
 ```
-src/User/Representation/Controller/RegisterUserController.php
-src/User/Representation/Request/RegisterUserRequest.php
+src/User/Presentation/Controller/RegisterUserController.php
+src/User/Presentation/Request/RegisterUserRequest.php
 ```
 
 **`RegisterUserController.php`**
@@ -53,9 +53,9 @@ src/User/Representation/Request/RegisterUserRequest.php
 
 declare(strict_types=1);
 
-namespace App\User\Representation\Controller;
+namespace App\User\Presentation\Controller;
 
-use App\User\Representation\Request\RegisterUserRequest;
+use App\User\Presentation\Request\RegisterUserRequest;
 use Vortos\Http\Attribute\AsController;
 use Vortos\Http\JsonResponse;
 use Vortos\Http\Response;
@@ -85,7 +85,7 @@ final class RegisterUserController
 
 declare(strict_types=1);
 
-namespace App\User\Representation\Request;
+namespace App\User\Presentation\Request;
 
 use Vortos\Http\Request\RequestDto;
 

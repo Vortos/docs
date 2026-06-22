@@ -71,7 +71,7 @@ $this->readRepository->upsert($envelope->aggregateId, ['_id' => $envelope->aggre
 $this->readRepository->insert(['_id' => $envelope->aggregateId, ...]);
 ```
 
-`MongoReadRepository::upsert()` uses `replaceOne` with `upsert: true` — inserts if not exists, replaces if exists. Calling it twice with the same data produces the same result.
+`MongoStore::upsert()` uses `replaceOne` with `upsert: true` — inserts if not exists, replaces if exists. Calling it twice with the same data produces the same result.
 
 ## Multiple Events — One Handler
 

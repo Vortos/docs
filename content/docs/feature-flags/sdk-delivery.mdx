@@ -1,0 +1,126 @@
+---
+title: SDK Delivery
+description: The /api/flags endpoint and SSE stream — how flag state reaches client applications in real time.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# SDK Delivery
+
+The engine exposes two endpoints for delivering flag state to clients: a one-shot evaluation endpoint and a real-time SSE stream.
+
+## `/api/flags` — evaluation endpoint
+
+```
+GET /api/flags
+Authorization: Bearer <sdk-key>   (or session cookie for web apps)
+```
+
+Evaluates all flags for the current request context and returns the result:
+
+```json
+{
+  "flags": ["new-dashboard", "dark-mode"],
+  "variants": {
+    "checkout-layout": "variant-b",
+    "cta-button": "blue"
+  },
+  "payloads": {
+    "new-dashboard": { "maxWidgets": 8 }
+  },
+  "version": "flags_2026_06_22_001"
+}
+```
+
+- `flags` — names of every flag that evaluated to `true` for this request
+- `variants` — active variant for each flag that has variants
+- `payloads` — optional structured configuration per flag
+- `version` — an opaque string that changes when any flag state changes; useful for cache invalidation
+
+The `@vortos/flags` React provider calls this endpoint on mount, on token/context change, and on the configured polling interval. See [Frontend Integration](/docs/feature-flags/frontend) for setup.
+
+### Context passing
+
+The endpoint reads targeting context from the `X-Vortos-Flag-Context` header (base64-encoded JSON) or from the registered `FlagContextResolver`. Browser clients passing the context header should include identity information:
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  context={{ userId, tenantId, plan }}
+>
+```
+
+The SDK encodes this as `X-Vortos-Flag-Context` automatically.
+
+## `/api/flags/stream` — SSE stream
+
+```
+GET /api/flags/stream?env=production
+Authorization: Bearer <sdk-key>
+```
+
+A persistent Server-Sent Events connection. The server pushes a `flag-change` event whenever any flag state changes in the subscribed environment:
+
+```
+event: connected
+data: {}
+
+event: flag-change
+data: {}
+
+: heartbeat
+
+event: flag-change
+data: {}
+```
+
+Events carry no flag payload — the client re-fetches `/api/flags` on receipt to get the updated state. This keeps the SSE stream simple and stateless.
+
+The stream sends a heartbeat comment every 25 seconds to keep the connection alive through proxies and load balancers. The connection times out after 5 minutes; the client should reconnect automatically.
+
+### Using the stream in React
+
+```tsx
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  streamEndpoint="/api/flags/stream"
+  headers={{ Authorization: `Bearer ${SDK_KEY}` }}
+>
+```
+
+When `streamEndpoint` is set, the provider opens an SSE connection and refetches `/api/flags` on each `flag-change` event, replacing the polling interval.
+
+### When to use SSE vs. polling
+
+| | Polling | SSE |
+|---|---|---|
+| Latency | Up to `refreshInterval` | Near-instant |
+| Infra complexity | None | Requires sticky connections or a pub/sub backend |
+| Good for | Most applications | Ops dashboards, kill switches, incident response |
+
+Start with polling. Switch to SSE when operators need to see flag changes reflect in open browser tabs without manual refresh.
+
+## Authentication
+
+Both endpoints accept:
+
+1. **SDK key** — `Authorization: Bearer sk-live-...` — for external clients (mobile apps, SPAs with their own key)
+2. **Session cookie** — for web apps where the browser already has an authenticated session (no key needed)
+3. **Internal header** — `X-Vortos-Internal: true` with a shared secret — for server-to-server calls inside the same cluster
+
+SDK read keys are scoped to a single environment. A key issued for `production` cannot access `staging` state. See [SDK Keys](/docs/feature-flags/sdk-keys).
+
+## Rate limiting
+
+The evaluation endpoint applies per-actor rate limiting: 600 requests per minute by default. SSE connections count as one persistent connection per client, not one request per event.
+
+Configure limits in `feature_flags.rate_limit`:
+
+```php title="config/feature_flags.php"
+return [
+    'rate_limit' => [
+        'evaluation_rpm' => 600,
+        'management_rpm' => 60,
+    ],
+];
+```

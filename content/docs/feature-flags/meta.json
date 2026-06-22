@@ -1,4 +1,25 @@
 {
   "title": "Feature Flags",
-  "pages": ["index", "managing-flags", "targeting", "frontend", "patterns"]
+  "pages": [
+    "index",
+    "installation",
+    "concepts",
+    "managing-flags",
+    "targeting",
+    "variants",
+    "environments",
+    "projects",
+    "audit-log",
+    "change-requests",
+    "release-guardrails",
+    "sdk-keys",
+    "gitops",
+    "webhooks",
+    "sdk-delivery",
+    "evaluation-explain",
+    "admin-ui",
+    "frontend",
+    "patterns",
+    "testing"
+  ]
 }

@@ -1,0 +1,106 @@
+---
+title: Change Requests
+description: 4-eyes approval workflow for flag changes in protected environments. No change reaches production without a second pair of eyes.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Change Requests
+
+A change request is a pending flag mutation that requires approval from a second actor before it executes. It is the 4-eyes principle applied to feature flag operations.
+
+You need this when:
+- Regulations require a second reviewer for production changes (SOC 2, ISO 27001, HIPAA)
+- Your team wants to prevent unreviewed rollouts reaching users
+- A flag controls a high-risk operation (payments, data migrations, compliance features)
+
+## How it works
+
+```
+Actor A submits change request
+  (enable new-checkout at 10% in production)
+         ↓
+Change request created — flag is NOT changed yet
+         ↓
+Actor B reviews the request in the approvals queue
+         ↓
+Actor B approves
+         ↓
+Change executes — flag is now at 10% in production
+Audit log records both actors and the approval chain
+```
+
+The change request captures the full intent: what flag, what environment, what change, and why. The approver can read the intent before approving.
+
+## Protecting an environment
+
+Mark an environment as protected in configuration. Any write targeting that environment goes through the change request workflow instead of executing immediately:
+
+```php title="config/feature_flags.php"
+return [
+    'protected_environments' => ['production'],
+];
+```
+
+CLI and admin UI both respect this. When a developer runs:
+
+```bash
+php vortos vortos:flags:enable new-checkout --env=production --rollout=10
+```
+
+Instead of enabling the flag immediately, the engine creates a pending change request and outputs the request ID. The flag stays unchanged until an approver acts.
+
+## Submitting a change request
+
+```bash
+php vortos vortos:flags:enable new-checkout \
+  --env=production \
+  --rollout=10 \
+  --reason="Rollout per PROJ-1234 — approved in Jira"
+```
+
+In the admin UI, all writes to protected environments automatically create a change request. The UI shows a confirmation step before submission.
+
+## Approving and rejecting
+
+```bash
+# List pending requests
+php vortos vortos:flags:change-requests:list
+
+# Approve
+php vortos vortos:flags:change-requests:approve <request-id> \
+  --reason="Reviewed PROJ-1234, looks good"
+
+# Reject
+php vortos vortos:flags:change-requests:reject <request-id> \
+  --reason="Needs more staging time"
+```
+
+In the admin UI, the **Approvals** screen shows all pending requests with the proposed change diff. One click to approve or reject, with an optional reason.
+
+<Callout type="warn" title="Self-approval is blocked">
+The actor who submitted a change request cannot approve it. The approver must be a different user with the `flags.manage` permission. This is enforced at the application layer and cannot be bypassed via the CLI.
+</Callout>
+
+## Approvals screen in the admin UI
+
+Navigate to `/admin/flags/approvals`. The screen shows:
+
+- Pending requests with the full proposed change (before/after diff)
+- Who submitted it and when
+- The stated reason
+- Approve / Reject buttons with a reason field
+
+Approvers are notified via webhook if a webhook is configured for the `change_request.created` event. See [Webhooks](/docs/feature-flags/webhooks).
+
+## Auto-expiry
+
+Change requests that are not acted on within a configurable window are automatically expired. The default is 72 hours. Expired requests are recorded in the audit log.
+
+```php title="config/feature_flags.php"
+return [
+    'change_request_expiry_hours' => 48,
+];
+```
+
+The submitter can re-submit an expired request.

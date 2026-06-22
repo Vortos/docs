@@ -80,6 +80,11 @@ return static function (VortosObjectStoreConfig $config): void {
 
     $config->audit()->enabled(true);
 
+    $config->circuitBreaker()
+        ->enabled(true)
+        ->failureThreshold(5)
+        ->resetTimeoutSeconds(60);
+
     $config->observability()
         ->logging(true)
         ->tracing(true)
@@ -166,6 +171,16 @@ Multipart config applies to trusted backend transfers through `ServerSideMultipa
 | `backoffBaseMilliseconds()` | `100` |
 | `backoffCapMilliseconds()` | `2000` |
 | `checksumAlgorithm()` | `null` |
+
+## Circuit Breaker
+
+| Method | Default | Description |
+| --- | --- | --- |
+| `enabled()` | `false` | Enable the circuit breaker. |
+| `failureThreshold()` | `5` | Consecutive infrastructure failures before the circuit opens. |
+| `resetTimeoutSeconds()` | `60` | Seconds before the open circuit transitions to half-open for a probe. |
+
+See [Circuit Breaker](/docs/object-store/circuit-breaker) for full details and tuning guidance.
 
 ## Observability
 

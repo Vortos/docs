@@ -1,0 +1,124 @@
+---
+title: GitOps
+description: Define flags as YAML in version control. Every merge to main syncs the flag state to the platform.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# GitOps
+
+GitOps lets you manage flag configuration as YAML files checked into your repository. Instead of running CLI commands or using the admin UI, you edit a YAML file, open a pull request, get it reviewed, and merge. The platform syncs the declared state on merge.
+
+This gives you:
+- Full version history for every flag change (git log)
+- Code review for flag configuration changes
+- Rollback via `git revert`
+- Audit trail that maps flag changes to specific PRs
+
+## Flag definition format
+
+```yaml title="config/flags/production.yaml"
+flags:
+  new-checkout:
+    kind: release
+    value_type: bool
+    description: New checkout redesign
+    enabled: true
+    rollout: 25
+    rules:
+      - type: users
+        users: [eng-1, eng-2]
+      - type: percentage
+        percentage: 25
+
+  cta-button:
+    kind: experiment
+    value_type: string
+    description: CTA copy A/B test
+    enabled: true
+    variants:
+      control: 34
+      variant-a: 33
+      variant-b: 33
+
+  disable-payments:
+    kind: ops
+    value_type: bool
+    description: Emergency kill switch
+    enabled: false
+```
+
+## Syncing
+
+```bash
+# Preview what will change (dry run)
+php vortos vortos:flags:sync \
+  --file=config/flags/production.yaml \
+  --env=production \
+  --dry-run
+
+# Apply
+php vortos vortos:flags:sync \
+  --file=config/flags/production.yaml \
+  --env=production
+```
+
+The sync command:
+1. Reads the YAML file
+2. Compares with current flag state
+3. Creates flags that don't exist
+4. Updates flags that have changed
+5. **Does not delete flags** that are in the platform but not in the YAML (safe by default)
+
+To enable deletion of flags not present in the YAML:
+
+```bash
+php vortos vortos:flags:sync \
+  --file=config/flags/production.yaml \
+  --env=production \
+  --prune
+```
+
+Use `--prune` carefully — it removes flags that have been deleted from the YAML file. Verify with `--dry-run` first.
+
+## CI/CD integration
+
+Add a sync step to your deployment pipeline:
+
+```yaml title=".github/workflows/deploy.yml"
+- name: Sync feature flags
+  run: |
+    php vortos vortos:flags:sync \
+      --file=config/flags/production.yaml \
+      --env=production \
+      --reason="Deployed from ${{ github.sha }}"
+  env:
+    VORTOS_FLAGS_API_KEY: ${{ secrets.FLAGS_MANAGEMENT_KEY }}
+```
+
+The `--reason` value appears in the audit log against each change made by the sync. Using the git SHA lets you trace every flag state back to the exact commit that caused it.
+
+## Exporting current state
+
+Generate a YAML file from the current platform state (useful when adopting GitOps on an existing installation):
+
+```bash
+php vortos vortos:flags:export \
+  --env=production \
+  --output=config/flags/production.yaml
+```
+
+Commit the exported file, then point your CI/CD pipeline at it. From that point forward, all changes should go through git.
+
+## GitOps vs. admin UI
+
+GitOps and the admin UI are not mutually exclusive. A common pattern:
+
+- **Admin UI** for exploratory changes in development and staging (fast iteration)
+- **GitOps** for production (change tracked, reviewed, auditable)
+
+The sync command records every change with `source: gitops` in the audit log, so you can always tell whether a change came from a human clicking the UI or from an automated pipeline.
+
+<Callout type="info" title="GitOps does not bypass change requests">
+If production is protected by change requests, the sync command creates pending change requests rather than applying changes directly. A human must still approve them. The YAML declares the intent; the approval workflow enforces the process.
+</Callout>

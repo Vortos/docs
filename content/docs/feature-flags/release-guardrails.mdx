@@ -1,0 +1,111 @@
+---
+title: Release Guardrails
+description: Policies that block risky flag operations — prevent disabling a flag that would break an SLO, or rolling back a flag while a dependent service is unhealthy.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Release Guardrails
+
+A guardrail is a policy attached to a flag that can block specific write operations from executing. Guardrails run before `FlagWriteService` commits a change. If any guardrail policy fails, the write is rejected with an explanation.
+
+Use guardrails when:
+- Disabling a flag would break a downstream SLO (e.g., disabling a flag that activates a circuit breaker means traffic floods an already-degraded service)
+- You want to prevent a rollback during a running A/B experiment to avoid contaminating the sample
+- A compliance rule requires a flag to remain enabled for a minimum period before it can be disabled
+
+## How guardrails work
+
+```
+FlagWriteService receives a request to disable 'new-payments-processor'
+  ↓
+GuardrailPolicyService checks all active policies for this flag
+  ↓
+Policy: "payments SLO must be above 99.5% to allow disable"
+  → checks current SLO metric
+  → SLO is 99.1% (degraded) → BLOCK
+  ↓
+Write rejected — actor receives reason: "SLO below threshold (99.1% < 99.5%)"
+  ↓
+Audit entry: write_blocked, reason, policy name
+```
+
+The guardrail does not make the write invisible — it is recorded in the audit log with the blocking reason so there is a trail.
+
+## Defining a guardrail policy
+
+Implement `GuardrailPolicyInterface`:
+
+```php
+use Vortos\FeatureFlags\Guardrail\GuardrailPolicyInterface;
+use Vortos\FeatureFlags\Guardrail\GuardrailContext;
+use Vortos\FeatureFlags\Guardrail\GuardrailResult;
+
+final class SloGuardrailPolicy implements GuardrailPolicyInterface
+{
+    public function __construct(
+        private readonly MetricsService $metrics,
+    ) {}
+
+    public function check(GuardrailContext $context): GuardrailResult
+    {
+        // Only block 'disable' operations
+        if ($context->operation !== 'disable') {
+            return GuardrailResult::pass();
+        }
+
+        $slo = $this->metrics->currentSlo($context->flagName);
+
+        if ($slo < 99.5) {
+            return GuardrailResult::block(
+                reason: sprintf(
+                    'SLO is %.1f%% — below the 99.5%% threshold required to disable this flag.',
+                    $slo,
+                ),
+            );
+        }
+
+        return GuardrailResult::pass();
+    }
+}
+```
+
+Attach the policy to a flag via configuration or the admin UI:
+
+```bash
+php vortos vortos:flags:guardrail:attach new-payments-processor \
+  --policy=SloGuardrailPolicy \
+  --env=production
+```
+
+## Built-in policies
+
+| Policy | What it blocks |
+|---|---|
+| `MinimumAgePolicy` | Blocks disable/rollback until the flag has been enabled for N days |
+| `ExperimentActivePolicy` | Blocks all changes while a linked experiment is collecting data |
+| `PercentageFloorPolicy` | Blocks reducing rollout below a configured minimum |
+| `RequiresChangeRequestPolicy` | Forces all writes through the change request workflow |
+
+## Admin UI guardrail panel
+
+The flag detail page shows active guardrails in a dedicated panel. Each guardrail shows:
+
+- Policy name and description
+- Current status (passing / blocking)
+- The blocking reason if active
+
+This gives operators visibility into why a change might be rejected before they try to make it.
+
+<Callout type="info" title="Override for emergencies">
+Users with the `flags.manage` permission can force-bypass a guardrail with a mandatory reason:
+
+```bash
+php vortos vortos:flags:disable new-payments-processor \
+  --env=production \
+  --bypass-guardrails \
+  --reason="INC-0099: forced disable during P0 incident"
+```
+
+The bypass is audited. Use it only in genuine emergencies.
+</Callout>

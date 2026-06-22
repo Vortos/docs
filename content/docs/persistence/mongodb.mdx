@@ -62,19 +62,19 @@ MONGODB_URL=mongodb+srv://user:pass@cluster0.abc123.mongodb.net
 
 ## Register Your Read Repositories
 
-Register your read repository class in `config/services.php` — the framework automatically injects `MongoDB\Client`, the database name, and the `vortos.read_repository` tag at compile time:
+Register your read repository class in `config/services.php` — the framework creates and injects a configured `MongoStore` at compile time:
 
 ```php title="config/services.php"
 $services->set(UserReadRepository::class);
 $services->set(OrderReadRepository::class);
 ```
 
-`MongoReadRepositoryAutowirePass` detects every subclass of `MongoReadRepository` and:
+`MongoReadRepositoryAutowirePass` detects every class with `#[MongoCollection]` and:
 
-1. Sets `$client` → `MongoDB\Client`
-2. Sets `$databaseName` → `%vortos.persistence.mongo.database_name%`
-3. Adds the `vortos.read_repository` tag
-4. Registers the class name with `MongoIndexAttributeScanner` so `vortos:mongo:sync` finds it
+1. Creates a named `MongoStore` service wired to the correct collection, database, and `MongoDB\Client`
+2. Injects the store as the `$store` constructor argument of the repository
+3. Tags the store with `vortos.read_repository` (used by tracing and metrics compiler passes)
+4. Registers the repository class name with `MongoIndexAttributeScanner` so `vortos:mongo:sync` finds it
 
 ## Collections Are Created Automatically
 
@@ -93,7 +93,7 @@ Mixing MongoDB indexes into the SQL migration system would couple infrastructure
 Add `#[MongoCollection]` and repeatable `#[MongoIndex]` directly on the repository class — the same class that uses the indexes for queries:
 
 ```php title="src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php"
-use Vortos\PersistenceMongo\Read\MongoReadRepository;
+use Vortos\PersistenceMongo\Read\MongoStore;
 use Vortos\PersistenceMongo\Schema\Attribute\MongoCollection;
 use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
 
@@ -102,8 +102,9 @@ use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
 #[MongoIndex(key: ['createdAt' => -1, '_id' => -1])]
 #[MongoIndex(key: ['deletedAt' => 1], sparse: true)]
 #[MongoIndex(key: ['expiresAt' => 1], expireAfterSeconds: 3600)]
-final class UserReadRepository extends MongoReadRepository
+final class UserReadRepository implements UserReadRepositoryInterface
 {
+    public function __construct(private readonly MongoStore $store) {}
     // ...
 }
 ```
@@ -118,7 +119,7 @@ final class UserReadRepository extends MongoReadRepository
 | `expireAfterSeconds` | `int\|null` | `null` | TTL — MongoDB auto-deletes after N seconds |
 | `name` | `string\|null` | `null` | Explicit index name (auto-named if omitted) |
 
-`MongoReadRepositoryAutowirePass` registers each repository class with `MongoIndexAttributeScanner` at compile time. At runtime, the scanner reflects over the class and reads these attributes — no glob paths, no provider files.
+`MongoReadRepositoryAutowirePass` registers each `#[MongoCollection]`-annotated repository class with `MongoIndexAttributeScanner` at compile time. At runtime, the scanner reflects over the class and reads these attributes — no glob paths, no provider files.
 
 ### Applying indexes with `vortos:mongo:sync`
 
@@ -193,7 +194,7 @@ $userReadRepository->bulkDelete(['user-1', 'user-2']);
 
 Single `deleteMany` with `$in` filter.
 
-## Advanced Queries via collection()
+## Advanced Queries via store->collection()
 
 Access the raw `MongoDB\Collection` for queries `findByCriteria()` cannot express:
 
@@ -202,7 +203,7 @@ Access the raw `MongoDB\Collection` for queries `findByCriteria()` cannot expres
 public function getStatsByRole(): array
 {
     return iterator_to_array(
-        $this->collection()->aggregate([
+        $this->store->collection()->aggregate([
             ['$group' => ['_id' => '$role', 'count' => ['$sum' => 1]]],
             ['$sort'  => ['count' => -1]],
         ])

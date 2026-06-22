@@ -80,7 +80,7 @@ JWT access tokens include:
 }
 ```
 
-During authorization, `PolicyEngine` compares the token claim with the runtime version from `AuthorizationVersionStoreInterface`.
+During authorization, `PolicyEngine` compares the token version against the runtime version from `AuthorizationVersionStoreInterface`. The version is read from the request context via `RequestAuthzVersionProvider`, which is populated by `AuthMiddleware` from the `ValidatedToken` returned by `JwtService::validate()`. In CLI context (auth explain/can commands) it is populated by `AuthCommandIdentityFactory` instead.
 
 If the token value is older, the decision is:
 

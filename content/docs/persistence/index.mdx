@@ -18,19 +18,24 @@ Write Side                        Read Side
 Command → Handler                 Query → Handler
     │                                 │
     ▼                                 ▼
-WriteRepositoryInterface          ReadRepositoryInterface
+UserRepositoryInterface           UserReadRepositoryInterface
     │                                 │
     ▼                                 ▼
-DbalWriteRepository               MongoReadRepository
-  or OrmWriteRepository               │
+UserWriteRepository               UserReadRepository
+  #[UsesDbalMapper]                  #[MongoCollection]
+  or #[UsesOrmEntity]                   │
     │                                 ▼
-    ▼                             MongoDB (read-optimised projections)
+    ▼                          MongoStore (injected at compile time)
+DbalStore / OrmStore                  │
+(injected at compile time)            ▼
+    │                         MongoDB (read-optimised projections)
+    ▼
 PostgreSQL (source of truth)
 ```
 
 The write side is transactional and strongly consistent. The read side is eventually consistent — projections update MongoDB asynchronously when domain events are processed.
 
-Both `DbalWriteRepository` and `OrmWriteRepository` implement the same `WriteRepositoryInterface`. Switching between them requires no changes to application code (command handlers, domain services, or tests that use in-memory repositories).
+Repository interfaces are pure domain contracts — no framework imports, no `extends`. Switching write backends (DBAL ↔ ORM) requires no changes to command handlers, domain services, or tests that use in-memory repositories.
 
 ## Packages
 
@@ -143,8 +148,8 @@ Safe to run on every deploy — all operations are idempotent.
 ## Module Overview
 
 <Cards>
-  <Card title="Write Repositories" href="/docs/persistence/write-repositories" description="Implement DbalWriteRepository for PostgreSQL aggregate storage." />
-  <Card title="Read Repositories" href="/docs/persistence/read-repositories" description="Implement MongoReadRepository for query-optimised read models." />
+  <Card title="Write Repositories" href="/docs/persistence/write-repositories" description="Implement DbalMapper, annotate with #[UsesDbalMapper], and get DbalStore injected automatically." />
+  <Card title="Read Repositories" href="/docs/persistence/read-repositories" description="Annotate with #[MongoCollection] and get MongoStore injected — no base class required." />
   <Card title="Unit of Work" href="/docs/persistence/unit-of-work" description="Transaction boundaries, connection resilience, and atomicity." />
   <Card title="DBAL" href="/docs/persistence/dbal" description="Connection factory, DSN drivers, SSL, and advanced configuration." />
   <Card title="Doctrine ORM" href="/docs/persistence/orm" description="Zero-SQL aggregate persistence via Doctrine ORM." />

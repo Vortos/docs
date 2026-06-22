@@ -120,6 +120,28 @@ The middleware always sets `Vary: Origin` on responses that include CORS headers
 
 Without `Vary: Origin`, a CDN might cache a response with `Access-Control-Allow-Origin: https://app.example.com` and serve it to `https://evil.example.com` — which then sees the allow header and proceeds.
 
+## Preflight Route Injection
+
+Vortos handles OPTIONS preflight requests automatically — you never need to add `'OPTIONS'` to a route's methods array.
+
+At container compile time, `CorsPreflightCompilerPass` scans every registered route. For each route that declares explicit HTTP methods without OPTIONS, it injects a companion OPTIONS route on the same path. This means:
+
+```php
+// You write this:
+#[Route('/api/orders', methods: ['POST'])]
+final class CreateOrderController { ... }
+
+// Vortos automatically creates an OPTIONS /api/orders route at compile time.
+// The router accepts the preflight, CorsMiddleware intercepts it at priority 95,
+// and returns 204 with the correct headers — your controller is never invoked.
+```
+
+Per-route `#[Cors]` overrides work correctly for preflights. The injected OPTIONS route carries a `_cors_owner` attribute pointing at the original controller, so `CorsMiddleware` resolves the right config.
+
+<Callout type="warn" title="Do not add OPTIONS manually">
+Do not add `'OPTIONS'` to your route's `methods` array. Vortos injects OPTIONS routes at compile time. Adding it manually creates duplicate route entries in the router.
+</Callout>
+
 ## Verifying CORS Is Working
 
 ### Browser DevTools

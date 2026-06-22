@@ -1,0 +1,84 @@
+---
+title: Webhooks
+description: Receive and handle Paddle webhook events with signature verification, IP allowlisting, and idempotency.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Webhooks
+
+The package registers an HTTP controller at the configured `webhookPath` (default: `/webhooks/paddle`). Every incoming request is:
+
+1. Verified against the notification secret (HMAC signature + replay window).
+2. Checked against the Paddle IP allowlist (if enabled).
+3. Deduplicated by Paddle event ID.
+4. Dispatched to all registered handlers.
+
+## Registering a Handler
+
+Implement `PaddleWebhookHandlerInterface` and tag it `vortos_paddle.webhook_handler`, or rely on autoconfiguration:
+
+```php
+use Vortos\Paddle\Webhook\PaddleWebhookHandlerInterface;
+use Vortos\Paddle\Webhook\Event\SubscriptionActivatedEvent;
+
+final class OnSubscriptionActivated implements PaddleWebhookHandlerInterface
+{
+    public function supports(object $event): bool
+    {
+        return $event instanceof SubscriptionActivatedEvent;
+    }
+
+    public function handle(object $event): void
+    {
+        // $event->subscriptionId, $event->customerId, etc.
+    }
+}
+```
+
+Autoconfiguration picks up any service implementing `PaddleWebhookHandlerInterface`. No manual tagging required.
+
+## Signature Verification
+
+Paddle signs every webhook with a notification secret. The verifier checks the `Paddle-Signature` header and rejects requests outside the configured replay window (default: 5 seconds).
+
+```php title="config/paddle.php"
+$config
+    ->notificationSecret($_ENV['PADDLE_NOTIFICATION_SECRET'])
+    ->security()
+        ->replayWindowSeconds(5);
+```
+
+<Callout type="warn" title="Always use a real secret in production">
+An empty or missing notification secret disables signature verification. Set `PADDLE_NOTIFICATION_SECRET` in every environment.
+</Callout>
+
+## IP Allowlist
+
+Paddle publishes a list of IP addresses it uses to send webhooks. Enable enforcement:
+
+```php
+$config->security()->enforceIpAllowlist(true);
+```
+
+When `mode=sandbox`, sandbox IPs are automatically included — no additional configuration required.
+
+## Idempotency
+
+Each received Paddle event ID is stored in `paddle_webhook_idempotency`. Duplicate deliveries within the TTL window (default: 72 hours) are silently dropped. This protects handlers from double-processing on Paddle retries.
+
+## Disabling Webhooks
+
+```php
+$config->webhooks()->enabled(false);
+```
+
+This skips registering the controller route and all webhook infrastructure.
+
+## Prune Idempotency Records
+
+```bash
+php bin/console vortos:paddle:webhook:idempotency:prune
+```
+
+Run this periodically (daily via cron is sufficient) to remove expired records.

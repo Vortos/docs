@@ -63,7 +63,7 @@ Returns layer responsibilities, CQRS/event flow diagrams, the canonical director
 
 **What it returns:**
 
-- **Layers** — Domain, Application, Infrastructure, Representation with what belongs in each and what is forbidden
+- **Layers** — Domain, Application, Infrastructure, Presentation with what belongs in each and what is forbidden
 - **CQRS + Event Flow** — Step-by-step command flow, query flow, and projection flow
 - **File Structure** — Canonical directory tree for a bounded context
 - **Transaction Boundary** — Who owns transactions and what the rules are
@@ -114,7 +114,7 @@ src/{Context}/
 ├── Infrastructure/
 │   ├── Messaging/
 │   └── Repository/        ← implementations
-└── Representation/
+└── Presentation/
     ├── Controller/
     └── Request/
 ```

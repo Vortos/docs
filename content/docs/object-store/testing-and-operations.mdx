@@ -41,6 +41,17 @@ Outbox relay:
 ```bash
 php bin/console vortos:object-store:relay
 php bin/console vortos:object-store:relay --once
+php bin/console vortos:object-store:relay --sleep=2
+```
+
+Dead-letter retry:
+
+```bash
+php bin/console vortos:object-store:outbox:retry --dry-run
+php bin/console vortos:object-store:outbox:retry --force
+php bin/console vortos:object-store:outbox:retry --operation=put --force
+php bin/console vortos:object-store:outbox:retry --id=abc-uuid --force
+php bin/console vortos:object-store:outbox:retry --created-from=2026-06-01 --force
 ```
 
 Lifecycle:

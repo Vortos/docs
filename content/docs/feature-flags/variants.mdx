@@ -1,0 +1,142 @@
+---
+title: Variants
+description: A/B testing and multi-variant experiments — deterministic bucketing, variant management, and exposure tracking.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Variants
+
+Variants extend a flag from a binary on/off into a multi-bucket experiment. Each user is deterministically assigned to exactly one variant — the same user always gets the same variant for the same flag.
+
+Use variants for:
+- A/B tests comparing a new UI against a control
+- Multivariate experiments with three or more options
+- Named configuration tiers (`"compact"`, `"comfortable"`, `"dense"`)
+
+For simple on/off rollout, a `bool` flag with percentage rules is sufficient. Variants are for when you need to know *which version* a user saw, not just whether they saw it.
+
+## How bucketing works
+
+Variant assignment uses the same deterministic hash as percentage rollout:
+
+```
+bucket = hash(flagName + userId) % 100
+```
+
+Variants are assigned cumulative weight ranges:
+
+```
+variants:
+  control:   weight 34  → buckets 0–33
+  variant-a: weight 33  → buckets 34–66
+  variant-b: weight 33  → buckets 67–99
+```
+
+A user with `hash('cta-button' + 'user-abc') % 100 = 45` is in `variant-a`. They stay in `variant-a` across sessions, deploys, and reboots as long as the variant weights do not change.
+
+<Callout type="warn" title="Changing weights reassigns users">
+Adjusting variant weights rehashes buckets. Users already exposed to `variant-a` may shift to `variant-b`. For running experiments, only change weights between measurement windows, never during active collection.
+</Callout>
+
+## Managing variants via the admin UI
+
+Open a flag's detail page and find the **Variants** section. Add rows with a variant name and weight. Weights must sum to 100.
+
+| Name | Weight |
+|---|---|
+| control | 34 |
+| variant-a | 33 |
+| variant-b | 33 |
+
+Click **Save Variants**. The change is persisted, audited, and live within the Redis TTL.
+
+## Checking variants in code
+
+```php
+use Vortos\FeatureFlags\FlagRegistry;
+use Vortos\FeatureFlags\FlagContext;
+
+$context = new FlagContext(userId: $user->getId());
+$variant = $this->flags->variant('cta-button', $context);
+// 'control' | 'variant-a' | 'variant-b'
+
+$cta = match ($variant) {
+    'variant-a' => 'Start free trial',
+    'variant-b' => 'Try it free for 14 days',
+    default     => 'Sign up',
+};
+```
+
+`variant()` returns the variant name string, or `null` if the flag is off or has no variants. Always provide a default in your `match` expression.
+
+## Variant-driven query handlers
+
+The right place for variant logic is inside query handlers, not controllers. The controller stays dumb; the response shape stays stable.
+
+```php title="src/Marketing/Application/Query/GetHeroBanner/GetHeroBannerQueryHandler.php"
+final class GetHeroBannerQueryHandler
+{
+    public function __construct(
+        private readonly FlagRegistry $flags,
+        private readonly HeroBannerRepository $banners,
+    ) {}
+
+    public function __invoke(GetHeroBannerQuery $query): HeroBanner
+    {
+        $context = new FlagContext(userId: $query->userId);
+        $variant = $this->flags->variant('hero_banner_test', $context) ?? 'control';
+
+        return $this->banners->forVariant($variant);
+    }
+}
+```
+
+The frontend receives a `HeroBanner` object — headline, image, CTA — and renders it. It never knows which variant produced the data.
+
+## Exposure tracking
+
+An exposure event records that a user was bucketed into a variant. This is the denominator of your experiment — you cannot compute conversion rates without it.
+
+Record exposure at the point where the user actually sees the experience, not when the flag is evaluated:
+
+```php
+// ✅ Record when the experience is delivered
+if ($this->flags->isEnabled('new-checkout', $context)) {
+    $this->exposureTracker->record('new-checkout', $context->userId);
+    return $this->render('checkout/new.html.twig');
+}
+```
+
+Do not record exposure during background jobs, prefetches, or hidden branches that the user did not actually encounter.
+
+The OpenTelemetry integration records exposures as OTel spans automatically when configured. See [SDK Delivery](/docs/feature-flags/sdk-delivery) for the frontend exposure endpoint.
+
+## Frontend variants
+
+The `@vortos/flags` React SDK exposes variant state locally after the provider fetches from `/api/flags`:
+
+```tsx
+import { useVariant } from '@vortos/flags';
+
+function CtaButton() {
+  const variant = useVariant('cta-button', 'control'); // 'control' is the default
+
+  return match ({
+    'variant-a': <button>Start free trial</button>,
+    'variant-b': <button>Try it free for 14 days</button>,
+  })[variant] ?? <button>Sign up</button>;
+}
+```
+
+For experiments, use `useVariantState` which includes exposure tracking:
+
+```tsx
+const { variant, trackExposure } = useVariantState('cta-button', {
+  default: 'control',
+  allowed: ['control', 'variant-a', 'variant-b'],
+  trackExposure: true,
+});
+```
+
+The `allowed` list protects against backend typos — unknown variant strings fall back to the default rather than breaking the render path.

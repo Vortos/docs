@@ -1,0 +1,78 @@
+---
+title: Projects
+description: Organise flags by team or product area, scope SDK keys to a project, and isolate blast radius.
+---
+
+# Projects
+
+A project is a namespace for flags. It exists for two reasons: organisation and isolation.
+
+**Organisation:** Large codebases with 50+ flags become hard to navigate when everything is in one flat list. Grouping by domain (`checkout`, `billing`, `onboarding`) lets each team find and manage their own flags without scrolling through unrelated ones.
+
+**Isolation:** SDK keys can be scoped to a project. A CI/CD pipeline for the checkout team gets a key that can only read and write checkout flags. A key leak or misconfiguration in one team's pipeline cannot affect another team's production rollout.
+
+## Default project
+
+All flags belong to the `default` project unless you specify otherwise. If your application is small and single-team, you never need to think about projects.
+
+## Creating flags in a project
+
+```bash
+php vortos vortos:flags:create new-checkout \
+  --project=checkout \
+  --description="New checkout flow"
+
+php vortos vortos:flags:create pricing-experiment \
+  --project=billing \
+  --kind=experiment
+```
+
+## Listing by project
+
+```bash
+php vortos vortos:flags:list --project=checkout
+php vortos vortos:flags:list --project=billing --env=production
+```
+
+The admin UI dashboard has a project selector in the sidebar. Selecting a project filters all views — flag list, history, approvals — to that project.
+
+## ProjectContext in code
+
+`ProjectContext` works the same way as `FlagScopeContext` — it provides the current project scope to the engine:
+
+```php
+// Explicit project scope
+$this->projectContext->withProject('checkout');
+$flags->isEnabled('new-checkout', $context);
+```
+
+In most applications, the project is fixed per service or bounded context. Set it once at bootstrap in your `services.php`:
+
+```php
+$services->when(ProjectContext::class)
+    ->needs('$project')
+    ->give('checkout');
+```
+
+## Scoping SDK keys to a project
+
+When you create an SDK key, you can restrict it to a project:
+
+```bash
+php vortos vortos:flags:sdk-key:create \
+  --name="Checkout CI" \
+  --project=checkout \
+  --access=read-write
+```
+
+This key can read and write flags in the `checkout` project only. Attempts to access flags in other projects return 403. See [SDK Keys](/docs/feature-flags/sdk-keys) for full key management.
+
+## Default project vs. no project
+
+Flags without an explicit project belong to `default`. If you later decide to adopt projects, you can migrate existing flags:
+
+```bash
+php vortos vortos:flags:move new-checkout --project=checkout
+```
+
+Moving a flag changes only its project assignment. State, rules, variants, and history are preserved.

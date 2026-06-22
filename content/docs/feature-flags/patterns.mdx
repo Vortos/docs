@@ -131,7 +131,7 @@ This is wrong because the controller is now doing application logic. It also mea
 
 **The right approach** is for the controller to stay dumb and for the query handler to check the variant:
 
-```php title="src/Checkout/Representation/Controller/CheckoutConfigController.php"
+```php title="src/Checkout/Presentation/Controller/CheckoutConfigController.php"
 // ✅ Controller is a thin adapter — one route, one stable response shape
 #[AsController]
 #[Route('/api/checkout/config', methods: ['GET'])]
@@ -228,7 +228,7 @@ export function HeroBanner({ headline, imageUrl, ctaText }: HeroBannerProps) {
 
 The built-in `/api/flags` returns all flags. Write a filtering wrapper to expose only the ones the frontend should know about:
 
-```php title="src/Shared/Representation/Controller/FrontendFlagsController.php"
+```php title="src/Shared/Presentation/Controller/FrontendFlagsController.php"
 #[AsController]
 #[Route('/api/flags', name: 'app.flags', methods: ['GET'])]
 final class FrontendFlagsController

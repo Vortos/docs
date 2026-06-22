@@ -1,0 +1,117 @@
+---
+title: Installation
+description: Install the engine and optional admin UI, run the migration, and wire up the context resolver.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Installation
+
+## Engine
+
+```bash
+composer require vortos/vortos-feature-flags
+```
+
+Run the module migration to create the flags tables:
+
+```bash
+php vortos vortos:migrate
+```
+
+The migration lives in `Resources/migrations/` inside the package. `vortos:migrate` discovers and runs it automatically.
+
+The engine self-registers via `extra.vortos.package` in its `composer.json`. No manual service registration is needed.
+
+## Wiring up the context resolver
+
+The engine ships with an anonymous context resolver — every request is treated as an unauthenticated user with no attributes. This means percentage rollout and attribute rules will not work until you override it.
+
+Create a resolver in your application:
+
+```php title="src/Shared/Infrastructure/Flags/UserFlagContextResolver.php"
+use Vortos\FeatureFlags\FlagContext;
+use Vortos\FeatureFlags\Resolver\FlagContextResolverInterface;
+use Vortos\Http\Request;
+
+final class UserFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly CurrentUserProvider $auth) {}
+
+    public function resolve(Request $request): FlagContext
+    {
+        $user = $this->auth->current();
+
+        if (!$user->isAuthenticated()) {
+            return new FlagContext();
+        }
+
+        return new FlagContext(
+            userId:     (string) $user->getId(),
+            tenantId:   (string) $user->getTenantId(),
+            attributes: [
+                'plan'   => $user->plan,
+                'role'   => $user->role,
+                'region' => $user->region,
+            ],
+        );
+    }
+}
+```
+
+```php title="config/services.php"
+$services->alias(FlagContextResolverInterface::class, UserFlagContextResolver::class);
+```
+
+Register once. Everything that evaluates flags uses this resolver automatically — the built-in `/api/flags` endpoint, `#[RequiresFlag]` on controllers, and any call to `FlagRegistry::isEnabled()` or `FlagRegistry::variant()` without an explicit context.
+
+## Admin UI (optional)
+
+```bash
+composer require vortos/vortos-feature-flags-admin
+```
+
+The admin UI ships with pre-built JavaScript assets inside the package. Copy them into your application's public directory:
+
+```bash
+php vortos vortos:assets:publish
+```
+
+This reads every installed Vortos package that declares a `public-dir` in its `composer.json` and copies the assets to `public/bundles/{package-name}/`. For the admin UI, this creates `public/bundles/feature-flags-admin/`.
+
+<Callout type="info" title="Symlink mode for development">
+Use `--symlink` during development to avoid re-running the command after a rebuild:
+
+```bash
+php vortos vortos:assets:publish --symlink
+```
+
+Assets served from `packages/feature-flags-admin/` via a symlink update immediately when you rebuild. Use copy mode in production.
+</Callout>
+
+Configure your web server to serve the `public/` directory. No additional Nginx or Caddy rules are needed — the assets are ordinary static files at `/bundles/feature-flags-admin/`.
+
+## Required roles
+
+The admin UI checks `flags.read` and `flags.write` permissions on every request. Configure your authorization layer to grant these to the appropriate roles:
+
+```php title="config/authorization.php"
+$catalog->define('flags.read',  'View feature flags and their state');
+$catalog->define('flags.write', 'Create, update, enable, and disable feature flags');
+```
+
+Users without `flags.read` receive a 403 when accessing the admin UI. Users with `flags.read` but not `flags.write` see the dashboard in read-only mode.
+
+## Verifying the installation
+
+```bash
+# Should show the flags table and an empty list
+php vortos vortos:flags:list
+
+# Create a test flag, check it appears
+php vortos vortos:flags:create test-flag --description="Installation check"
+php vortos vortos:flags:list
+php vortos vortos:flags:delete test-flag --force
+```
+
+For the admin UI, navigate to `/admin/flags` in your browser. You should see the dashboard with an environment selector and an empty flag list.

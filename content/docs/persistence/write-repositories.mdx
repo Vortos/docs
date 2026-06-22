@@ -1,59 +1,57 @@
 ---
 title: Write Repositories
-description: Implement DbalWriteRepository to persist domain aggregates to PostgreSQL with optimistic locking, batch operations, and custom queries.
+description: Implement DbalMapper, annotate your repository with #[UsesDbalMapper], and let the framework inject DbalStore — optimistic locking, batch operations, and custom queries included.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
 # Write Repositories
 
-`DbalWriteRepository` is the abstract base for all write-side aggregate repositories. Extend it and implement four methods describing your table shape — insert, update, delete, batch operations, and optimistic locking are provided free.
+Write repositories use **composition**, not inheritance. You implement a `DbalMapper` class that describes your table shape, annotate your repository with `#[UsesDbalMapper]`, and the framework injects a configured `DbalStore` at compile time. All persistence mechanics live in the store — your repository stays focused on queries.
 
 ## Required Table Structure
 
-Every table using `DbalWriteRepository` **must** have these two columns:
+Every table using DBAL persistence **must** have these two columns:
 
 ```sql
 CREATE TABLE users (
-    id      VARCHAR(36)  PRIMARY KEY,  -- UUID string (UuidV7)
-    version INTEGER      NOT NULL DEFAULT 0,
+    id           VARCHAR(36)  PRIMARY KEY,  -- UUID string (UuidV7)
+    lock_version INTEGER      NOT NULL DEFAULT 0,
     -- your domain columns below
-    email   VARCHAR(255) NOT NULL,
-    name    VARCHAR(255) NOT NULL
+    email        VARCHAR(255) NOT NULL,
+    name         VARCHAR(255) NOT NULL
 );
 ```
 
-The `id` column stores your aggregate's UUID as a string. The `version` column is used for optimistic concurrency control — the base class manages it automatically.
+The `id` column stores your aggregate's UUID as a string. The `lock_version` column is managed by the store for optimistic concurrency control — you never touch it directly.
 
-## Implement the Four Methods
+## Step 1 — Implement DbalMapper
 
-```php title="src/User/Infrastructure/Database/UserWriteRepository.php"
+`DbalMapper` is a four-method interface that describes how your aggregate maps to a database table. Create one class per aggregate:
+
+```php title="src/User/Infrastructure/Database/UserMapper.php"
 use Doctrine\DBAL\Types\Types;
 use Vortos\Domain\Aggregate\AggregateRoot;
-use Vortos\PersistenceDbal\Write\DbalWriteRepository;
+use Vortos\PersistenceDbal\Write\DbalMapper;
 
-final class UserWriteRepository extends DbalWriteRepository
+final class UserMapper implements DbalMapper
 {
-    // 1. Table name
-    protected function tableName(): string
+    public function tableName(): string
     {
         return 'users';
     }
 
-    // 2. Column → DBAL type map (must include id, version, and all domain columns)
-    protected function columnMap(): array
+    public function columnMap(): array
     {
         return [
             'id'            => Types::STRING,
             'name'          => Types::STRING,
             'email'         => Types::STRING,
             'password_hash' => Types::STRING,
-            'version'       => Types::INTEGER,
         ];
     }
 
-    // 3. Aggregate → database row
-    protected function toRow(AggregateRoot $aggregate): array
+    public function toRow(AggregateRoot $aggregate): array
     {
         /** @var User $aggregate */
         return [
@@ -61,27 +59,67 @@ final class UserWriteRepository extends DbalWriteRepository
             'name'          => $aggregate->getName(),
             'email'         => (string) $aggregate->getEmail(),
             'password_hash' => $aggregate->getPasswordHash(),
-            'version'       => $aggregate->getVersion(),
         ];
     }
 
-    // 4. Database row → Aggregate
-    protected function fromRow(array $row): AggregateRoot
+    public function fromRow(array $row): AggregateRoot
     {
         return User::reconstruct(
             id:           UserId::fromString($row['id']),
             email:        new Email($row['email']),
             name:         $row['name'],
             passwordHash: $row['password_hash'],
-            version:      (int) $row['version'],
         );
     }
 }
 ```
 
-### The `reconstruct()` Pattern
+The mapper has no framework base class — it is a pure data-mapping class. The `DbalStore` that uses it is created and injected by the compiler pass.
 
-`fromRow()` needs to restore the aggregate's version from the database. Add a named constructor to your aggregate for this:
+## Step 2 — Annotate Your Repository
+
+Apply `#[UsesDbalMapper]` and declare a `DbalStore` constructor argument. The compiler pass creates and injects the store automatically:
+
+```php title="src/User/Infrastructure/Database/UserWriteRepository.php"
+use Vortos\PersistenceDbal\Attribute\UsesDbalMapper;
+use Vortos\PersistenceDbal\Write\DbalStore;
+
+#[UsesDbalMapper(UserMapper::class)]
+final class UserWriteRepository implements UserRepositoryInterface
+{
+    public function __construct(private readonly DbalStore $store) {}
+
+    public function save(User $user): void
+    {
+        $this->store->save($user);
+    }
+
+    public function delete(User $user): void
+    {
+        $this->store->delete($user);
+    }
+
+    public function findById(UserId $id): ?User
+    {
+        /** @var User|null */
+        return $this->store->find($id);
+    }
+}
+```
+
+No `extends`. No abstract methods. The repository implements your pure domain interface directly.
+
+## Step 3 — Register
+
+```php title="config/services.php"
+$services->set(UserWriteRepository::class);
+```
+
+`DbalRepositoryCompilerPass` detects `#[UsesDbalMapper]` at compile time, creates a dedicated `DbalStore` wired to `UserMapper` and the shared `Connection`, and injects it as the `$store` argument. No manual argument configuration needed.
+
+## The `reconstruct()` Pattern
+
+`fromRow()` calls a named constructor on the aggregate to restore its persisted version:
 
 ```php title="src/User/Domain/User.php"
 final class User extends AggregateRoot
@@ -93,40 +131,22 @@ final class User extends AggregateRoot
         private string $passwordHash,
     ) {}
 
-    // For new aggregates — generates ID, records domain event
     public static function register(string $name, string $email, string $plainPassword): self
     {
         $id   = UserId::generate();
-        $user = new self(
-            id:           $id,
-            email:        new Email($email),
-            name:         $name,
-            passwordHash: password_hash($plainPassword, PASSWORD_BCRYPT),
-        );
-        $user->recordEvent(new UserRegisteredEvent(
-            aggregateId: (string) $id,
-            email:       $email,
-            name:        $name,
-        ));
+        $user = new self($id, new Email($email), $name, password_hash($plainPassword, PASSWORD_BCRYPT));
+        $user->recordEvent(new UserRegisteredEvent((string) $id, $email, $name));
         return $user;
     }
 
-    // For loading from database — restores version for optimistic locking
+    // For loading from database — DbalStore restores lock_version automatically via hydrate()
     public static function reconstruct(
         UserId $id,
         Email $email,
         string $name,
         string $passwordHash,
-        int $version,
     ): self {
-        $user = new self(
-            id:           $id,
-            email:        $email,
-            name:         $name,
-            passwordHash: $passwordHash,
-        );
-        $user->restoreVersion($version);
-        return $user;
+        return new self($id, $email, $name, $passwordHash);
     }
 
     public function getId(): UserId { return $this->id; }
@@ -136,102 +156,92 @@ final class User extends AggregateRoot
 }
 ```
 
-## Register the Repository
-
-`DbalWriteRepository` subclasses are discovered and wired automatically — no manual service registration is needed. The `services.php` default configuration autowires everything under `src/` (excluding the `Domain/` layer):
-
-```php title="config/services.php"
-$services->load('App\\', '../src/')
-    ->exclude(['../src/*/Domain/']);
-```
-
-`UserWriteRepository` is picked up automatically and its `Connection` dependency is injected by type.
-
 ## Built-In Operations
-
-### `findById(AggregateId $id): ?AggregateRoot`
-
-```php
-$user = $userRepository->findById(UserId::fromString($command->userId));
-
-if ($user === null) {
-    throw new UserNotFoundException($command->userId);
-}
-```
-
-Returns `null` if not found — never throws for missing records.
 
 ### `save(AggregateRoot $aggregate): void`
 
 ```php
-$userRepository->save($user);
+$this->store->save($user);
 ```
 
-- `version === 0` → `INSERT`
-- `version > 0` → `UPDATE WHERE version = :expectedVersion`
-- Throws `OptimisticLockException` if another process modified the aggregate
+- New aggregate (`isNew()` returns `true`) → `INSERT`
+- Existing aggregate → `UPDATE WHERE lock_version = :expectedVersion`
+- Throws `OptimisticLockException` if another process modified the aggregate since it was loaded.
 
 After a successful save, `incrementVersion()` is called on the aggregate automatically.
+
+### `find(AggregateId $id): ?AggregateRoot`
+
+```php
+/** @var User|null */
+return $this->store->find($id);
+```
+
+Returns `null` if not found — never throws for missing records.
 
 ### `delete(AggregateRoot $aggregate): void`
 
 ```php
-$userRepository->delete($user);
+$this->store->delete($user);
 ```
 
-Applies optimistic locking on delete. Throws `OptimisticLockException` if the aggregate was modified since loaded.
+Applies optimistic locking on delete. Throws `OptimisticLockException` if the aggregate was modified since it was loaded.
 
 ## Custom Queries
 
-Use the protected `connection()` method for queries beyond `findById()`. The underlying DBAL `Connection` field is `private` — subclasses must go through `connection()`, never `$this->connection`. This keeps the resolution strategy an internal detail of the base class:
+Use `$this->store->createQueryBuilder()` for any query beyond `find()`. Access the table name and row mapping via `$this->store->mapper()`:
 
 ```php
 public function findByEmail(Email $email): ?User
 {
-    $row = $this->connection()->createQueryBuilder()
+    $row = $this->store->createQueryBuilder()
         ->select('*')
-        ->from($this->tableName())
+        ->from($this->store->mapper()->tableName())
         ->where('email = :email')
         ->setParameter('email', (string) $email)
         ->executeQuery()
         ->fetchAssociative();
 
-    return $row !== false ? $this->fromRow($row) : null;
+    /** @var User|null */
+    return $row !== false ? $this->store->hydrate($row) : null;
 }
 
 public function findAllActive(): array
 {
-    $rows = $this->connection()->createQueryBuilder()
+    $rows = $this->store->createQueryBuilder()
         ->select('*')
-        ->from($this->tableName())
+        ->from($this->store->mapper()->tableName())
         ->where('status = :status')
         ->setParameter('status', 'active')
         ->orderBy('created_at', 'DESC')
         ->executeQuery()
         ->fetchAllAssociative();
 
-    return array_map(fn(array $row) => $this->fromRow($row), $rows);
+    return array_map(fn(array $row) => $this->store->hydrate($row), $rows);
 }
 ```
 
 <Callout type="warn" title="Never Use Raw SQL Strings">
-Always use `createQueryBuilder()` for custom queries — never raw SQL strings. QueryBuilder handles parameter escaping and is database-portable. Raw strings bypass DBAL's type binding and are vulnerable to SQL injection.
+Always use `createQueryBuilder()` — never raw SQL strings. QueryBuilder handles parameter escaping and is database-portable. Raw strings bypass DBAL's type binding and are vulnerable to SQL injection.
 </Callout>
 
 ## Batch Operations
 
 ### `batchInsert(array $aggregates): void`
 
-Single `INSERT` statement for multiple new aggregates. All must have `version === 0`.
+Single `INSERT` statement for multiple new aggregates. All must be new (`isNew()` returns true).
 
 ```php
-$users = array_map(fn($row) => User::register(new Email($row['email']), $row['name']), $csvRows);
-$userRepository->batchInsert($users);
+$users = array_map(
+    fn($row) => User::register($row['name'], $row['email'], $row['password']),
+    $csvRows,
+);
+$this->store->batchInsert($users);
 ```
 
 ### `batchUpdate(array $aggregates): void`
 
-Updates multiple aggregates. The base `DbalWriteRepository` calls `save()` per aggregate (applies optimistic locking per row). `PostgresWriteRepository` overrides this with a single-query `UPDATE FROM VALUES`.
+Updates multiple aggregates. `DbalStore` calls `save()` per aggregate (applies optimistic locking per row). `PostgresStore` overrides this with a single `UPDATE FROM VALUES` query — see below.
 
 ### `batchUpsert(array $aggregates): void`
 
@@ -244,7 +254,7 @@ PostgreSQL `INSERT ... ON CONFLICT (id) DO UPDATE SET`. Does **not** apply optim
 ### `batchDelete(array $ids): void`
 
 ```php
-$userRepository->batchDelete([
+$this->store->batchDelete([
     UserId::fromString('user-1'),
     UserId::fromString('user-2'),
 ]);
@@ -252,23 +262,27 @@ $userRepository->batchDelete([
 
 Single `DELETE WHERE id IN (...)`. Does not apply optimistic locking.
 
-## PostgresWriteRepository
+## PostgresStore — Optimised Batch Updates
 
-For PostgreSQL-only applications with large batch updates, extend `PostgresWriteRepository` instead of `DbalWriteRepository`. It overrides `batchUpdate()` with PostgreSQL's `UPDATE FROM VALUES` — a single query regardless of batch size:
+For PostgreSQL applications with large batch updates, specify `PostgresStore` in the attribute. It overrides `batchUpdate()` with PostgreSQL's `UPDATE FROM VALUES` — a single query regardless of batch size:
 
-```php
-use Vortos\PersistenceDbal\Write\PostgresWriteRepository;
+```php title="src/User/Infrastructure/Database/UserWriteRepository.php"
+use Vortos\PersistenceDbal\Attribute\UsesDbalMapper;
+use Vortos\PersistenceDbal\Write\PostgresStore;
 
-final class UserRepository extends PostgresWriteRepository
+#[UsesDbalMapper(UserMapper::class, storeClass: PostgresStore::class)]
+final class UserWriteRepository implements UserRepositoryInterface
 {
-    // Same four methods — batchUpdate() is now a single query
+    public function __construct(private readonly PostgresStore $store) {}
+
+    // All operations identical — batchUpdate() now uses a single query
 }
 ```
 
-| Method | `DbalWriteRepository` | `PostgresWriteRepository` |
+| Method | `DbalStore` | `PostgresStore` |
 |---|---|---|
 | `batchUpdate()` | One `UPDATE` per aggregate | One `UPDATE FROM VALUES` for all |
 | Optimistic locking in batch | Per-row, throws on conflict | Silent skip on version mismatch |
 | Database portability | All DBAL drivers | PostgreSQL only |
 
-Use `PostgresWriteRepository` when batch sizes exceed ~50 aggregates and you are on PostgreSQL. For smaller batches the difference is negligible.
+Use `PostgresStore` when batch sizes exceed ~50 aggregates and you are on PostgreSQL. For smaller batches the difference is negligible.

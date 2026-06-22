@@ -132,6 +132,38 @@ Changing `Connection` registration to `setShared(false)` breaks transaction atom
 
 `Connection::class` is registered as `setPublic(true)` so that other extensions (like `MessagingExtension`) can reference it via `new Reference(Connection::class)` across package boundaries.
 
+## Framework Table Namespace
+
+Vortos separates its own tables from your application tables using a platform-specific namespace resolved at container compile time — zero runtime cost.
+
+| Database | Mode | Example |
+|---|---|---|
+| PostgreSQL | Dedicated `vortos` schema | `vortos.user_roles` |
+| MySQL, SQLite, SQL Server, Oracle | `vortos_` prefix | `vortos_user_roles` |
+
+The correct prefix is derived from your `DATABASE_URL` DSN automatically. No configuration is needed.
+
+### Opting Out of Schema Mode (PostgreSQL)
+
+If you prefer prefix mode on PostgreSQL — for example, if your deployment does not allow creating new schemas — add `?vortos_prefix=true` to your DSN:
+
+```bash
+# .env
+DATABASE_URL=pgsql://postgres:secret@db:5432/myapp?vortos_prefix=true
+```
+
+This is the only change required. All framework table names switch to `vortos_` prefix automatically.
+
+<Callout type="info" title="Container parameter">
+The resolved prefix is stored as the `vortos.db.framework_table_prefix` container parameter (`'vortos.'` or `'vortos_'`). It is set once at compile time by `DbalPersistenceExtension` and baked into every service definition that references a framework table — there is no runtime branching.
+</Callout>
+
+### PostgreSQL Schema Bootstrap
+
+When using schema mode, `vortos:migrate` automatically runs `CREATE SCHEMA IF NOT EXISTS vortos` before executing any migrations. You do not need to create the schema manually.
+
+`vortos:migrate:fresh` drops the `vortos` schema completely before re-running from scratch, giving a guaranteed clean state.
+
 ## QueryBuilder
 
 Always use `createQueryBuilder()` for custom queries in repositories — never raw SQL strings:

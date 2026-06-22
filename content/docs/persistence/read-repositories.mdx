@@ -11,12 +11,12 @@ The read side in Vortos is intentionally separate from the write side. Write rep
 
 In DDD + CQRS, the read model is an application-layer concern, not a domain concern. Read models live in `Application/ReadModel/`, repositories live in `Infrastructure/Persistence/`.
 
-Vortos provides two abstract base classes depending on your read store:
+Vortos provides two patterns depending on your read store:
 
-| Base class | Read store | When to use |
+| Pattern | Read store | When to use |
 |---|---|---|
-| `MongoReadRepository` | MongoDB | Self-contained document projections, high read throughput, frequent schema changes |
-| `DbalReadRepository` | PostgreSQL | Complex joins or CTEs, single-database setups, full-text search with `pg_trgm` |
+| `#[MongoCollection]` + `MongoStore` | MongoDB | Self-contained document projections, high read throughput, frequent schema changes |
+| `DbalReadRepository` (abstract) | PostgreSQL | Complex joins or CTEs, single-database setups, full-text search with `pg_trgm` |
 
 ---
 
@@ -28,7 +28,7 @@ The read side exists to serve query handlers as efficiently as possible without 
 
 ### Step 1 — Create the read model
 
-The read model is a pure typed DTO. No framework imports, no database annotations — it represents the application's view of an entity, not the infrastructure that stores it:
+The read model is a pure typed DTO. No framework imports, no database annotations:
 
 ```php title="src/User/Application/ReadModel/UserReadModel.php"
 final readonly class UserReadModel
@@ -45,23 +45,29 @@ final readonly class UserReadModel
 
 ### Step 2 — Create the repository
 
-The repository is the MongoDB-aware class. Declare the collection name and indexes here — alongside the queries that use them:
+Declare the collection name, indexes, and a `MongoStore` constructor argument. The compiler pass injects the store automatically:
 
 ```php title="src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php"
 use App\User\Application\ReadModel\UserReadModel;
-use Vortos\PersistenceMongo\Read\MongoReadRepository;
+use App\User\Application\UserReadRepositoryInterface;
+use Vortos\PersistenceMongo\Read\MongoStore;
 use Vortos\PersistenceMongo\Schema\Attribute\MongoCollection;
 use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
 
-/**
- * @extends MongoReadRepository<UserReadModel>
- */
 #[MongoCollection('users')]
 #[MongoIndex(key: ['email' => 1], unique: true)]
 #[MongoIndex(key: ['createdAt' => -1, '_id' => -1])]
-final class UserReadRepository extends MongoReadRepository
+final class UserReadRepository implements UserReadRepositoryInterface
 {
-    protected function fromDocument(array $doc): UserReadModel
+    public function __construct(private readonly MongoStore $store) {}
+
+    public function findById(string $id): ?UserReadModel
+    {
+        $doc = $this->store->findById($id);
+        return $doc !== null ? $this->fromDocument($doc) : null;
+    }
+
+    private function fromDocument(array $doc): UserReadModel
     {
         return new UserReadModel(
             id:        $doc['_id'],
@@ -74,7 +80,7 @@ final class UserReadRepository extends MongoReadRepository
 }
 ```
 
-`fromDocument()` receives the raw BSON document cast to an array and returns your typed read model. The `@extends` PHPDoc annotation gives IDEs and PHPStan full type inference — `findById()` returns `?UserReadModel`, `findByCriteria()` returns `UserReadModel[]`.
+`MongoStore` returns raw `?array` from `findById()` and `findByCriteria()`. The `fromDocument()` method maps to your typed read model — it lives privately in the repository where it belongs.
 
 ### Step 3 — Register
 
@@ -82,7 +88,7 @@ final class UserReadRepository extends MongoReadRepository
 $services->set(UserReadRepository::class);
 ```
 
-`MongoReadRepositoryAutowirePass` injects `MongoDB\Client` and the database name automatically. No manual argument wiring needed.
+`MongoReadRepositoryAutowirePass` detects every class with `#[MongoCollection]` and creates a dedicated `MongoStore` service configured with the correct collection name, database, and client. The store is injected as the `$store` argument. No manual argument wiring needed.
 
 ### Step 4 — Generate with make command
 
@@ -104,45 +110,36 @@ Always store `_id` as a string UUID (UuidV7). Mixing with MongoDB `ObjectId` cau
 ['_id' => new ObjectId(), 'email' => 'alice@example.com']
 ```
 
-### Built-In Operations
+### Built-In Store Operations
 
-All methods return your typed read model — `UserReadModel`, not `array`.
+All methods on `MongoStore` return raw arrays — your `fromDocument()` maps them to typed read models.
 
-#### `findById(string $id): ?UserReadModel`
+#### `store->findById(string $id): ?array`
 
 ```php
-$user = $userReadRepository->findById('user-019d...');
+$doc = $this->store->findById('user-019d...');
 // null if not found
 ```
 
-#### `findByCriteria(array $criteria, array $sort, int $limit, ?string $cursor): UserReadModel[]`
+#### `store->findByCriteria(array $criteria, array $sort, int $limit, ?string $cursor): array`
 
 ```php
-$recent = $userReadRepository->findByCriteria(
+$docs = $this->store->findByCriteria(
     criteria: ['status' => 'active'],
     sort: ['createdAt' => 'desc'],
     limit: 20,
 );
+$users = array_map(fn($doc) => $this->fromDocument($doc), $docs);
 ```
 
-#### `findPage(...): PageResult<UserReadModel>`
+#### `store->findPage(...): PageResult`
 
 See the [Pagination](/docs/persistence/pagination) page.
 
-#### `countByCriteria(array $criteria): int`
+#### `store->upsert(string $id, array $document): void`
 
 ```php
-$count = $userReadRepository->countByCriteria(['status' => 'active']);
-```
-
-<Callout type="warn" title="count() is Expensive">
-`countByCriteria()` scans all matching documents. On large collections without a supporting index this is expensive. Prefer `hasMore` from `PageResult` for pagination UI.
-</Callout>
-
-#### `upsert(string $id, array $document): void`
-
-```php
-$userReadRepository->upsert('user-123', [
+$this->store->upsert('user-123', [
     '_id'       => 'user-123',
     'email'     => 'alice@example.com',
     'name'      => 'Alice',
@@ -151,25 +148,25 @@ $userReadRepository->upsert('user-123', [
 ]);
 ```
 
-#### `bulkUpsert(array $documents): void` / `bulkDelete(array $ids): void`
+#### `store->bulkUpsert(array $documents): void` / `store->bulkDelete(array $ids): void`
 
 ```php
-$userReadRepository->bulkUpsert([
+$this->store->bulkUpsert([
     ['_id' => 'user-1', 'email' => 'alice@example.com'],
     ['_id' => 'user-2', 'email' => 'bob@example.com'],
 ]);
 
-$userReadRepository->bulkDelete(['user-1', 'user-2']);
+$this->store->bulkDelete(['user-1', 'user-2']);
 ```
 
 ### Custom Queries
 
-Use the protected `collection()` method for anything beyond `findByCriteria()`:
+Access the raw `MongoDB\Collection` via `$this->store->collection()` for anything beyond `findByCriteria()`:
 
 ```php
 public function findByEmailDomain(string $domain): array
 {
-    $cursor = $this->collection()->find([
+    $cursor = $this->store->collection()->find([
         'email' => ['$regex' => '@' . preg_quote($domain) . '$'],
     ]);
 
@@ -181,7 +178,7 @@ public function findByEmailDomain(string $domain): array
 
 public function countByRole(): array
 {
-    return iterator_to_array($this->collection()->aggregate([
+    return iterator_to_array($this->store->collection()->aggregate([
         ['$group' => ['_id' => '$role', 'count' => ['$sum' => 1]]],
         ['$sort' => ['count' => -1]],
     ]));
@@ -358,12 +355,11 @@ use App\User\Application\ReadModel\UserReadModel;
 final class GetUserByIdQueryHandler
 {
     public function __construct(
-        private readonly UserReadRepository $repository,
+        private readonly UserReadRepositoryInterface $repository,
     ) {}
 
     public function __invoke(GetUserByIdQuery $query): Result
     {
-        /** @var UserReadModel|null $user */
         $user = $this->repository->findById($query->userId);
 
         if ($user === null) {

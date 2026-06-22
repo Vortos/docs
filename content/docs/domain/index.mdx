@@ -11,7 +11,7 @@ import { Card, Cards } from 'fumadocs-ui/components/card';
 `vortos-domain` is the pure domain layer. It has **no dependencies on infrastructure** — no Doctrine, no Redis, no HTTP. Everything in this package is plain PHP expressing business concepts.
 
 <Callout type="info" title="Dependency Direction">
-Infrastructure depends on domain. Domain never depends on infrastructure. `DbalWriteRepository` depends on `WriteRepositoryInterface`. `WriteRepositoryInterface` does not know Doctrine exists.
+Infrastructure depends on domain. Domain never depends on infrastructure. `DbalStore` and `OrmStore` depend on your repository interfaces. Those interfaces do not know Doctrine exists.
 </Callout>
 
 ## What's in vortos-domain

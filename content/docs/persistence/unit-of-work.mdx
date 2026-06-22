@@ -157,6 +157,6 @@ DBAL 3.x removed `Connection::ping()`. The correct reconnect pattern is to catch
 
 ## Shared Connection
 
-All services that participate in a transaction — `UnitOfWork`, `DbalWriteRepository`, `OutboxWriter`, `DeadLetterWriter` — **must share the same `Connection` instance**. If they used different instances, each would have its own transaction and atomicity would be lost.
+All services that participate in a transaction — `UnitOfWork`, `DbalStore`, `OutboxWriter`, `DeadLetterWriter` — **must share the same `Connection` instance**. If they used different instances, each would have its own transaction and atomicity would be lost.
 
 `DbalPersistenceExtension` registers `Connection::class` with `setShared(true)` (the default, made explicit). Never change this to `setShared(false)`.

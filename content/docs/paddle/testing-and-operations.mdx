@@ -1,0 +1,112 @@
+---
+title: Testing And Operations
+description: Commands, sandbox setup, and operational runbooks for the Vortos Paddle billing package.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing And Operations
+
+## Sandbox Setup
+
+Set `PADDLE_MODE=sandbox` in your environment. Sandbox IPs are automatically allowed for webhook delivery — no additional config required.
+
+```bash title=".env"
+PADDLE_MODE=sandbox
+PADDLE_API_KEY=your_sandbox_api_key
+PADDLE_NOTIFICATION_SECRET=your_sandbox_webhook_secret
+```
+
+## Commands
+
+### Outbox relay
+
+```bash
+# Long-running worker (recommended — handles SIGTERM gracefully)
+php bin/console vortos:paddle:outbox:relay
+
+# Single batch (for cron)
+php bin/console vortos:paddle:outbox:relay --once
+
+# Control idle sleep
+php bin/console vortos:paddle:outbox:relay --sleep=5
+```
+
+### Dead-letter retry
+
+```bash
+# Inspect failed entries without resetting
+php bin/console vortos:paddle:outbox:retry --dry-run
+php bin/console vortos:paddle:outbox:retry --dry-run --operation=customer.create
+php bin/console vortos:paddle:outbox:retry --dry-run --id=42
+
+# Reset failed entries for re-delivery
+php bin/console vortos:paddle:outbox:retry --force
+php bin/console vortos:paddle:outbox:retry --operation=subscription.cancel --force
+php bin/console vortos:paddle:outbox:retry --id=42 --force
+php bin/console vortos:paddle:outbox:retry --limit=20 --force
+```
+
+### Webhook idempotency pruning
+
+```bash
+# Remove expired webhook idempotency records (run daily)
+php bin/console vortos:paddle:webhook:idempotency:prune
+```
+
+## Deployment Runbook
+
+1. Deploy code.
+2. Run `php bin/console vortos:migrate:run`.
+3. Verify `PADDLE_MODE`, `PADDLE_API_KEY`, and `PADDLE_NOTIFICATION_SECRET` are set.
+4. Configure the webhook URL in the Paddle dashboard to point to `{app_url}/webhooks/paddle`.
+5. Start or reload the outbox relay worker.
+6. Watch `paddle_outbox` for failed entries after the first relay cycle.
+7. Schedule `vortos:paddle:webhook:idempotency:prune` to run daily.
+
+## Monitoring
+
+Watch `paddle_outbox` for entries that fail permanently:
+
+```sql
+SELECT operation, last_error, failed_at, created_at
+FROM vortos_paddle_outbox
+WHERE status = 'failed'
+ORDER BY failed_at DESC
+LIMIT 50;
+```
+
+Watch pending backlog age:
+
+```sql
+SELECT COUNT(*), MIN(created_at)
+FROM vortos_paddle_outbox
+WHERE status = 'pending';
+```
+
+<Callout type="warn" title="Alert on failed entries">
+A non-zero count of `status=failed` entries means Paddle API calls were permanently dropped. Inspect `last_error` and use the retry command after resolving the underlying cause.
+</Callout>
+
+## Testing Paddle Code
+
+Inject the Immediate interfaces in unit tests and mock them directly:
+
+```php
+use Vortos\Paddle\Customer\Contract\ImmediateCustomerServiceInterface;
+use Vortos\Paddle\Customer\Customer;
+
+$customers = $this->createMock(ImmediateCustomerServiceInterface::class);
+$customers->method('get')->willReturn(Customer::fromSdk(...));
+```
+
+For command handler tests that go through the unit of work, use the Transactional interfaces and assert against the outbox writer:
+
+```php
+use Vortos\Paddle\Outbox\PaddleOutboxWriterInterface;
+
+$outbox = $this->createMock(PaddleOutboxWriterInterface::class);
+$outbox->expects($this->once())
+       ->method('queue')
+       ->with('customer.create', $this->arrayHasKey('email'));
+```

@@ -1,0 +1,93 @@
+---
+title: Circuit Breaker
+description: Fast-fail protection for the object store driver when the provider is unavailable.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Circuit Breaker
+
+When an R2 or S3 outage occurs, every request that reaches the driver waits for the SDK timeout before failing. Under load this exhausts the worker pool. The circuit breaker detects consecutive infrastructure failures and fast-fails subsequent requests until the provider recovers, keeping the application responsive while the provider is down.
+
+## How It Works
+
+The circuit has three states:
+
+| State | Behaviour |
+|---|---|
+| **Closed** | Normal — all requests pass through to the driver. |
+| **Open** | Tripped — requests fail immediately with `ObjectStoreException`. No provider calls are made. |
+| **Half-Open** | Probing — one request is allowed through to test recovery. Success closes the circuit; failure re-opens it. |
+
+The circuit opens after `failureThreshold` consecutive infrastructure failures. It moves to half-open after `resetTimeoutSeconds` elapses, then closes on a successful probe.
+
+## What Trips the Circuit
+
+Infrastructure failures trip the circuit:
+
+- Network errors, connection timeouts, provider 5xx responses.
+- `BucketNotFoundException`, `ObjectStoreAccessDeniedException`.
+- Any unexpected exception from the driver.
+
+These exceptions do **not** trip the circuit — the provider is reachable, only the request itself is invalid:
+
+- `ObjectNotFoundException` — the object does not exist.
+- `ObjectTooLargeException` — the upload exceeds the configured size limit.
+- `PresignedUrlPolicyException` — TTL or size constraint violation.
+- `PromotionRejectedException` — the promotion policy rejected the request.
+- `ObjectStoreRateLimitException` — provider rate limit; the provider is alive.
+- `\InvalidArgumentException` — invalid key or upload constraint.
+
+<Callout type="info" title="Outbox mutations are still retried">
+Write operations (put, delete, copy, move) that go through the outbox are retried by the relay worker independently of the circuit breaker. The circuit protects synchronous reads and direct provider calls from pile-ups. Queued outbox rows sit safely in the database until the provider recovers.
+</Callout>
+
+## Enabling
+
+The circuit breaker is disabled by default. Enable it in `config/object_store.php`:
+
+```php
+$config->circuitBreaker()
+    ->enabled(true)
+    ->failureThreshold(5)
+    ->resetTimeoutSeconds(60);
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `enabled()` | `false` | Enable the circuit breaker. |
+| `failureThreshold()` | `5` | Consecutive infrastructure failures before the circuit opens. |
+| `resetTimeoutSeconds()` | `60` | Seconds before the open circuit transitions to half-open for a probe. |
+
+## Tuning
+
+**`failureThreshold`** controls how quickly the circuit trips. A lower value protects faster but is more sensitive to transient errors that the SDK retry policy would already handle. A value below `3` is rarely useful — the SDK already retries internally.
+
+**`resetTimeoutSeconds`** controls recovery latency. During this window all requests fast-fail. Set it to a value that gives the provider time to stabilise. `60` seconds is a reasonable starting point; increase it if your provider typically takes longer to recover from partial outages.
+
+For production the recommended starting configuration:
+
+```php
+$config->circuitBreaker()
+    ->enabled(true)
+    ->failureThreshold(5)
+    ->resetTimeoutSeconds(60);
+```
+
+## Circuit State in Responses
+
+When the circuit is open, every call to `ObjectStoreInterface`, `ImmediateObjectStoreInterface`, or `StandaloneObjectStoreInterface` throws:
+
+```
+Vortos\ObjectStore\Exception\ObjectStoreException: Object store circuit breaker is open.
+```
+
+Handle this in the same way as any other `ObjectStoreException`. The circuit state is also available if you inject `CircuitBreakerObjectStore` directly, though standard application code should not need to inspect it.
+
+## Interaction With Other Features
+
+**Outbox relay** — the relay worker calls `vortos_object_store.sending_store` (the middleware stack) directly. The circuit breaker sits below the middleware stack at the raw driver level, so relay operations are also protected. If the circuit is open when the relay attempts delivery, the relay records a failed attempt and backs off according to the outbox retry configuration.
+
+**Immediate interface** — `ImmediateObjectStoreInterface` bypasses the outbox but still goes through the middleware stack and driver, so it is also subject to the circuit breaker.
+
+**Read operations** — `get`, `head`, `exists`, `list`, presigned URL generation all go through the same circuit. If the provider is unreachable for writes it is unreachable for reads too. The circuit protects all operations equally.

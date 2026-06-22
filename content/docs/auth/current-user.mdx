@@ -54,19 +54,32 @@ $userId = $user->id(); // safe, guaranteed authenticated
 ```php
 interface UserIdentityInterface
 {
-    public function id(): string;            // User aggregate ID
-    public function roles(): array;          // ['ROLE_USER', 'ROLE_ADMIN']
-    public function isAuthenticated(): bool; // always true for UserIdentity
+    public function id(): string;
+    public function roles(): array;
+    public function isAuthenticated(): bool;
     public function hasRole(string $role): bool;
     public function getAttribute(string $key, mixed $default = null): mixed;
+    public function getClaims(): array; // what gets serialized into the JWT attrs namespace
 }
 ```
 
-JWT claims that are not core claims become identity attributes. This is how authorization receives `authz_version`.
+## Custom attributes
+
+Anything you pass in the third `UserIdentity` constructor argument is serialized into the JWT `attrs` claim and readable on every authenticated request via `getAttribute()`:
 
 ```php
-$version = $this->currentUser->get()->getAttribute('authz_version', 0);
+// At login — embed in the token:
+$identity = new UserIdentity($user->id, $user->roles, [
+    'organization_id' => $user->organizationId,
+    'plan'            => 'pro',
+]);
+
+// Anywhere in the request — read back:
+$orgId = $this->currentUser->get()->getAttribute('organization_id');
+$plan  = $this->currentUser->get()->getAttribute('plan', 'free');
 ```
+
+`getClaims()` is what `JwtService` calls to determine what goes into the token. `UserIdentity::getClaims()` returns the full attributes array by default. Override it in a custom identity class to exclude fields that should stay in memory only.
 
 ## Request cleanup
 

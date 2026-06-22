@@ -45,22 +45,19 @@ final class User extends AggregateRoot
         return $user;
     }
 
-    // Named constructor for loading from DB (restores version)
+    // Named constructor for loading from DB
     public static function reconstruct(
         UserId $id,
         Email $email,
         string $name,
         string $passwordHash,
-        int $version,
     ): self {
-        $user = new self(
+        return new self(
             id:           $id,
             email:        $email,
             name:         $name,
             passwordHash: $passwordHash,
         );
-        $user->restoreVersion($version);
-        return $user;
     }
 
     public function getId(): UserId { return $this->id; }
@@ -95,8 +92,8 @@ public function hasDomainEvents(): bool;
 
 // Optimistic locking
 public function getVersion(): int;
-protected function restoreVersion(int $version): void; // @internal — call from reconstruct() only
-public function incrementVersion(): void;              // @internal — called by repository after save
+protected function restoreVersion(int $version): void; // @internal — called by DbalStore::hydrate() automatically
+public function incrementVersion(): void;              // @internal — called by DbalStore after save
 ```
 
 ## Domain Event Recording
@@ -137,27 +134,38 @@ save()            version = 3   (UPDATE WHERE version = 2)
 
 If two processes load version 2 and both try to save, the second save fails because the database version is already 3. See [Optimistic Locking](/docs/persistence/optimistic-locking) for handling strategies.
 
-**Never call `incrementVersion()` or `restoreVersion()` directly from outside the aggregate.** `incrementVersion()` is called by the repository after a successful save; `restoreVersion()` is called only inside `reconstruct()` factories.
+**Never call `incrementVersion()` or `restoreVersion()` directly.** `incrementVersion()` is called by `DbalStore` after a successful save; `restoreVersion()` is called automatically by `DbalStore::hydrate()` when loading from the database.
 
 ## The reconstruct() Pattern
 
-`fromRow()` in your repository needs to restore the aggregate's version from the database. Add a `reconstruct()` static factory:
+`reconstruct()` is a plain named constructor — it does not need to restore `lock_version`. `DbalStore` calls `hydrate()` after `fromRow()`, which restores the version via `Closure::bind()` automatically:
 
 ```php
-// In DbalWriteRepository::fromRow():
-protected function fromRow(array $row): AggregateRoot
+// Aggregate — no lock_version parameter needed
+public static function reconstruct(
+    UserId $id,
+    Email $email,
+    string $name,
+    string $passwordHash,
+): self {
+    return new self($id, $email, $name, $passwordHash);
+}
+```
+
+```php
+// DbalMapper::fromRow() — no (int) $row['lock_version'] needed
+public function fromRow(array $row): AggregateRoot
 {
     return User::reconstruct(
         id:           UserId::fromString($row['id']),
         email:        new Email($row['email']),
         name:         $row['name'],
         passwordHash: $row['password_hash'],
-        version:      (int) $row['version'],
     );
 }
 ```
 
-Inside `reconstruct()`, call `$this->restoreVersion($version)` — this directly assigns the stored version number so optimistic locking works correctly on the next `save()`. Never use an `incrementVersion()` loop for this; `restoreVersion()` is the correct API.
+`DbalStore::hydrate()` is what actually calls `restoreVersion()` — never call it yourself. For custom query methods in your repository, use `$this->store->hydrate($row)` instead of `$this->store->mapper()->fromRow($row)` directly, so the version is always restored.
 
 ## EventSourcedAggregateRoot
 

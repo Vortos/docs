@@ -1,0 +1,129 @@
+---
+title: Webhooks
+description: Notify external systems when flags change — Slack, PagerDuty, deployment trackers, and custom endpoints.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Webhooks
+
+A webhook fires an HTTP POST to a configured URL whenever a flag event occurs. Use webhooks to:
+
+- Post a message to a Slack channel when a flag is enabled in production
+- Notify PagerDuty when an ops kill switch is triggered
+- Update a deployment tracker with flag state changes
+- Trigger a cache warm-up in a downstream service after a flag changes
+
+## Configuring a webhook
+
+```bash
+php vortos vortos:flags:webhook:create \
+  --name="Slack #releases" \
+  --url="https://hooks.slack.com/services/T00/B00/xxx" \
+  --events=flag.enabled,flag.disabled \
+  --env=production
+```
+
+Webhook events:
+
+| Event | Fires when |
+|---|---|
+| `flag.created` | A new flag is created |
+| `flag.enabled` | A flag transitions to enabled |
+| `flag.disabled` | A flag transitions to disabled |
+| `flag.updated` | Rules, variants, or schedule change |
+| `flag.deleted` | A flag is permanently deleted |
+| `flag.archived` | A flag is archived |
+| `change_request.created` | A change request is submitted |
+| `change_request.approved` | A change request is approved |
+| `change_request.rejected` | A change request is rejected |
+
+## Payload format
+
+```json
+{
+  "event":   "flag.enabled",
+  "flag":    "new-checkout",
+  "env":     "production",
+  "project": "checkout",
+  "actor":   "user-abc",
+  "reason":  "Rollout per PROJ-1234",
+  "at":      "2026-06-22T14:30:00Z",
+  "payload": {
+    "enabled":  true,
+    "rollout":  25,
+    "kind":     "release"
+  }
+}
+```
+
+## Signing
+
+Every webhook request includes a signature in the `X-Vortos-Signature` header. Verify it on the receiving end to confirm the request is genuine:
+
+```php title="Verifying a webhook"
+$signature = $request->headers->get('X-Vortos-Signature');
+$secret    = 'your-webhook-secret';
+$body      = $request->getContent();
+
+$expected = 'sha256=' . hash_hmac('sha256', $body, $secret);
+
+if (!hash_equals($expected, $signature)) {
+    return new Response('Forbidden', 403);
+}
+```
+
+Set the secret when creating the webhook:
+
+```bash
+php vortos vortos:flags:webhook:create \
+  --name="My endpoint" \
+  --url="https://yourservice.com/hooks/flags" \
+  --secret="whsec_supersecret" \
+  --events=flag.enabled,flag.disabled
+```
+
+## Delivery guarantees
+
+Webhooks are delivered at-least-once. The engine retries with exponential backoff on non-2xx responses or timeouts:
+
+```
+Attempt 1: immediately
+Attempt 2: after 30 seconds
+Attempt 3: after 5 minutes
+Attempt 4: after 30 minutes
+Attempt 5: after 2 hours
+Then: marked as failed, no more retries
+```
+
+Failed deliveries are visible in the admin UI webhook log. You can manually retry a failed delivery:
+
+```bash
+php vortos vortos:flags:webhook:retry <delivery-id>
+```
+
+## Listing and managing webhooks
+
+```bash
+# List all webhooks
+php vortos vortos:flags:webhook:list
+
+# Show delivery history for a webhook
+php vortos vortos:flags:webhook:deliveries <webhook-id>
+
+# Disable a webhook temporarily
+php vortos vortos:flags:webhook:disable <webhook-id>
+
+# Delete a webhook
+php vortos vortos:flags:webhook:delete <webhook-id>
+```
+
+<Callout type="info" title="Test delivery">
+Send a test event to a new webhook before putting it into production:
+
+```bash
+php vortos vortos:flags:webhook:test <webhook-id>
+```
+
+This fires a `webhook.test` event with a synthetic payload. Check your receiving endpoint's logs to confirm receipt and signature verification.
+</Callout>

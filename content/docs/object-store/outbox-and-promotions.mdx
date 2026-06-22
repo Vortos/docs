@@ -94,8 +94,13 @@ Temporary uploads are quarantine-adjacent. Validate ownership, expected content 
 ## Relay Worker
 
 ```bash
+# Long-running worker (handles SIGTERM gracefully)
 php bin/console vortos:object-store:relay
+
+# Single batch and exit (for cron)
 php bin/console vortos:object-store:relay --once
+
+# Control idle sleep interval
 php bin/console vortos:object-store:relay --sleep=2
 ```
 
@@ -104,6 +109,46 @@ Install supervisor config:
 ```bash
 php bin/console vortos:worker:install --worker=object-store-outbox-relay
 ```
+
+## Dead-Letter Retry
+
+When an outbox entry exhausts all delivery attempts it is marked `status=dead`. The relay no longer picks it up. Use the retry command to inspect and reset dead entries:
+
+```bash
+# Inspect dead entries without resetting
+php bin/console vortos:object-store:outbox:retry --dry-run
+
+# Filter by operation
+php bin/console vortos:object-store:outbox:retry --dry-run --operation=put
+
+# Filter by date range
+php bin/console vortos:object-store:outbox:retry --dry-run --created-from=2026-06-01 --created-to=2026-06-02
+
+# Reset dead entries (prompts for confirmation)
+php bin/console vortos:object-store:outbox:retry --force
+
+# Reset a specific entry by ID
+php bin/console vortos:object-store:outbox:retry --id=abc-uuid --force
+
+# Reset only a specific operation type
+php bin/console vortos:object-store:outbox:retry --operation=promote --force
+
+# Limit batch size
+php bin/console vortos:object-store:outbox:retry --limit=10 --force
+```
+
+Resetting sets `status=pending`, clears `attempt_count`, `processed_at`, and `last_error`, and sets `next_attempt_at=NULL` (process immediately). The relay picks the rows up on its next poll.
+
+## Outbox Table
+
+| Column | Description |
+|--------|-------------|
+| `status` | `pending` → `done` (success) or `dead` (permanently failed). |
+| `attempt_count` | Delivery attempt count. |
+| `last_error` | Error message from the most recent failed attempt. |
+| `next_attempt_at` | Scheduled time for the next delivery attempt (exponential backoff). |
+| `processed_at` | Set when the row is successfully delivered or marked dead. |
+| `domain_event_id` | Optional correlation ID for idempotent writes from domain events. |
 
 ## Why A Separate Outbox Table?
 

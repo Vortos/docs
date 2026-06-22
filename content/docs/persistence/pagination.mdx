@@ -161,7 +161,7 @@ $this->assertNull($page3->nextCursor);
 ```
 
 <Callout type="info" title="InMemory Cursor Format Differs">
-`InMemoryReadRepository` encodes the cursor as a base64 integer offset. `MongoReadRepository` encodes it as a base64 JSON object with sort field values. The formats are not interchangeable — do not mix cursors between implementations.
+`InMemoryReadRepository` encodes the cursor as a base64 integer offset. `MongoStore` encodes it as a base64 JSON object with sort field values. The formats are not interchangeable — do not mix cursors between implementations.
 
 In practice this does not matter because you never parse cursors — you only pass them back verbatim.
 </Callout>

@@ -1,0 +1,117 @@
+---
+title: SDK Keys
+description: API keys for SDK clients, CI/CD pipelines, and the management API. Scope keys to projects, environments, and access levels.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# SDK Keys
+
+SDK keys authenticate external clients to the feature flags API. They exist for three distinct use cases:
+
+| Use case | Key type | Access |
+|---|---|---|
+| Frontend/mobile SDK reading flags | SDK read key | Read-only, single environment |
+| CI/CD pipeline creating/updating flags | Management write key | Read-write, scoped project |
+| Monitoring or audit integrations | Management read key | Read-only, full visibility |
+
+Keys are separate from user sessions. They do not expire on logout and are designed to be used by automated systems.
+
+## Creating a key
+
+```bash
+# Read-only key for the @vortos/flags frontend SDK
+php vortos vortos:flags:sdk-key:create \
+  --name="Web frontend (production)" \
+  --env=production \
+  --access=read
+
+# CI/CD write key scoped to a project
+php vortos vortos:flags:sdk-key:create \
+  --name="Checkout team CI" \
+  --project=checkout \
+  --env=staging \
+  --access=read-write
+
+# Management read key with full scope
+php vortos vortos:flags:sdk-key:create \
+  --name="Audit integration" \
+  --access=read \
+  --all-projects \
+  --all-environments
+```
+
+The command outputs the key once. Store it in your secret manager immediately — it cannot be retrieved again.
+
+## Using a key
+
+Pass the key as a Bearer token:
+
+```
+Authorization: Bearer sk-live-abc123...
+```
+
+```bash
+# Curl example
+curl -H "Authorization: Bearer sk-live-abc123" \
+  https://yourapp.com/api/flags
+
+# @vortos/flags SDK
+<FeatureFlagProvider
+  endpoint="/api/flags"
+  headers={{ Authorization: `Bearer ${SDK_KEY}` }}
+>
+```
+
+For CI/CD pipelines using the management API:
+
+```bash
+curl -X POST \
+  -H "Authorization: Bearer sk-live-abc123" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true, "rollout": 10}' \
+  https://yourapp.com/api/flags/management/new-checkout/enable
+```
+
+## Listing and revoking keys
+
+```bash
+# List all active keys (key values are never shown)
+php vortos vortos:flags:sdk-key:list
+
+# Revoke a key by ID
+php vortos vortos:flags:sdk-key:revoke <key-id> \
+  --reason="Team member offboarded"
+```
+
+Revoked keys are recorded in the audit log with the actor and reason. The key stops working immediately — there is no TTL to wait for.
+
+## Key scoping
+
+A key's scope limits what it can do:
+
+- **Project scope:** A key scoped to `checkout` cannot read or write flags in `billing`, even if the bearer has `flags.write` elsewhere.
+- **Environment scope:** A key scoped to `staging` cannot read production flag state.
+- **Access scope:** A read-only key returns 403 on any write endpoint.
+
+This matters for CI/CD pipelines: a checkout team's CI key cannot accidentally modify a payments flag during a misconfigured deploy script.
+
+## Key rotation
+
+Rotate keys regularly or immediately after a suspected leak:
+
+```bash
+# Create a new key first, update all consumers, then revoke the old one
+php vortos vortos:flags:sdk-key:create \
+  --name="Web frontend (production) — rotated 2026-06" \
+  --env=production \
+  --access=read
+
+# After updating consumers
+php vortos vortos:flags:sdk-key:revoke <old-key-id> \
+  --reason="Scheduled rotation"
+```
+
+<Callout type="warn" title="Never commit keys to source control">
+SDK keys in environment variables or a secret manager. Never in `.env.example`, `config/`, or any committed file. The platform does not store the raw key value after creation — only a hash — so there is no way to recover a committed key except revocation.
+</Callout>

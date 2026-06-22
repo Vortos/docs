@@ -1,6 +1,6 @@
 ---
 title: Persistence Generators
-description: Generate PostgreSQL write repositories and MongoDB read repositories with the correct base classes and column maps.
+description: Generate PostgreSQL write repositories and MongoDB read repositories with the correct mapper, store wiring, and attributes.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -36,66 +36,120 @@ php bin/console vortos:make:write-repository User --context=User
 
 ```
 src/User/Domain/User/Repository/UserRepositoryInterface.php  (skipped if already exists)
-src/User/Infrastructure/Repository/UserRepository.php
+src/User/Infrastructure/Database/UserMapper.php
+src/User/Infrastructure/Database/UserWriteRepository.php
 ```
 
-**`UserRepository.php`**
+**`UserMapper.php`**
 
 ```php
 <?php
 
 declare(strict_types=1);
 
-namespace App\User\Infrastructure\Repository;
+namespace App\User\Infrastructure\Database;
 
-use App\User\Domain\User\User;
-use App\User\Domain\User\UserId;
-use App\User\Domain\User\Repository\UserRepositoryInterface;
-use Vortos\PersistenceDbal\Write\PostgresWriteRepository;
+use Doctrine\DBAL\Types\Types;
+use Vortos\Domain\Aggregate\AggregateRoot;
+use Vortos\PersistenceDbal\Write\DbalMapper;
 
-final class UserRepository extends PostgresWriteRepository implements UserRepositoryInterface
+final class UserMapper implements DbalMapper
 {
-    protected function tableName(): string
+    public function tableName(): string
     {
         return 'users';
     }
 
-    protected function columnMap(): array
+    public function columnMap(): array
     {
         return [
-            'id'      => 'id',
-            'version' => 'version',
-            // add columns here
+            'id' => Types::STRING,
+            // add your domain columns here — lock_version is handled automatically
         ];
     }
 
-    protected function toRow(User $aggregate): array
+    public function toRow(AggregateRoot $aggregate): array
     {
+        /** @var User $aggregate */
         return [
-            'id'      => (string) $aggregate->getId(),
-            'version' => $aggregate->getVersion(),
-            // map aggregate state to DB columns here
+            'id' => (string) $aggregate->getId(),
+            // map aggregate state to DB columns here — do NOT include lock_version
         ];
     }
 
-    protected function fromRow(array $row): User
+    public function fromRow(array $row): AggregateRoot
     {
         return User::reconstruct(
             UserId::fromString($row['id']),
-            (int) $row['version'],
+            // do NOT pass lock_version — DbalStore restores it automatically via hydrate()
         );
     }
 }
 ```
 
-Fill in `columnMap`, `toRow`, and `fromRow` to match your aggregate's state. The base class handles `save`, `update`, `delete`, `findById`, and optimistic locking automatically once these three methods are implemented.
+**`UserWriteRepository.php`**
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\User\Infrastructure\Database;
+
+use App\User\Domain\User\User;
+use App\User\Domain\User\UserId;
+use App\User\Domain\User\Repository\UserRepositoryInterface;
+use Vortos\PersistenceDbal\Attribute\UsesDbalMapper;
+use Vortos\PersistenceDbal\Write\DbalStore;
+
+#[UsesDbalMapper(UserMapper::class)]
+final class UserWriteRepository implements UserRepositoryInterface
+{
+    public function __construct(private readonly DbalStore $store) {}
+
+    public function save(User $user): void
+    {
+        $this->store->save($user);
+    }
+
+    public function delete(User $user): void
+    {
+        $this->store->delete($user);
+    }
+
+    public function findById(UserId $id): ?User
+    {
+        /** @var User|null */
+        return $this->store->find($id);
+    }
+
+    // Add custom query methods here. Example:
+    //
+    // public function findByEmail(string $email): ?User
+    // {
+    //     $row = $this->store->createQueryBuilder()
+    //         ->select('*')
+    //         ->from($this->store->mapper()->tableName())
+    //         ->where('email = :email')
+    //         ->setParameter('email', $email)
+    //         ->executeQuery()
+    //         ->fetchAssociative();
+    //
+    //     /** @var User|null */
+    //     /** @var User|null */
+    //     return $row !== false ? $this->store->hydrate($row) : null;
+    // }
+}
+```
+
+Fill in `columnMap`, `toRow`, and `fromRow` in `UserMapper` with your domain columns. Do not include `lock_version` — `DbalStore` injects it on INSERT, applies it in the WHERE clause on UPDATE/DELETE, and restores it on the aggregate after `find()` and `hydrate()` automatically.
 
 <Callout type="info" title="ORM Variant">
-If `vortos/vortos-persistence-orm` is installed, the generator uses the ORM stub instead. The repository extends `OrmWriteRepository` and uses Doctrine ORM's entity manager rather than DBAL. The interface is unchanged.
+If `vortos/vortos-persistence-orm` is installed, the generator uses the ORM stub instead — `#[UsesOrmEntity(User::class)]` on the repository, no mapper file. The repository interface is unchanged.
 </Callout>
 
 <Callout type="warn" title="Never use batchUpdate for conflict-safe operations">
-`PostgresWriteRepository::batchUpdate()` silently skips rows with version conflicts rather than throwing `OptimisticLockException`. It is suitable only for last-write-wins bulk operations, not for conflict-safe aggregate updates.
+`PostgresStore::batchUpdate()` silently skips rows with version conflicts rather than throwing `OptimisticLockException`. It is suitable only for last-write-wins bulk operations, not for conflict-safe aggregate updates. Switch to `PostgresStore` via the `storeClass` argument on `#[UsesDbalMapper]` only when you need the single-query batch update path.
 </Callout>
 
 ---
@@ -135,39 +189,60 @@ src/User/Infrastructure/Persistence/Mongo/UserReadRepository.php
 
 declare(strict_types=1);
 
-namespace App\User\Infrastructure\Repository;
+namespace App\User\Infrastructure\Persistence\Mongo;
 
-use Vortos\PersistenceMongo\Read\MongoReadRepository;
+use App\User\Application\ReadModel\UserReadModel;
+use App\User\Application\UserReadRepositoryInterface;
+use Vortos\PersistenceMongo\Read\MongoStore;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoCollection;
+use Vortos\PersistenceMongo\Schema\Attribute\MongoIndex;
 
-final class UserReadRepository extends MongoReadRepository
+#[MongoCollection('users')]
+#[MongoIndex(key: ['_id' => 1])]
+final class UserReadRepository implements UserReadRepositoryInterface
 {
-    protected function collectionName(): string
+    public function __construct(private readonly MongoStore $store) {}
+
+    public function findById(string $id): ?UserReadModel
     {
-        return 'users';
+        $doc = $this->store->findById($id);
+        return $doc !== null ? $this->fromDocument($doc) : null;
     }
 
-    protected function fromDocument(array $document): array
-    {
-        return [
-            'id'    => $document['_id'],
-            // map MongoDB document fields to your read model shape
-        ];
-    }
+    // Add custom query methods here. Example:
+    //
+    // public function findByStatus(string $status, int $limit = 50): array
+    // {
+    //     $docs = $this->store->findByCriteria(['status' => $status], limit: $limit);
+    //     return array_map(fn(array $doc) => $this->fromDocument($doc), $docs);
+    // }
+    //
+    // For paginated results:
+    //
+    // public function findPage(array $criteria, int $limit, ?string $cursor = null): PageResult
+    // {
+    //     $raw = $this->store->findPage($criteria, $limit, $cursor);
+    //     return new PageResult(
+    //         items: array_map(fn(array $doc) => $this->fromDocument($doc), $raw->items),
+    //         nextCursor: $raw->nextCursor,
+    //         hasMore: $raw->hasMore,
+    //     );
+    // }
 
-    protected function indexes(): array
+    private function fromDocument(array $doc): UserReadModel
     {
-        return [
-            // define MongoDB indexes here
-            // ['key' => ['email' => 1], 'unique' => true],
-        ];
+        return new UserReadModel(
+            id: $doc['_id'],
+            // map document fields to read model here
+        );
     }
 }
 ```
 
-Fill in `fromDocument` to transform MongoDB documents into your read model shape. The `indexes` method declares which indexes MongoDB should maintain — these are created automatically on startup.
+Fill in `fromDocument` to transform MongoDB documents into your read model shape. Add `#[MongoIndex]` attributes alongside the queries that use those indexes.
 
 <Callout type="warn" title="Store _id as string UUID">
-MongoDB's `_id` field must always be stored as a string UUID, never as `ObjectId`. The `MongoReadRepository` base class enforces this for `save` and `upsert`. Do not cast `_id` to `ObjectId` in your repository — it will break cross-service event correlation.
+MongoDB's `_id` field must always be stored as a string UUID, never as `ObjectId`. Cross-service event correlation depends on UUID identity being consistent between the write and read sides.
 </Callout>
 
 ### Projection handlers write, read repositories read
@@ -177,12 +252,12 @@ The typical flow for a read model:
 ```
 Event arrives from Kafka
     └── ProjectionHandler::__invoke()
-            └── UserReadRepository::upsert(['_id' => $event->userId, ...])
+            └── UserReadRepository::upsert($store->upsert('user-123', [...]))
 
 Query arrives via HTTP
     └── GetUserByIdHandler::__invoke()
-            └── UserReadRepository::findOne(['_id' => $query->userId])
-                └── Returns plain array to controller
+            └── UserReadRepository::findById($query->userId)
+                    └── Returns typed UserReadModel to controller
 ```
 
-Use `upsert` in your projection handler (never `insert`) and `findOne` / `findMany` in your query handler.
+Use `$this->store->upsert()` in your projection handler (never `insert`) and `findById()` / `findByCriteria()` in your query handler.

@@ -1,0 +1,123 @@
+---
+title: Configuration
+description: Full configuration reference for the Vortos Paddle billing package.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Configuration
+
+`config/paddle.php` receives `Vortos\Paddle\DependencyInjection\VortosPaddleConfig`.
+
+```php title="config/paddle.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\Paddle\DependencyInjection\VortosPaddleConfig;
+
+return static function (VortosPaddleConfig $config): void {
+    $config
+        ->mode($_ENV['PADDLE_MODE'] ?? 'sandbox')
+        ->apiKey($_ENV['PADDLE_API_KEY'] ?? '')
+        ->notificationSecret($_ENV['PADDLE_NOTIFICATION_SECRET'] ?? '')
+        ->webhookPath('/webhooks/paddle');
+
+    $config->client()
+        ->maxRetries(3)
+        ->retryOnRateLimit(true)
+        ->idempotencyKeyTtlSeconds(86400);
+
+    $config->circuitBreaker()
+        ->failureThreshold(5)
+        ->resetTimeoutSeconds(60);
+
+    $config->security()
+        ->enforceIpAllowlist(false)
+        ->replayWindowSeconds(5);
+        // allowSandboxIps is auto-set when mode=sandbox
+
+    $config->webhooks()
+        ->enabled(true)
+        ->idempotencyTable('paddle_webhook_idempotency')
+        ->idempotencyTtlSeconds(259200);
+
+    $config->outbox()
+        ->maxAttempts(5)
+        ->backoffBaseSeconds(60)
+        ->backoffCapSeconds(3600)
+        ->batchSize(50)
+        ->sleepSecondsWhenEmpty(2);
+
+    $config->observability()
+        ->logging(true)
+        ->tracing(true)
+        ->metrics(true);
+};
+```
+
+You can also provide an environment-specific override:
+
+```php title="config/prod/paddle.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\Paddle\DependencyInjection\VortosPaddleConfig;
+
+return static function (VortosPaddleConfig $config): void {
+    $config->mode('live');
+};
+```
+
+## Mode
+
+| Value | Description |
+|-------|-------------|
+| `sandbox` | Paddle sandbox. Sandbox webhook IPs are automatically allowed. |
+| `live` | Paddle production. Use for real billing. |
+
+## API Client
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `maxRetries` | `3` | Retries on transient Paddle API errors. |
+| `retryOnRateLimit` | `true` | Retry after `429` rate limit responses. |
+| `idempotencyKeyTtlSeconds` | `86400` | How long idempotency keys are stored (seconds). |
+
+## Circuit Breaker
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `failureThreshold` | `5` | Consecutive failures before the circuit opens. |
+| `resetTimeoutSeconds` | `60` | Seconds before attempting recovery after the circuit opens. |
+
+## Webhooks
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `true` | Register the webhook controller route. |
+| `idempotencyTable` | `paddle_webhook_idempotency` | Table for deduplicating incoming events. |
+| `idempotencyTtlSeconds` | `259200` | 3 days — how long received event IDs are retained. |
+
+## Security
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enforceIpAllowlist` | `false` | Block requests not from Paddle IP ranges. |
+| `replayWindowSeconds` | `5` | Reject webhook signatures older than this many seconds. |
+| `allowSandboxIps` | auto | Auto-enabled when `mode=sandbox`. Set explicitly to override. |
+
+## Outbox
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `maxAttempts` | `5` | Delivery attempts before an entry is permanently failed. |
+| `backoffBaseSeconds` | `60` | Base for exponential backoff: attempt 1 = 60s, attempt 2 = 120s, etc. |
+| `backoffCapSeconds` | `3600` | Maximum backoff delay (1 hour). |
+| `batchSize` | `50` | Rows processed per relay cycle. |
+| `sleepSecondsWhenEmpty` | `2` | Pause between polls when the outbox is empty (worker mode). |
+
+<Callout type="info" title="Outbox delivery is at-least-once">
+The relay re-runs any row whose `status = pending` and `next_attempt_at <= now`. Idempotency keys in the Paddle SDK protect against duplicate API side effects within the TTL window.
+</Callout>

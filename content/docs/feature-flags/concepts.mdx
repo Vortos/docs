@@ -1,0 +1,113 @@
+---
+title: Concepts
+description: Flag kinds, value types, lifecycle states, environments, and projects — the mental model before you write any code.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Concepts
+
+Understanding these five concepts will make every other page in this section click.
+
+## Flag kinds
+
+Every flag has a `kind` that describes its intended use. The kind is informational — it does not change how the engine evaluates the flag — but it affects what the admin UI shows and what guardrails apply.
+
+| Kind | Use for | Example |
+|---|---|---|
+| `release` | Shipping a new feature gradually | `new-checkout`, `redesigned-onboarding` |
+| `experiment` | A/B tests where you compare metrics | `cta-button-copy`, `pricing-layout` |
+| `ops` | Kill switches and operational toggles | `disable-payments`, `maintenance-mode` |
+| `permission` | Granting access to specific users or tenants | `beta-access`, `enterprise-reporting` |
+
+**Release flags** are temporary. They exist during a gradual rollout and should be removed from the codebase once the feature is fully live. The admin UI flags stale release flags that have been at 100% rollout for more than 30 days.
+
+**Experiment flags** drive A/B tests. They have variants (see [Variants](/docs/feature-flags/variants)) and are typically active for a defined window while metrics are collected. Remove them once the experiment concludes and the winning variant is hardcoded.
+
+**Ops flags** are kill switches. They are designed to be disabled instantly in an incident. The admin UI surfaces them in a dedicated kill switch panel and the engine skips the 60-second cache TTL on disable — the change propagates within the current request cycle.
+
+**Permission flags** grant persistent access to a user or tenant segment. Unlike release flags, they may stay active indefinitely. They typically have a users whitelist rule or an attribute rule rather than a percentage rule.
+
+## Value types
+
+A flag's `value_type` determines what `variant()` returns when the flag is active.
+
+| Type | `variant()` returns | Use for |
+|---|---|---|
+| `bool` | `"true"` / `"false"` | Simple on/off — most flags |
+| `string` | Any string | Variant labels, theme names |
+| `number` | Numeric string | Configuration values, limits |
+| `json` | JSON string | Structured configuration objects |
+
+Most flags are `bool`. Use `string` for A/B experiments where the variant name carries meaning (`"control"`, `"variant-a"`). Use `json` sparingly — payloads belong in the database, not in flags.
+
+## Flag lifecycle
+
+```
+create (disabled)
+    ↓
+enable (with rules)
+    ↓
+ramp up (increase percentage)
+    ↓
+full rollout (100% or all users)
+    ↓
+archive (flag removed from code, kept for audit)
+    ↓
+delete (permanent, removes all history)
+```
+
+Flags start disabled. They have no rules and evaluate to `false` for everyone. This is intentional — you create the flag before merging the feature branch so the code is deployed but nothing is visible.
+
+**Archiving** retains the flag and its full audit history but removes it from the evaluation loop. Use archive when the feature is fully live and you have removed all `isEnabled()` calls from the codebase but want to keep the history. Archived flags do not appear in `/api/flags` responses.
+
+**Deleting** is permanent. It removes the flag, all its rules, all its audit entries, and all its history. Require `--force` on the CLI and a confirmation step in the admin UI.
+
+## Environments
+
+Each flag has a state per environment. The same flag name can be enabled in `production`, disabled in `staging`, and at 10% in `development`. Environments are separate rollout contexts — a change in one does not affect another.
+
+The engine ships with three default environments: `production`, `staging`, and `development`. You can add custom environments in configuration.
+
+When you call `isEnabled()` or hit `/api/flags`, the engine evaluates the flag for the current environment. The environment is resolved from `FlagScopeContext`, which the HTTP layer populates from a request header or configuration.
+
+```php
+// Production evaluation (default)
+$flags->isEnabled('new-checkout', $context);
+
+// Explicit environment
+$this->scopeContext->withEnvironment('staging');
+$flags->isEnabled('new-checkout', $context);
+```
+
+See [Environments](/docs/feature-flags/environments) for promotion workflows and environment-level permissions.
+
+## Projects
+
+Projects group flags by product area or team. A project is a namespace — `checkout/new-flow` and `payments/new-flow` are different flags belonging to different projects. Projects do not affect evaluation; they are an organizational tool.
+
+The default project is `default`. In larger codebases, create projects per domain:
+
+```bash
+php vortos vortos:flags:create new-checkout --project=checkout
+php vortos vortos:flags:create pricing-experiment --project=billing
+```
+
+The admin UI shows flags grouped by project and lets you filter by project. SDK keys can be scoped to a project so a CI/CD pipeline for one team cannot modify another team's flags.
+
+See [Projects](/docs/feature-flags/projects) for setup and key scoping.
+
+## The write boundary
+
+All mutations go through `FlagWriteService`. Nothing writes to `FlagStorageInterface` directly. This single boundary is enforced by a PHPUnit architecture test that will fail the build if any code bypasses it.
+
+```
+FlagWriteService
+  ├── validates the change
+  ├── persists to FlagStorageInterface
+  ├── writes an audit log entry (actor + reason + diff)
+  ├── invalidates the Redis cache
+  └── notifies SSE subscribers (live dashboard updates)
+```
+
+Every method on `FlagWriteService` takes an `actorId` and an optional `reason`. These appear in the audit log and in the admin UI history timeline.

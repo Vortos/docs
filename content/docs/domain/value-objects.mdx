@@ -131,7 +131,7 @@ final readonly class Address extends ValueObject { ... }  // ValueObject base
 ```
 
 <Callout type="info" title="Value Objects in Database">
-Store value objects as their primitive representation. In `DbalWriteRepository::toRow()`:
+Store value objects as their primitive representation. In `DbalMapper::toRow()`:
 
 ```php
 'email' => (string) $user->getEmail(),  // __toString()

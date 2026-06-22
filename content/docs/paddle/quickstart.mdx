@@ -1,0 +1,117 @@
+---
+title: Quickstart
+description: Install, configure, and make your first Paddle API call with Vortos.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Quickstart
+
+<Steps>
+
+<Step>
+
+## Register the package
+
+```php title="bootstrap/app.php"
+use Vortos\Paddle\DependencyInjection\PaddlePackage;
+
+$packages = [
+    new PaddlePackage(),
+];
+```
+
+</Step>
+
+<Step>
+
+## Run migrations
+
+```bash
+php bin/console vortos:migrate:run
+```
+
+This creates the outbox, idempotency, webhook idempotency, audit log, transactions, and subscriptions tables.
+
+</Step>
+
+<Step>
+
+## Create the config file
+
+```php title="config/paddle.php"
+<?php
+
+declare(strict_types=1);
+
+use Vortos\Paddle\DependencyInjection\VortosPaddleConfig;
+
+return static function (VortosPaddleConfig $config): void {
+    $config
+        ->mode($_ENV['PADDLE_MODE'] ?? 'sandbox')
+        ->apiKey($_ENV['PADDLE_API_KEY'] ?? '')
+        ->notificationSecret($_ENV['PADDLE_NOTIFICATION_SECRET'] ?? '')
+        ->webhookPath('/webhooks/paddle');
+};
+```
+
+</Step>
+
+<Step>
+
+## Set environment variables
+
+```bash title=".env"
+PADDLE_MODE=sandbox
+PADDLE_API_KEY=your_sandbox_api_key
+PADDLE_NOTIFICATION_SECRET=your_webhook_secret
+```
+
+</Step>
+
+<Step>
+
+## Make your first API call
+
+```php
+use Vortos\Paddle\Customer\Contract\StandaloneCustomerServiceInterface;
+use Vortos\Paddle\Customer\Operation\CreateCustomerRequest;
+
+final class RegisterUserHandler
+{
+    public function __construct(
+        private readonly UserRepository $users,
+        private readonly StandaloneCustomerServiceInterface $customers,
+    ) {}
+
+    public function handle(RegisterUser $command): void
+    {
+        $user = User::register($command->email);
+        $this->users->save($user);
+
+        $paddleId = $this->customers->create(new CreateCustomerRequest(
+            email: $command->email,
+            name:  $command->name,
+        ));
+
+        $user->assignPaddleCustomerId($paddleId);
+        $this->users->save($user);
+    }
+}
+```
+
+</Step>
+
+</Steps>
+
+<Callout type="info" title="Sandbox IPs are auto-allowed">
+When `PADDLE_MODE=sandbox`, the webhook controller automatically allows Paddle sandbox IPs. You do not need to call `allowSandboxIps(true)` manually.
+</Callout>
+
+## Next Steps
+
+- [Configure all options](/docs/paddle/configuration)
+- [Understand service tiers](/docs/paddle/services)
+- [Handle incoming webhooks](/docs/paddle/webhooks)
+- [Understand the outbox](/docs/paddle/outbox)

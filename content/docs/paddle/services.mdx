@@ -1,0 +1,125 @@
+---
+title: Services
+description: The three-tier Paddle service hierarchy — Immediate, Transactional, and Standalone.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Services
+
+Every Paddle domain exposes three service interfaces. The injected interface is the delivery guarantee.
+
+## Service Tiers
+
+### Transactional (`XxxServiceInterface`)
+
+Writes to the Paddle outbox inside the **currently active** database transaction. Use this inside command handlers where the unit of work owns the transaction.
+
+```php
+use Vortos\Paddle\Customer\Contract\CustomerServiceInterface;
+
+final class CreateOrderHandler
+{
+    public function __construct(
+        private readonly OrderRepository $orders,
+        private readonly CustomerServiceInterface $customers,
+    ) {}
+
+    public function handle(CreateOrder $command): void
+    {
+        $order = Order::create($command->customerId);
+        $this->orders->save($order);
+
+        // Queued to outbox — same transaction as $orders->save()
+        $this->customers->update($command->customerId, new UpdateCustomerRequest(
+            name: $command->billingName,
+        ));
+    }
+}
+```
+
+If the transaction rolls back, the outbox write rolls back too. The Paddle API is never called.
+
+### Standalone (`StandaloneXxxServiceInterface`)
+
+Wraps the outbox write in its **own short transaction**. Use in console commands, event listeners, or any context where no outer transaction exists.
+
+```php
+use Vortos\Paddle\Customer\Contract\StandaloneCustomerServiceInterface;
+
+final class SyncBillingDataCommand
+{
+    public function __construct(
+        private readonly StandaloneCustomerServiceInterface $customers,
+    ) {}
+
+    // Each call wraps itself — no outer transaction needed
+    public function sync(PaddleCustomerId $id, string $email): void
+    {
+        $this->customers->update($id, new UpdateCustomerRequest(email: $email));
+    }
+}
+```
+
+### Immediate (`ImmediateXxxServiceInterface`)
+
+Calls the Paddle API **directly** — no outbox, no transaction. Use for reads, diagnostics, or cases where you explicitly want synchronous delivery.
+
+```php
+use Vortos\Paddle\Customer\Contract\ImmediateCustomerServiceInterface;
+
+$customer = $this->customers->get(PaddleCustomerId::of($id));
+```
+
+<Callout type="warn" title="Immediate writes have no delivery guarantee">
+A failure between the Paddle API call and your database commit leaves the two systems in an inconsistent state. Prefer Transactional or Standalone for mutations.
+</Callout>
+
+## Available Domains
+
+| Domain | Transactional | Standalone | Immediate |
+|--------|---------------|------------|-----------|
+| Customer | `CustomerServiceInterface` | `StandaloneCustomerServiceInterface` | `ImmediateCustomerServiceInterface` |
+| Address | `AddressServiceInterface` | `StandaloneAddressServiceInterface` | `ImmediateAddressServiceInterface` |
+| Business | `BusinessServiceInterface` | `StandaloneBusinessServiceInterface` | `ImmediateBusinessServiceInterface` |
+| Transaction | `TransactionServiceInterface` | `StandaloneTransactionServiceInterface` | `ImmediateTransactionServiceInterface` |
+| Adjustment | `AdjustmentServiceInterface` | `StandaloneAdjustmentServiceInterface` | `ImmediateAdjustmentServiceInterface` |
+| Product | `ProductServiceInterface` | `StandaloneProductServiceInterface` | `ImmediateProductServiceInterface` |
+| Price | `PriceServiceInterface` | `StandalonePriceServiceInterface` | `ImmediatePriceServiceInterface` |
+| Discount | `DiscountServiceInterface` | `StandaloneDiscountServiceInterface` | `ImmediateDiscountServiceInterface` |
+| Subscription | `SubscriptionServiceInterface` | `StandaloneSubscriptionServiceInterface` | `ImmediateSubscriptionServiceInterface` |
+| Price Preview | — | — | `PricePreviewServiceInterface` |
+
+All interfaces live under `Vortos\Paddle\{Domain}\Contract\`.
+
+## Checkout and Portal
+
+Checkout and portal session services have no outbox tier — they are always immediate Paddle API calls:
+
+```php
+use Vortos\Paddle\Checkout\CheckoutService;
+use Vortos\Paddle\Checkout\PortalSessionService;
+```
+
+## Report Services
+
+```php
+use Vortos\Paddle\Report\ReportService;
+use Vortos\Paddle\Report\EventLogService;
+```
+
+## Value Objects
+
+All IDs use private constructors and require `::of()`:
+
+```php
+use Vortos\Paddle\ValueObject\PaddleCustomerId;
+use Vortos\Paddle\ValueObject\PaddleSubscriptionId;
+use Vortos\Paddle\ValueObject\PaddleTransactionId;
+use Vortos\Paddle\ValueObject\PaddleProductId;
+use Vortos\Paddle\ValueObject\PaddlePriceId;
+use Vortos\Paddle\ValueObject\PaddleDiscountId;
+
+$id = PaddleCustomerId::of('ctm_01abc123');
+echo $id->value; // ctm_01abc123
+```

@@ -1,6 +1,6 @@
 ---
 title: Doctrine ORM
-description: Zero-SQL aggregate persistence via Doctrine ORM — AggregateRoot, OrmWriteRepository, OrmUnitOfWork, metadata caching, and schema management.
+description: Zero-SQL aggregate persistence via Doctrine ORM — AggregateRoot, OrmStore, #[UsesOrmEntity], OrmUnitOfWork, metadata caching, and schema management.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -11,14 +11,14 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 ## When to Use ORM vs DBAL
 
-Both modules implement the same `WriteRepositoryInterface` and `UnitOfWorkInterface`. Choose based on your access patterns and team preferences.
+Both modules implement the same `UnitOfWorkInterface`. Your repository interfaces are pure domain contracts — no framework types, no `extends`. Choose based on your access patterns and team preferences.
 
 | | ORM | DBAL |
 |---|---|---|
 | SQL required | None — Doctrine generates it | Full control via QueryBuilder |
-| Aggregate mapping | Doctrine entity annotations | `toRow()` / `fromRow()` |
+| Aggregate mapping | Doctrine entity annotations | `toRow()` / `fromRow()` in a `DbalMapper` |
 | Schema management | `vortos:orm:diff` → `vortos:migrate` | Hand-written migrations + `vortos:migrate` |
-| Optimistic locking | `#[ORM\Version]` — Doctrine-managed | `version` column — base class managed |
+| Optimistic locking | `#[ORM\Version]` — Doctrine-managed | `version` column — store-managed |
 | Bulk operations | Not provided | `batchInsert`, `batchUpdate`, `batchUpsert` |
 | Custom queries | DQL or `createQueryBuilder()` | DBAL `createQueryBuilder()` |
 | Use when | Entity model fits cleanly, no heavy bulk writes | Full SQL control, bulk operations, complex projections |
@@ -118,23 +118,46 @@ Call `$this->incrementVersion()` inside your `create()` or factory method. Doctr
 
 ---
 
-## OrmWriteRepository
+## OrmStore and #[UsesOrmEntity]
 
-Extend `OrmWriteRepository` and implement one method: `entityClass()`. `findById()`, `save()`, and `delete()` are provided.
+ORM repositories use the same composition pattern as DBAL repositories. Annotate your repository with `#[UsesOrmEntity]` and declare an `OrmStore` constructor argument — the compiler pass creates and injects the store automatically.
 
 ```php title="src/User/Infrastructure/Repository/UserRepository.php"
-use Vortos\PersistenceOrm\Write\OrmWriteRepository;
+use Vortos\PersistenceOrm\Attribute\UsesOrmEntity;
+use Vortos\PersistenceOrm\Write\OrmStore;
 
-final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
+#[UsesOrmEntity(User::class)]
+final class UserRepository implements UserRepositoryInterface
 {
-    protected function entityClass(): string
+    public function __construct(private readonly OrmStore $store) {}
+
+    public function save(User $user): void
     {
-        return User::class;
+        $this->store->save($user);
+    }
+
+    public function delete(User $user): void
+    {
+        $this->store->delete($user);
+    }
+
+    public function findById(UserId $id): ?User
+    {
+        /** @var User|null */
+        return $this->store->find($id);
     }
 }
 ```
 
-No `toRow()`, no `fromRow()`, no column map. Doctrine handles serialisation from the entity's `#[ORM\Column]` annotations.
+No `extends`. No `entityClass()` method. The entity class is declared once in the attribute — the compiler pass wires an `OrmStore` configured for `User::class`.
+
+### Register
+
+```php title="config/services.php"
+$services->set(UserRepository::class);
+```
+
+`OrmRepositoryCompilerPass` detects `#[UsesOrmEntity]` at compile time and injects the configured store. No manual argument configuration needed.
 
 ### How save() and delete() Work
 
@@ -149,7 +172,7 @@ Both `save()` and `delete()` translate all infrastructure exceptions so applicat
 
 ### Exception Translation
 
-`OrmWriteRepository` translates every DBAL and Doctrine exception to a type in `Vortos\PersistenceOrm\Exception\`:
+`OrmStore` translates every DBAL and Doctrine exception to a type in `Vortos\PersistenceOrm\Exception\`:
 
 | DBAL exception | Vortos exception |
 |---|---|
@@ -182,25 +205,24 @@ For constraints you can cheaply check before writing (e.g. email uniqueness), pr
 
 | Method | Behaviour |
 |---|---|
-| `findById(AggregateId $id)` | `EntityManager::find()` — returns `null` if not found |
-| `save(AggregateRoot $aggregate)` | Detects new vs managed via `contains()`, persist + flush or flush only |
-| `delete(AggregateRoot $aggregate)` | Detects managed via `contains()`, falls back to `find()` if unmanaged, then `remove()` + `flush()` |
+| `store->find(AggregateId $id)` | `EntityManager::find()` — returns `null` if not found |
+| `store->save(AggregateRoot $aggregate)` | Detects new vs managed via `contains()`, persist + flush or flush only |
+| `store->delete(AggregateRoot $aggregate)` | Detects managed via `contains()`, falls back to `find()` if unmanaged, then `remove()` + `flush()` |
 
 ### Custom Queries
 
-For queries beyond `findById()`, use the protected `em()` accessor, which returns `EntityManagerInterface`. The underlying `EntityManager` field is `private` — subclasses must go through `em()`, never `$this->em`. This keeps the resolution strategy (lazy load, decoration, registry) an internal detail of the base class:
+For queries beyond `findById()`, use `$this->store->createQueryBuilder()` or `$this->store->createQuery()`. The EntityManager is fully encapsulated in the store:
 
 ```php
-final class UserRepository extends OrmWriteRepository implements UserRepositoryInterface
+#[UsesOrmEntity(User::class)]
+final class UserRepository implements UserRepositoryInterface
 {
-    protected function entityClass(): string
-    {
-        return User::class;
-    }
+    public function __construct(private readonly OrmStore $store) {}
 
     public function findByEmail(string $email): ?User
     {
-        return $this->em()->createQueryBuilder()
+        /** @var User|null */
+        return $this->store->createQueryBuilder()
             ->select('u')
             ->from(User::class, 'u')
             ->where('u.email = :email')
@@ -317,14 +339,14 @@ See [Running Migrations](/docs/migrations/running) for the full workflow includi
 
 ## Smart Stubs
 
-`vortos:make:entity` and `vortos:make:write-repository` auto-detect whether `vortos-persistence-orm` is installed and generate the correct base class — no flags needed.
+`vortos:make:entity` and `vortos:make:write-repository` auto-detect whether `vortos-persistence-orm` is installed and generate the correct pattern — no flags needed.
 
 ```bash
 # Generates User extending AggregateRoot (with #[ORM\Entity], #[ORM\Table], #[ORM\Id])
 php vortos vortos:make:entity User --context=User
 
-# Generates UserRepository extending OrmWriteRepository (with entityClass() only)
+# Generates UserRepository with #[UsesOrmEntity] and OrmStore injection
 php vortos vortos:make:write-repository User --context=User
 ```
 
-When ORM is detected, the command prints `[ORM]` next to the command name in the output. When only DBAL is installed, the standard `AggregateRoot` / `DbalWriteRepository` stubs are generated instead.
+When ORM is detected, the command prints `[ORM]` next to the command name in the output. When only DBAL is installed, the `#[UsesDbalMapper]` / `DbalStore` pattern is generated instead.

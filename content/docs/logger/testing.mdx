@@ -99,17 +99,17 @@ return static function (VortosLoggingConfig $config): void {
     );
 
     // Raise the minimum level for the app channel so only CRITICAL leaks through
-    $config->channel(LogChannel::App, Level::Critical);
+    $config->channel(LogChannel::App)->level(Level::Critical);
 };
 ```
 
 This keeps test output clean without requiring every test to inject a `NullLogger` manually.
 
 <Callout type="info" title="Buffer Flushing in Tests">
-If buffering is enabled (`$config->buffer(true)`), records are flushed at the end of the HTTP/console lifecycle — which does not happen in PHPUnit. Use `TestHandler` (which bypasses buffering) or disable buffering in the test config:
+Batched sinks flush via `FlushScheduler` at the end of the HTTP/console lifecycle and on a periodic timer — neither of which fires mid-test in PHPUnit. Use `TestHandler` (which bypasses buffering entirely) for assertions, or make a sink write-through in the test config:
 
 ```php
-$config->buffer(false);
+$config->sink(LogChannel::App->value)->writeThrough();
 ```
 </Callout>
 

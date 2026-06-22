@@ -105,53 +105,85 @@ return static function (VortosAuthConfig $config): void {
 
 ```php
 use Vortos\Auth\Identity\UserIdentity;
+use Vortos\Authorization\Contract\AuthorizationVersionStoreInterface;
 
 $identity = new UserIdentity(
     id: (string) $user->getId(),
     roles: $user->getRoles(),
-    attributes: [
-        'authz_version' => $currentAuthzVersion,
-    ],
 );
 
-$token = $this->jwtService->issue($identity);
+$token = $this->jwtService->issue(
+    $identity,
+    $this->versions->versionForUser($user->getId()),
+);
 
 return new JsonResponse($token->toArray());
 ```
+
+`authz_version` is passed as the second argument — not as an identity attribute. See [Authorization Version](/docs/auth/authorization-version) for why.
+
+## Custom identity attributes
+
+Any extra data you want readable on authenticated requests goes in the third `UserIdentity` constructor argument. It is serialized into the JWT under the `attrs` claim and available via `getAttribute()` everywhere.
+
+```php
+$identity = new UserIdentity(
+    id: $user->getId(),
+    roles: $user->getRoles(),
+    attributes: [
+        'organization_id' => $user->organizationId,
+        'plan'            => $user->plan,
+    ],
+);
+```
+
+After validation, anywhere in the request:
+
+```php
+$user->getAttribute('organization_id'); // 'org-abc'
+$user->getAttribute('plan');            // 'pro'
+$user->getAttribute('missing', 'free'); // 'free'
+```
+
+`getClaims()` controls what is serialized. By default `UserIdentity::getClaims()` returns all attributes. Override it in a custom identity class to exclude fields that should not be in the token.
 
 ## Validating tokens (every request)
 
 `AuthMiddleware` validates access tokens automatically on every main request. You usually do not call `validate()` directly unless building a custom flow.
 
 ```php
-// AuthMiddleware does this for you:
-$identity = $this->jwtService->validate($accessToken);
+// AuthMiddleware does this for you — returns ValidatedToken:
+$result   = $this->jwtService->validate($accessToken);
+$identity = $result->identity;      // UserIdentityInterface
+$version  = $result->authzVersion;  // int
 ```
 
-`JwtService::validate()` returns a `UserIdentity` with ID, roles, and remaining JWT claims as identity attributes.
+`validate()` returns a `ValidatedToken` value object, not a `UserIdentityInterface` directly. `AuthMiddleware` stores `$result->identity` in the request context and `$result->authzVersion` in the authz version slot.
 
 ## Refreshing tokens
 
 ```php
-// Validate old refresh token, revoke it, issue new pair
-$newToken = $this->jwtService->refresh($refreshToken, $identity);
+$newToken = $this->jwtService->refresh($refreshToken, $identity, $authzVersion);
 ```
 
 Token rotation: the old refresh token is revoked before the new pair is issued. A stolen refresh token cannot be reused after legitimate use.
 
-To refresh, first extract the user ID from the refresh token, load the current user and roles, then call `refresh()` with a fresh identity:
+To refresh, first extract the user ID from the refresh token, load the current user and roles, then call `refresh()` with a fresh identity and the current authz version:
 
 ```php
 $userId = $this->jwtService->getUserIdFromRefreshToken($refreshToken);
-$user = $this->users->get($userId);
+$user   = $this->users->get($userId);
 
 $identity = new UserIdentity(
     id: $userId,
     roles: $user->roles(),
-    attributes: ['authz_version' => $this->versions->versionForUser($userId)],
 );
 
-$newToken = $this->jwtService->refresh($refreshToken, $identity);
+$newToken = $this->jwtService->refresh(
+    $refreshToken,
+    $identity,
+    $this->versions->versionForUser($userId),
+);
 ```
 
 ## Logout
@@ -172,9 +204,15 @@ $this->jwtService->revokeAll($identity->id());
   "exp": 1234568790,
   "roles": ["ROLE_USER", "ROLE_ADMIN"],
   "authz_version": 4,
-  "type": "access"
+  "type": "access",
+  "attrs": {
+    "organization_id": "org-abc",
+    "plan": "pro"
+  }
 }
 ```
+
+`attrs` is omitted entirely when there are no custom attributes.
 
 **Refresh token:**
 ```json
@@ -188,7 +226,7 @@ $this->jwtService->revokeAll($identity->id());
 }
 ```
 
-`authz_version` is used by the authorization module to reject stale access tokens after role changes.
+`authz_version` is a framework-owned top-level claim. It is passed explicitly to `issue()` and `refresh()` — not stored as an identity attribute. The authorization module reads it through its own internal path (`RequestAuthzVersionProvider`) independently of identity attributes.
 
 ## Expected failures
 
