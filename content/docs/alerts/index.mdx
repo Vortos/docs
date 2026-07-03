@@ -1,0 +1,193 @@
+---
+title: Alerts
+description: Alert dedupe, flap damping, escalation with quiet hours and on-call rotation, SSRF-hardened webhook delivery, and acknowledgement.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Alerts
+
+`vortos-alerts` is the framework's paging layer — the thing that turns "something is wrong" signals from [Health](/docs/health-checks), [Backup](/docs/backup), [Deploy](/docs/deploy), and your own rules into an actual notification, sent to the right channel, to the right person, without flooding anyone the moment a flaky check starts flapping.
+
+<Callout type="info" title="A notifier outage must never block the system it's monitoring">
+`NotifierInterface::notify()` is contractually forbidden from throwing into the dispatcher. A failed delivery comes back as `NotificationResult::failed()`, and `OutboxNotifier` handles retry and fallback from there. Whatever you're monitoring keeps running even if every notification channel is down.
+</Callout>
+
+## Dedupe — one incident, one notification
+
+Without dedupe, a flapping health check or a burst of identical errors pages someone once per occurrence. `Dedupe` groups alert events by a stable `Fingerprint` and tracks an `AlertState` (open, resolved) per fingerprint — the same underlying problem firing repeatedly inside a dedupe window produces exactly one notification, not one per event.
+
+## Flap damping
+
+A signal that flips open → resolved → open rapidly (a database connection that drops for two seconds every few minutes, say) is the specific failure mode dedupe alone doesn't solve — each re-open after a resolve is a *new* incident from dedupe's perspective. `FlapDamper` exists for exactly this:
+
+```php
+$outcome = $flapDamper->recordTransition($state, now: new \DateTimeImmutable(), window: $dedupeWindow);
+
+$outcome->shouldEscalate; // true exactly once — the first time the flap threshold is crossed
+$outcome->isDamped;       // true on every subsequent flap within the same window
+```
+
+After more than `maxTransitions` open→resolve→open cycles within a window, the *first* crossing notifies once ("this is flapping"), and every cycle after that within the same window is silently damped — not because the problem stopped, but because you already know about it and another page adds nothing.
+
+## Escalation
+
+`EscalationEngine::tick()` is a pure function of `(event, state, ack, active silences, now)` — every escalation timer is deterministically testable because time is always an explicit input, never read from the system clock inside the engine itself.
+
+```php
+[$decision, $state] = $engine->start($event, now: new \DateTimeImmutable());
+// decision is EscalationDecision::notify(tier: 0, reason: 'initial page')
+//          or  EscalationDecision::suppress(...) if quiet hours / a silence applies
+```
+
+Escalation respects two suppression mechanisms before ever paging:
+
+- **Quiet hours** (`QuietHoursPolicy`) — configured windows where non-critical alerts don't page a human; they still get recorded, just not delivered urgently.
+- **Maintenance silences** (`MaintenanceSilence`) — an explicit, time-boxed "we know, don't page" declared ahead of planned work.
+
+If neither applies, the engine consults `OnCallRotation` to decide who tier 0 actually pages, and escalates to the next tier if nobody acknowledges within the policy's window.
+
+## Acknowledgement
+
+```bash
+php bin/console vortos:alerts:ack <fingerprint> --by=alice
+```
+
+An acknowledgement halts escalation for that fingerprint — `AckTokenSigner` issues a signed token so a one-click "acknowledge" link in a notification (Slack, email) can ack without requiring the responder to be logged into anything; the signature is what prevents a guessed or forged ack token from silencing someone else's incident.
+
+## Silencing for planned maintenance
+
+```bash
+php bin/console vortos:alerts:silence --rule=database-latency --duration=2h --reason="planned failover test"
+```
+
+A silence is explicit and time-boxed — it expires automatically, so a silence someone forgot to lift doesn't quietly suppress a real incident weeks later.
+
+## Notifiers and the SSRF-hardened webhook
+
+`NotifierInterface` is the [Ops Kit](/docs/ops-kit) port. Shipped drivers: `slack`, `telegram`, `ses` (email), and a generic `webhook` for anything else.
+
+The generic webhook driver is the one that needs the most care — it sends to a URL an operator configures, which means it needs to refuse to be turned into an internal network probe. `SsrfGuard` is the single place this validation lives:
+
+- **Scheme** — only `https` is allowed outside local development.
+- **Address ranges** — every private, link-local, loopback, multicast, and cloud-metadata range is denied, including `169.254.169.254` (the address that serves cloud instance credentials on AWS/GCP/Azure) and IPv6 equivalents (ULA, link-local).
+- **Redirects** — disabled at the HTTP transport layer entirely, not just checked once at the start. `SsrfGuard` validates the *declared* destination; redirect-following is turned off so a benign-looking URL can't 302 its way to an internal address after the check passes.
+
+```php
+$guard = new SsrfGuard();
+$guard->assertSafe('https://hooks.example.com/webhook'); // fine
+$guard->assertSafe('http://169.254.169.254/latest/meta-data/'); // throws SsrfViolationException
+```
+
+<Callout type="warn" title="This exists because webhook URLs are operator input">
+A webhook notifier's destination is configuration, set by whoever administers your alerting — not a hardcoded, trusted value. Treat it the same way you'd treat any other user-supplied URL: validate before you fetch.
+</Callout>
+
+## Outbound rate limiting
+
+`SlidingWindowOutboundRateLimiter` caps how many notifications can go out to a channel in a window, independent of dedupe and escalation — a defense against a misconfigured rule or a runaway loop generating thousands of distinct fingerprints, each individually deduped but collectively still capable of hammering a Slack channel or an SMS gateway into rate-limit hell on the receiving end.
+
+## Rules
+
+`AlertRule` pairs a condition with a severity and routing target. Conditions are pluggable:
+
+| Condition | Evaluates |
+|---|---|
+| `ThresholdCondition` | A numeric sample crossing a threshold |
+| `ResourceCondition` | A resource-usage sample (disk, memory, connection pool) |
+| `CertExpiryCondition` | A TLS certificate's remaining validity window |
+| `SloBurnCondition` | An SLO error-budget burn rate |
+| `NoCondition` | Always fires — for manual or always-on rules |
+
+Declare your rules in `config/alerts.php` — a list of `AlertRule` (or a closure returning one). This is loaded by `AlertRuleSetFactory`; you no longer override the `AlertRuleSet` service definition. Without the file the rule set is empty and alerting does nothing.
+
+```php title="config/alerts.php"
+use Vortos\Alerts\Rule\AlertRule;
+use Vortos\Alerts\Rule\AlertRuleKind;
+use Vortos\Alerts\Severity;
+
+return [
+    new AlertRule(
+        id: 'db-latency',
+        severity: Severity::Warning,
+        kind: AlertRuleKind::Threshold,
+        condition: $latencyCondition,
+        forDuration: 120,
+    ),
+];
+```
+
+```bash
+# validate rule definitions before deploying them
+php bin/console vortos:alerts:rules:validate
+
+# send a synthetic test alert through the full pipeline (dedupe, routing, delivery)
+php bin/console vortos:alerts:test --rule=database-latency
+```
+
+## Integrations
+
+Alerts wires into other packages as event sinks rather than the other way around, so those packages never depend on Alerts directly:
+
+| Source | What triggers an alert |
+|---|---|
+| [Health](/docs/health-checks) | `HealthProbeAlertSource`, `CapacityAlertSource`, `CertExpiryAlertSource`, `SyntheticUptimeAlertSource` |
+| [Backup](/docs/backup) | `BackupEventAlertSink` — a failed backup or failed restore drill |
+| [Deploy](/docs/deploy) | `DeployAuditAlertSink` — deploy and rollback audit events |
+| SLO burn rate | `SloBurnAlertSource`, via a pluggable `SloBurnRateProviderInterface` |
+
+## CLI
+
+```bash
+php bin/console vortos:alerts:drain              # flush queued outbox deliveries
+php bin/console vortos:alerts:ack <fp> --by=me   # acknowledge an open alert
+php bin/console vortos:alerts:silence --rule=... --duration=2h
+php bin/console vortos:alerts:rotation:show       # who is currently on call
+php bin/console vortos:alerts:rules:validate
+php bin/console vortos:alerts:test --rule=...
+```
+
+## Step-by-step: wiring a Slack channel
+
+<Steps>
+<Step>
+Configure the notifier and a channel:
+
+```php title="config/alerts.php"
+use Vortos\Alerts\DependencyInjection\VortosAlertsConfig;
+
+return static function (VortosAlertsConfig $config): void {
+    $config->channel('ops')
+        ->notifier('slack')
+        ->webhookUrl($_ENV['SLACK_OPS_WEBHOOK']);
+};
+```
+</Step>
+
+<Step>
+Define a rule routing to it:
+
+```php
+$config->rule('database-latency')
+    ->condition(new ThresholdCondition(metric: 'db.p99_ms', operator: ThresholdOperator::GreaterThan, value: 500))
+    ->severity(Severity::Critical)
+    ->route('ops');
+```
+</Step>
+
+<Step>
+Validate and test before relying on it:
+
+```bash
+php bin/console vortos:alerts:rules:validate
+php bin/console vortos:alerts:test --rule=database-latency
+```
+</Step>
+</Steps>
+
+<Cards>
+  <Card title="Health Checks" href="/docs/health-checks" description="The probe and uptime sources that feed alerts most directly." />
+  <Card title="Backup" href="/docs/backup" description="Drill and backup failure events route through Alerts automatically." />
+</Cards>

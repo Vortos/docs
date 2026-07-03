@@ -5,6 +5,7 @@
     "module-schema-providers",
     "running",
     "status-and-drift",
+    "safety",
     "adopting-existing-schema",
     "production"
   ]

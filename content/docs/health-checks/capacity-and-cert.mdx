@@ -1,0 +1,86 @@
+---
+title: Capacity & Certificate Probes
+description: Tri-state disk, memory, and CPU capacity probes that drain a node before it dies, and graduated TLS certificate expiry warnings.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Capacity & Certificate Probes
+
+These probes exist to catch two specific failure modes that traditional liveness checks miss entirely: a node that's still technically running but is about to run out of disk, and a certificate that's about to expire on a schedule nobody's watching.
+
+## Capacity probes
+
+`AbstractCapacityProbe` defines a tri-state response: below `warnPct` is healthy, between `warnPct` and `criticalPct` degrades readiness (the node stops receiving new traffic but keeps running), and at or above `criticalPct` fails outright.
+
+```php
+final class DiskCapacityProbe extends AbstractCapacityProbe
+{
+    public function __construct(
+        CapacityReaderInterface $reader,
+        string $path = '/',
+        float $warnPct = 85.0,
+        float $criticalPct = 95.0,
+    ) {}
+}
+```
+
+```bash
+curl http://localhost:8000/health/ready
+```
+
+```json
+{
+  "status": "degraded",
+  "checks": {
+    "disk-capacity": { "status": "warn", "used_pct": 87.3 }
+  }
+}
+```
+
+Three drivers ship: `DiskCapacityProbe`, `MemoryCapacityProbe`, and `CpuLoadProbe` — all reading through `CapacityReaderInterface`, with `ProcCapacityReader` as the real `/proc`-backed implementation and `InMemoryCapacityReader` for tests.
+
+<Callout type="info" title="Readiness-only, by design">
+Every capacity probe declares `ProbeKind::Readiness` — never liveness. High disk usage means "don't send this node new work," not "kill the process." Putting a capacity check on the liveness path would mean a container platform restarting a node that's perfectly capable of finishing its in-flight requests, just running low on a resource — restarting it doesn't free that resource any faster and adds a recovery storm on top.
+</Callout>
+
+```
+< warnPct           → ProbeStatus::Pass
+[warnPct, criticalPct) → ProbeStatus::Warn   — drains the node from the load balancer
+>= criticalPct       → ProbeStatus::Fail   — out of rotation entirely
+```
+
+`warnPct` must be strictly less than `criticalPct`, both must be in `(0, 100]` — enforced at construction. An unreadable capacity value (the `/proc` read fails) reports `Warn` with `capacity_unreadable` rather than `Pass` — an unknown reading is never silently treated as "fine."
+
+## Certificate expiry probe
+
+`CertExpiryProbe` inspects a live TLS connection's certificate and reports based on days remaining until expiry:
+
+```php
+new CertExpiryProbe(
+    inspector: new StreamCertInspector(),
+    host: 'api.example.com',
+    port: 443,
+    thresholds: new CertExpiryThresholds(warnDays: 14, secondWarnDays: 7, criticalDays: 1),
+);
+```
+
+```php
+final readonly class CertExpiryThresholds
+{
+    public function statusFor(int $daysUntilExpiry): ProbeStatus
+    {
+        if ($daysUntilExpiry <= $this->criticalDays) return ProbeStatus::Fail;
+        if ($daysUntilExpiry <= $this->warnDays) return ProbeStatus::Warn;
+        return ProbeStatus::Pass;
+    }
+}
+```
+
+The thresholds are graduated deliberately: a 14-day warning is meant to be the first nudge to renew, not an emergency. Only the final day before expiry escalates to `Fail` — certificate renewal is a routine, proactive task, and these thresholds are built so it stays one. Construction enforces `criticalDays < secondWarnDays < warnDays`, so a misconfigured threshold set (e.g. a critical window longer than the warning window) fails immediately rather than producing a confusing alert ordering later.
+
+`StreamCertInspector` performs the actual TLS handshake and certificate read; `InMemoryCertInspector` is the test double for exercising threshold logic without a real socket.
+
+<Callout type="warn" title="A cert probe is readiness, not a substitute for renewal automation">
+This probe tells you a certificate is about to expire — it doesn't renew it. Pair it with automated renewal (ACME/Let's Encrypt, your CA's API) and treat the warning state as a backstop that fires only if automated renewal has already failed.
+</Callout>

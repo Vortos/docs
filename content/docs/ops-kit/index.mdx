@@ -1,0 +1,193 @@
+---
+title: Ops Kit
+description: The swappable-driver pattern shared by every Vortos operations concern — ports, drivers, capabilities, and registries with zero runtime reflection.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+
+# Ops Kit
+
+`vortos-ops-kit` is not a feature you configure — it's the pattern every other operations package is built from. Deploy, Health, Backup, Secrets, Alerts, Observability, Analytics, Migration, and IaC all need the same thing: a way to swap a concrete provider (Kubernetes vs. SSH+Compose, PostHog vs. a no-op, S3 vs. local disk) without leaking that provider's vocabulary into the core engine. Ops Kit is that mechanism, written once and reused nine times.
+
+<Callout type="info" title="Why this exists">
+Early in the deploy/CI-CD build, every concern reinvented its own "driver" concept slightly differently — some used interfaces, some used string `match()` blocks, some had no capability negotiation at all. Ops Kit collapses all of that into one pattern so a driver written for Deploy looks and behaves like a driver written for Backup.
+</Callout>
+
+## The five pieces
+
+Every concern that adopts Ops Kit ends up with the same five things:
+
+| Piece | What it is | Example |
+|---|---|---|
+| **Port** | An interface extending `DriverInterface` — the stable contract the concern's core code depends on | `DeployTargetInterface` |
+| **Driver** | A concrete implementation of a port, tagged `#[AsDriver(key: '...')]` | `SshComposeDriver` |
+| **Registry** | A lazy key→driver lookup, built at compile time | `DeployTargetRegistry` |
+| **Capability** | A backed enum the driver uses to honestly declare what it supports | `DeployCapability::RollingAcrossNodes` |
+| **TCK** | A reusable PHPUnit test suite every driver of that port must pass | `DeployTargetConformanceTestCase` |
+
+The core code for a concern (say, the deploy planner) only ever talks to the port and the registry. It never knows whether the driver underneath is talking to Kubernetes, a bare VPS over SSH, or a test double — and it never imports a provider's SDK.
+
+## Why drivers, not `if`/`match`
+
+A `match ($provider) { 'k8s' => ..., 'ssh' => ... }` block works until you need to ship a driver out-of-tree (a third party publishing a Kubernetes driver as a separate Composer package) or until two drivers support different subsets of behavior. Ops Kit solves both:
+
+- **Out-of-tree drivers** — a driver is just a class with `#[AsDriver]` and `setAutoconfigured(true)` in its own package's DI extension. The core's compiler pass discovers it automatically; no registration step, no enum to edit. See [Deploy Kubernetes Target](/docs/deploy/k8s) for a real example.
+- **Partial support, declared honestly** — a driver that can't do rolling restarts across multiple nodes says so via its `CapabilityDescriptor`, and the framework refuses to select that driver for a strategy that requires it — at config time, not at 3am during an incident.
+
+## Architecture
+
+```
+composer.json (extra.vortos.package)
+    │
+    ▼
+PackageInterface::build()
+    └── CollectDriversCompilerPass::register()
+            │
+            ▼ (priority -32, after all tags exist)
+    Scans services tagged `vortos.<concern>.driver`
+    Reads #[AsDriver(key: '...')] via compile-time reflection
+    Validates: lower-kebab key, no duplicates, class exists
+            │
+            ▼
+    Injects key → Reference map into a Symfony ServiceLocator
+            │
+            ▼
+TaggedDriverRegistry::get('ssh-compose')   ← O(1) lookup, lazy instantiation, zero reflection
+```
+
+Nothing here costs anything at runtime beyond a single array lookup. All the validation — key format, duplicate keys, missing classes — happens once, when the container compiles.
+
+## Defining a port
+
+A port is an interface that extends `Vortos\OpsKit\Driver\DriverInterface`, which itself requires only one method:
+
+```php
+namespace Vortos\OpsKit\Driver;
+
+interface DriverInterface
+{
+    public function capabilities(): CapabilityDescriptor;
+}
+```
+
+Your concern's port adds whatever operations it actually needs:
+
+```php
+namespace App\Deploy\Target;
+
+use Vortos\OpsKit\Driver\DriverInterface;
+
+interface DeployTargetInterface extends DriverInterface
+{
+    public function deploy(DeployPlan $plan): DeployResult;
+}
+```
+
+## Writing a driver
+
+```php title="src/Deploy/Target/SshCompose/SshComposeDriver.php"
+namespace App\Deploy\Target\SshCompose;
+
+use App\Deploy\Target\DeployTargetInterface;
+use Vortos\OpsKit\Attribute\AsDriver;
+use Vortos\OpsKit\Driver\Capability\CapabilityDescriptor;
+
+#[AsDriver(key: 'ssh-compose')]
+final class SshComposeDriver implements DeployTargetInterface
+{
+    public function capabilities(): CapabilityDescriptor
+    {
+        return CapabilityDescriptor::create(capabilities: [
+            'rolling_across_nodes' => false,
+            'zero_downtime_cutover' => true,
+        ]);
+    }
+
+    public function deploy(DeployPlan $plan): DeployResult
+    {
+        // ...
+    }
+}
+```
+
+The `key` must be lower-kebab (`^[a-z][a-z0-9-]*$`) — this is enforced at compile time, not as a runtime assertion. No registration step is needed beyond the attribute: `registerForAutoconfiguration()` in the concern's DI extension tags every class implementing the port, and the compiler pass picks it up from there.
+
+<Callout type="warn" title="Never silently no-op">
+If an operation isn't supported, throw `UnsupportedCapabilityException`, don't quietly skip it. A driver that pretends to support something it doesn't is worse than one that fails loudly — the [TCK](/docs/ops-kit/testing) enforces this for every driver automatically.
+</Callout>
+
+## Capabilities
+
+`CapabilityDescriptor` is how a driver tells the framework what it can actually do, and `RequiredCapabilities` is how a strategy or config choice states what it needs. The two are reconciled by `CapabilityValidator::assertSatisfies()`:
+
+```php
+use Vortos\OpsKit\Driver\Capability\CapabilityValidator;
+use Vortos\OpsKit\Driver\Capability\RequiredCapabilities;
+
+CapabilityValidator::assertSatisfies(
+    driverKey: 'ssh-compose',
+    concern: 'deploy-target',
+    descriptor: $driver->capabilities(),
+    required: RequiredCapabilities::of(['rolling_across_nodes']),
+);
+```
+
+If the driver doesn't support `rolling_across_nodes`, this throws `CapabilityMismatchException` with a message naming exactly what's missing — at the point you select the strategy, not mid-deploy.
+
+Capability keys for a concern are usually a backed enum implementing `CapabilityKey`:
+
+```php
+enum DeployCapability: string implements CapabilityKey
+{
+    case RollingAcrossNodes = 'rolling_across_nodes';
+    case ZeroDowntimeCutover = 'zero_downtime_cutover';
+
+    public function key(): string
+    {
+        return $this->value;
+    }
+}
+```
+
+## Resolving a driver
+
+```php
+use App\Deploy\Target\DeployTargetRegistry;
+
+final class DeployPlanner
+{
+    public function __construct(private DeployTargetRegistry $targets) {}
+
+    public function run(string $targetKey, DeployPlan $plan): DeployResult
+    {
+        return $this->targets->get($targetKey)->deploy($plan);
+    }
+}
+```
+
+`get()` throws `UnknownDriverException` for an unrecognized key, and the exception message lists every key that *is* registered — useful when a driver package isn't installed yet.
+
+## Building a new concern
+
+If you're adding a new swappable concern to your own application (not one of the shipped packages), wire the three compile-time pieces:
+
+<Cards>
+  <Card title="make:driver" href="/docs/ops-kit/make-driver" description="Scaffold a port, driver, conformance test, and optional split package with one command." />
+  <Card title="Testing & the TCK" href="/docs/ops-kit/testing" description="The conformance test suite every driver inherits, and the agnosticism lint that keeps provider names out of core code." />
+</Cards>
+
+## Where Ops Kit is used
+
+| Concern | Package | Drivers shipped |
+|---|---|---|
+| Deploy target | [Deploy](/docs/deploy) | `ssh-compose`, `k8s` ([DeployK8s](/docs/deploy/k8s)) |
+| Health probe / uptime monitor | [Health](/docs/health-checks) | in-core `betterstack` |
+| Backup target / store | [Backup](/docs/backup) | S3-compatible, local disk |
+| Secrets provider / key provider | [Secrets](/docs/secrets) | env, file, age |
+| Notifier | [Alerts](/docs/alerts) | webhook (SSRF-hardened) |
+| Metrics sink / error sink | [Observability](/docs/observability) | OTLP, Sentry |
+| Analytics | [Analytics](/docs/analytics) | PostHog ([AnalyticsPosthog](/docs/analytics/posthog)) |
+| IaC engine | [IaC](/docs/iac) | Terraform |
+
+Each of these packages documents its own drivers under its own section — Ops Kit is the shared machinery underneath, not something you configure directly unless you're authoring a new driver.

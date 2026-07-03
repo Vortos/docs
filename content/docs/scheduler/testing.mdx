@@ -1,0 +1,265 @@
+---
+title: Testing
+description: Test utilities, fakes, conformance test cases, and how to write tests for code that uses the scheduler.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing
+
+The scheduler ships with a full set of testing utilities in the `Vortos\Scheduler\Testing` namespace. You should never need to mock scheduler internals in your tests — use these instead.
+
+## In-memory stores
+
+For unit and integration tests, use the in-memory store implementations:
+
+```php
+use Vortos\Scheduler\Testing\InMemoryScheduleStore;
+use Vortos\Scheduler\Testing\InMemoryScheduleStatusOverrideStore;
+use Vortos\Scheduler\Lease\Driver\InMemoryLeaseStore;
+
+$scheduleStore  = new InMemoryScheduleStore();
+$overrideStore  = new InMemoryScheduleStatusOverrideStore();
+$leaseStore     = new InMemoryLeaseStore($clock);
+```
+
+These implement the same interfaces as the production DBAL implementations, but store everything in memory. Tests using these are fast, parallel-safe, and require no database.
+
+`InMemoryScheduleStore` has a `seed()` method for pre-populating schedules:
+
+```php
+$store = new InMemoryScheduleStore();
+$store->seed($schedule1);
+$store->seed($schedule2);
+```
+
+## Mutable clock
+
+The `MutableClock` lets you control time in tests:
+
+```php
+use Vortos\Scheduler\Clock\MutableClock;
+
+$clock = new MutableClock(new DateTimeImmutable('2026-07-01T10:00:00Z', new DateTimeZone('UTC')));
+
+// Advance time by 3600 seconds (1 hour)
+$clock->advanceSeconds(3600);
+
+// Set to a specific moment
+$clock->setNow(new DateTimeImmutable('2026-07-02T00:00:00Z', new DateTimeZone('UTC')));
+```
+
+Always use `new DateTimeImmutable('now', new DateTimeZone('UTC'))` as the initial value for tests that interact with real infrastructure (SQL stores, lease stores). Using a fixed past date means your lease TTL calculations will be relative to a time in the past, which can cause the database's `NOW()` to disagree with your clock.
+
+## Recording doubles
+
+`RecordingSchedulerEnqueuer` captures all enqueue calls without actually sending anything:
+
+```php
+use Vortos\Scheduler\Testing\RecordingSchedulerEnqueuer;
+
+$enqueuer = new RecordingSchedulerEnqueuer();
+
+// ... run the daemon ...
+
+$enqueuer->assertEnqueuedOnce($scheduleId, $expectedSlot);
+$enqueuer->assertNotEnqueued($scheduleId);
+$enqueuer->getEnqueued(); // array of [ScheduledFire, Schedule] pairs
+```
+
+`RecordingSchedulerMetrics` records all metric calls:
+
+```php
+use Vortos\Scheduler\Testing\RecordingSchedulerMetrics;
+
+$metrics = new RecordingSchedulerMetrics();
+
+// ... run the daemon ...
+
+$metrics->assertFiredCount(2);
+$metrics->assertSkippedCount(1);
+$metrics->assertCircuitOpenCount(0);
+```
+
+`SpySchedulerAuditProjector` records all audit entries:
+
+```php
+use Vortos\Scheduler\Testing\SpySchedulerAuditProjector;
+
+$spy = new SpySchedulerAuditProjector();
+
+// ... run the daemon ...
+
+$spy->assertRecorded(SchedulerAuditEvent::SlotDispatched, scheduleId: $id);
+$spy->assertRecordCount(3);
+$spy->getRecorded(); // array of SchedulerAuditEntry
+```
+
+## Fake dispatcher
+
+`FakeFireDispatcherPort` records dispatches without doing any work:
+
+```php
+use Vortos\Scheduler\Testing\FakeFireDispatcherPort;
+
+$dispatcher = new FakeFireDispatcherPort();
+
+// Pre-configure results by schedule ID
+$dispatcher->willReturn($scheduleId, FireDispatchResult::Dispatched);
+$dispatcher->willThrow($scheduleId, new FireDispatchException($fire, 'simulated failure'));
+
+// After running:
+$dispatcher->assertDispatchedCount(2);
+$dispatcher->assertDispatched($scheduleId);
+```
+
+## Fake schedule policy
+
+`FakeSchedulePolicy` allows all operations by default. Use it in tests where RBAC is not under test:
+
+```php
+use Vortos\Scheduler\Testing\FakeSchedulePolicy;
+
+$policy = new FakeSchedulePolicy();
+// Now deny specific operations:
+$policy->denyCreate();
+$policy->requireFourEyesFor('delete');
+```
+
+## Writing a daemon integration test
+
+To test the full dispatch path without real infrastructure:
+
+```php
+final class DaemonIntegrationTest extends TestCase
+{
+    public function test_daemon_dispatches_due_schedule(): void
+    {
+        $clock      = new MutableClock(new DateTimeImmutable('2026-07-01T10:00:00Z', new DateTimeZone('UTC')));
+        $store      = new InMemoryScheduleStore();
+        $lease      = new InMemoryLeaseStore($clock);
+        $enqueuer   = new RecordingSchedulerEnqueuer();
+
+        $schedule = new Schedule(
+            id:       ScheduleId::generate(),
+            name:     'test-schedule',
+            source:   ScheduleSource::Dynamic,
+            trigger:  new IntervalTrigger(3600),
+            command:  new CommandSpec(MyTestCommand::class),
+            misfire:  MisfirePolicy::skipMissed(),
+            overlap:  OverlapPolicy::AllowConcurrent,
+            timezone: new DateTimeZone('UTC'),
+            jitter:   null,
+            status:   ScheduleStatus::Active,
+            tenantId: null,
+        );
+
+        $store->seed($schedule);
+
+        $resolver = new ScheduleResolver(
+            new StaticScheduleRegistry([]),
+            $store,
+            new InMemoryScheduleStatusOverrideStore(),
+        );
+
+        $runStore   = new InMemoryScheduleRunStore();
+        $dispatcher = new FireDispatcher(
+            $runStore,
+            $enqueuer,
+            // no real DB needed — use in-memory variants
+        );
+
+        $daemon = new SchedulerDaemon(
+            leasePort:                $lease,
+            scheduleResolver:         $resolver,
+            runStore:                 $runStore,
+            dueScan:                  new DueScan(new MisfireResolver(new SlotCalculator()), 86400),
+            fireDispatcher:           $dispatcher,
+            clock:                    $clock,
+            logger:                   new NullLogger(),
+            shardCount:               1,
+            leaseTtlSec:              30,
+            maxIdleSec:               60,
+            tenantMaxConcurrentFires: 0,
+        );
+
+        // Advance time so the schedule is due
+        $clock->advanceSeconds(3600);
+
+        $daemon->runOnce();
+
+        $enqueuer->assertEnqueuedOnce($schedule->id, /* expected slot */);
+    }
+}
+```
+
+## Conformance test cases
+
+If you implement a custom `LeasePort`, `ScheduleStoreInterface`, or `ScheduleRunStoreInterface`, the package ships conformance test cases you extend:
+
+```php
+use Vortos\Scheduler\Testing\LeasePortConformanceTestCase;
+use Vortos\Scheduler\Testing\ScheduleStoreConformanceTestCase;
+use Vortos\Scheduler\Testing\ScheduleRunStoreConformanceTestCase;
+use Vortos\Scheduler\Testing\ScheduleStatusOverrideStoreConformanceTestCase;
+```
+
+Each test case runs a comprehensive suite of scenarios. All scenarios must pass for your implementation to be correct.
+
+See [Extending](/docs/scheduler/extending) for a full example of extending `LeasePortConformanceTestCase`.
+
+## Fuzz, soak, and chaos suites
+
+The package ships three additional test suites for pre-release validation. These are not in the default CI run — they are intentionally slow or resource-intensive.
+
+Run them inside the Docker backend container:
+
+```bash
+# Fuzz: generate edge-case inputs for cron/interval parsers
+docker compose exec backend php vendor/bin/phpunit --group=fuzz --testsuite=Scheduler
+
+# Soak: run the daemon under sustained load for N iterations
+docker compose exec backend php vendor/bin/phpunit --group=soak --testsuite=Scheduler
+
+# Chaos: inject transient failures, lease losses, and cascade errors
+docker compose exec backend php vendor/bin/phpunit --group=chaos --testsuite=Scheduler
+```
+
+### Fuzz tests
+
+`ScheduleExpressionFuzzTest` generates large corpora of cron expressions and interval values, verifying that:
+- Valid inputs are always accepted
+- Invalid inputs always throw the expected exception (never silently produce wrong results)
+- Edge cases (end-of-month days, leap years, DST transitions) are handled correctly
+
+### Soak tests
+
+`SchedulerSoakTest` runs the daemon for many ticks against a large set of schedules and verifies:
+- No memory leaks (RSS growth is bounded)
+- No slot is ever enqueued twice
+- Throughput stays above the minimum threshold
+- Lease renewals succeed throughout
+
+### Chaos tests
+
+`SchedulerChaosTest` injects failures and verifies recovery:
+
+| Test | Failure injected |
+|---|---|
+| C1 | Transient dispatch failures — daemon recovers |
+| C2 | Circuit breaker opens under sustained backend failure |
+| C3 | One tenant's dispatcher fails — other tenants still fire |
+| C4 | Same slot attempted twice — only dispatched once |
+| C5 | Lease expires mid-tick — daemon re-acquires and continues |
+
+These tests use anonymous class dispatchers and `MutableClock` to simulate failures deterministically.
+
+## Benchmark suite
+
+`SchedulerBenchmark` in `Tests/Bench/SchedulerBenchmark.php` uses [phpbench](https://phpbench.readthedocs.io/):
+
+```bash
+docker compose exec backend vendor/bin/phpbench run packages/Vortos/src/Scheduler/Tests/Bench/ --report=default
+```
+
+Benchmarks cover: single-shard scan throughput, slot calculation performance, and resolver cache hit/miss ratios. Use these as a baseline before making changes to the engine hot path.

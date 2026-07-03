@@ -1,0 +1,269 @@
+---
+title: Running the Scheduler
+description: Starting the daemon, CLI commands reference, supervisor and Docker Compose configuration.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Running the Scheduler
+
+## Two processes: daemon and consumer
+
+The scheduler needs **two** long-lived processes running at all times, not one:
+
+- **`scheduler:run`** (the daemon) scans for due schedules, claims slots, and writes them into `vortos_scheduler_fire_queue`. It does not execute anything itself.
+- **`scheduler:consume`** (the consumer) drains that queue and actually dispatches each command through the CQRS `CommandBus`.
+
+If you only run the daemon, schedules appear to fire — ledger rows and fire-queue rows accumulate — but nothing ever executes. `scheduler:doctor` check **C11** exists specifically to catch this: a fire-queue consumer that isn't running shows up as a stale, growing `pending` backlog. See [Retention → Two processes, not one](/docs/scheduler/retention#two-processes-not-one) for the full explanation.
+
+Start both:
+
+```bash
+php vortos scheduler:run
+php vortos scheduler:consume --loop
+```
+
+With a specific shard for the daemon (advanced — see [Production](/docs/scheduler/production)):
+
+```bash
+php vortos scheduler:run --shard=0
+```
+
+The daemon will:
+1. Acquire the distributed lease for this shard
+2. Scan all active schedules for due slots
+3. Atomically claim and enqueue any due slots
+4. Sleep for `SCHEDULER_MAX_IDLE_SEC` (default: 60 seconds)
+5. Repeat
+
+The consumer will:
+1. Claim a batch of `pending` fire-queue rows (`FOR UPDATE SKIP LOCKED` on Postgres — safe to run multiple replicas; single-writer only on SQLite)
+2. Hydrate each row's payload into the referenced `CommandInterface` DTO
+3. Dispatch it through `CommandBusInterface`
+4. Mark the ledger row `Completed` or `Failed` and the fire-queue row accordingly
+5. Sleep `SCHEDULER_CONSUME_POLL_INTERVAL_SEC` after an empty batch (in `--loop` mode), then repeat
+
+Both processes exit cleanly on `SIGTERM` and `SIGINT`, completing in-flight work before shutting down.
+
+## Supervisor configuration
+
+For production, run both processes under a process supervisor. Here is an example Supervisor configuration:
+
+```ini title="/etc/supervisor/conf.d/scheduler.conf"
+[program:vortos-scheduler]
+command=php /var/www/html/vortos scheduler:run
+directory=/var/www/html
+user=www-data
+autostart=true
+autorestart=true
+startretries=10
+stderr_logfile=/var/log/supervisor/scheduler.err.log
+stdout_logfile=/var/log/supervisor/scheduler.out.log
+
+[program:vortos-scheduler-consumer]
+command=php /var/www/html/vortos scheduler:consume --loop
+directory=/var/www/html
+user=www-data
+autostart=true
+autorestart=true
+startretries=10
+stderr_logfile=/var/log/supervisor/scheduler-consumer.err.log
+stdout_logfile=/var/log/supervisor/scheduler-consumer.out.log
+```
+
+If you are running multiple daemon shards, add one program block per shard (the consumer does not shard — run one or more replicas as needed, they coordinate via row-level locking, not leases):
+
+```ini
+[program:vortos-scheduler-0]
+command=php /var/www/html/vortos scheduler:run --shard=0
+...
+
+[program:vortos-scheduler-1]
+command=php /var/www/html/vortos scheduler:run --shard=1
+...
+```
+
+## Docker Compose configuration
+
+```yaml title="docker-compose.yml"
+services:
+  scheduler:
+    image: your-app-image
+    command: ["php", "vortos", "scheduler:run"]
+    restart: unless-stopped
+    environment:
+      VORTOS_SCHEDULER_LEASE_DRIVER: postgres-advisory
+      SCHEDULER_SHARD_COUNT: "1"
+    depends_on:
+      write_db:
+        condition: service_healthy
+
+  scheduler-consumer:
+    image: your-app-image
+    command: ["php", "vortos", "scheduler:consume", "--loop"]
+    restart: unless-stopped
+    depends_on:
+      write_db:
+        condition: service_healthy
+```
+
+<Callout type="info">
+The deploy preflight check (`deploy:doctor`) includes a `scheduler.doctor` check. If the scheduler is misconfigured, it will block deployments automatically. No need to add separate health checks — the doctor integration handles it.
+</Callout>
+
+## CLI commands
+
+All scheduler management is available via CLI. These commands require appropriate RBAC permissions (see [Security](/docs/scheduler/security)).
+
+### scheduler:run
+
+Start the daemon.
+
+```bash
+php vortos scheduler:run [--shard=N]
+```
+
+### scheduler:consume
+
+Start the fire-queue consumer. Required alongside `scheduler:run` — without it, nothing scheduled ever executes. See [Two processes, not one](/docs/scheduler/retention#two-processes-not-one).
+
+```bash
+php vortos scheduler:consume --loop [--batch-size=N] [--poll-interval=N]
+```
+
+Without `--loop`, it processes one batch and exits (useful for a cron-triggered consumer instead of a long-lived process).
+
+`scheduler:run` and `scheduler:consume --loop` are the only commands that should run as long-lived processes. All others are one-shot.
+
+### scheduler:list
+
+List all registered schedules with their current status and next fire time.
+
+```bash
+php vortos scheduler:list
+php vortos scheduler:list --tenant=tenant-id
+php vortos scheduler:list --status=paused
+```
+
+Output shows schedule ID, name, trigger expression, status, last run, next due time, and last outcome.
+
+### scheduler:pause
+
+Pause a schedule by name or ID. The current run (if any) is not interrupted.
+
+```bash
+php vortos scheduler:pause prune-audit-logs
+php vortos scheduler:pause --id=01900000-dead-7000-0000-000000000001
+```
+
+### scheduler:resume
+
+Resume a paused schedule.
+
+```bash
+php vortos scheduler:resume prune-audit-logs
+php vortos scheduler:resume --id=01900000-dead-7000-0000-000000000001
+```
+
+### scheduler:run-now
+
+Manually fire a schedule immediately, outside its normal trigger. The fire is recorded in the audit log as a manual fire with the actor identity of the CLI user.
+
+```bash
+php vortos scheduler:run-now prune-audit-logs
+php vortos scheduler:run-now --id=01900000-dead-7000-0000-000000000001
+```
+
+This is useful for testing a new schedule without waiting for its next scheduled time, or for re-running a failed job manually.
+
+### scheduler:approve
+
+Approve or reject a pending 4-eyes approval request.
+
+```bash
+php vortos scheduler:approve {requestId} --action=approve
+php vortos scheduler:approve {requestId} --action=reject --reason="Not approved during freeze window"
+```
+
+The approving actor must be a different person than the one who created the request (self-approval is blocked).
+
+### scheduler:prune
+
+Prune the run ledger. **This now runs automatically by default** — a framework-registered static schedule fires daily and prunes every tenant at its resolved retention (see [Retention](/docs/scheduler/retention)). This command is the manual escape hatch, not something you need to schedule yourself.
+
+```bash
+# Default: runs the exact same per-tenant/global policy the automatic schedule uses
+php vortos scheduler:prune
+
+# Explicit cutoff, bypassing policy entirely (e.g. incident cleanup)
+php vortos scheduler:prune --before="2026-01-01T00:00:00Z" --tenant=acme
+
+# Preview without deleting
+php vortos scheduler:prune --dry-run --json
+```
+
+### scheduler:retention:set / scheduler:retention:remove
+
+Set or remove a per-tenant retention override (including permanent legal holds via `--days=0`). Requires the `scheduler.retention.manage` permission. See [Retention](/docs/scheduler/retention#per-tenant-overrides).
+
+```bash
+php vortos scheduler:retention:set --tenant=acme --days=90 --actor=jsmith --reason="contract clause 4.2"
+php vortos scheduler:retention:remove --tenant=acme --actor=jsmith
+```
+
+### scheduler:doctor
+
+Run the scheduler health check suite. Outputs a table of checks with PASS/FAIL/SKIP status.
+
+```bash
+php vortos scheduler:doctor
+```
+
+Checks performed:
+
+| Check | What it tests |
+|---|---|
+| `C1` | Cron expressions are parseable and yield valid next-run times |
+| `C2` | No name or ID collision between static and dynamic schedules |
+| `C3` | Every scheduled command class is allowlisted (`#[SchedulableCommand]`) |
+| `C4` | Lease driver is reachable |
+| `C5` | Required database tables are present (migrations applied) |
+| `C6` | Sensitive schedules have a recorded 4-eyes approval |
+| `C7` | Sensitive schedules declare an explicit misfire policy |
+| `C8` | Catchup bounds and misfire caps are within valid range |
+| `C9` | Shard count is valid and a probe lease succeeds for each shard |
+| `C10` | Auto-prune config + liveness — see [Retention](/docs/scheduler/retention#doctor-checks) |
+| `C11` | Fire-queue consumer liveness — catches a dead `scheduler:consume` process |
+
+Exit code is 0 if all non-SKIP checks pass, 1 if any FAIL. This makes it suitable for use in CI and deploy preflight scripts.
+
+## Sharding
+
+By default, the scheduler runs as a single shard. For high-throughput deployments with hundreds or thousands of schedules, you can increase the shard count:
+
+```dotenv
+SCHEDULER_SHARD_COUNT=4
+```
+
+Then start one daemon process per shard:
+
+```bash
+php vortos scheduler:run --shard=0
+php vortos scheduler:run --shard=1
+php vortos scheduler:run --shard=2
+php vortos scheduler:run --shard=3
+```
+
+Each daemon acquires the lease only for its shard. Schedule assignment to shards is determined by `crc32(scheduleId) % shardCount` — the same schedule always lands in the same shard, so run history and overlap detection remain consistent.
+
+<Callout type="warn">
+If you change `SCHEDULER_SHARD_COUNT` without restarting all daemon processes simultaneously, some schedules may temporarily be processed by the wrong shard count. Always change the shard count as part of a coordinated deployment that restarts all daemons.
+</Callout>
+
+## Graceful shutdown and deployments
+
+When you deploy a new version of your application, the scheduler daemon needs to restart cleanly. Send `SIGTERM` to the daemon process. It will complete the current tick and exit. The supervisor will restart it with the new code.
+
+During a blue-green deployment, the new (green) daemon should not start until the old (blue) one has shut down. The distributed lease prevents both from running simultaneously — the green daemon will simply wait for the lease to be released before acquiring it.
+
+The scheduler's deploy preflight check (`scheduler.doctor`) verifies the scheduler is healthy before a deployment proceeds. If the scheduler cannot acquire a lease or reach its dependencies, the deploy is blocked.

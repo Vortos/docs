@@ -207,6 +207,22 @@ final class MyFeaturePackage implements PackageInterface
 }
 ```
 
+### Cross-package wiring rule (`load()` vs `build()`)
+
+`Extension::load()` runs during Symfony's `MergeExtensionConfigurationPass`, while extensions are still loading one by one — so **another package's services are not reliably visible there**. Deciding whether to register a service based on a foreign `$container->has()` in `load()` is order-dependent and silently wrong.
+
+**The rule:** `load()` registers only this package's own services and reads only its own config. Any decision that depends on another package's services goes in a **CompilerPass** (registered in `build()`), where `has()` reflects the fully-merged container and is order-independent.
+
+- Optional cross-package collaborator → inject `new Reference(X, ContainerInterface::NULL_ON_INVALID_REFERENCE)` and take a nullable constructor arg. No `has()` needed.
+- Cross-package entry-point command → register it **always** (so it appears in `list`) with the collaborator as `NULL_ON_INVALID_REFERENCE`, and fail loudly with remediation at runtime when it's null.
+- `class_exists()` / `interface_exists()` **are** allowed in `load()` — they're autoloader-based and order-free.
+
+This is enforced by an architecture test (`NoCrossPackageHasInLoadTest`) that fails the build on any new cross-package `has()`/`hasDefinition()`/`hasAlias()` inside a `load()`. See `Foundation\DependencyInjection\Compiler\ConditionalWiringPass` for the base class and `MissingCapabilityException` for the fail-loud contract.
+
+<Callout type="info" title="Config surfaces, not service overrides">
+Configure framework packages through their `config/<package>.php` surface (`config/deploy.php`, `config/alerts.php`, `config/secrets.php`, `config/pipeline.php`) — each is loaded by a factory. Redefining a vendor service definition to inject configuration is no longer necessary.
+</Callout>
+
 ## Container Caching
 
 In `prod` + `http` context, the compiled container is dumped to `var/cache/` and loaded on subsequent requests — zero compilation overhead.
@@ -336,6 +352,225 @@ php vortos debug:bindings -v
 ```
 
 Only bindings created by `DefaultImplCompilerPass` are listed. Aliases registered manually in `services.php` are not included — they take precedence over `#[DefaultImpl]` and are visible via `php vortos debug:container`.
+
+## #[OverrideImpl]
+
+`#[OverrideImpl]` is the counterpart to `#[DefaultImpl]`. It **unconditionally replaces** any existing alias or definition — including bindings that framework extensions registered during `load()`.
+
+Use it when app code needs to swap out a framework-provided binding without adding an explicit alias to `services.php`.
+
+```php
+use Vortos\Foundation\DependencyInjection\Attribute\OverrideImpl;
+
+#[OverrideImpl]
+final class CustomFlagContextResolver implements FlagContextResolverInterface
+{
+    // This replaces whatever the FeatureFlags extension registered
+    // for FlagContextResolverInterface — no services.php edit needed.
+}
+```
+
+### Why not just use `#[DefaultImpl]`?
+
+`DefaultImplCompilerPass` intentionally skips an interface that already has a registered alias or definition. Framework extensions register their bindings during `load()`, which runs **before** `DefaultImplCompilerPass`. This means `#[DefaultImpl]` always loses to a framework default.
+
+`OverrideImplCompilerPass` runs **after** `DefaultImplCompilerPass` (priority 0 vs 5, same `TYPE_BEFORE_OPTIMIZATION` phase) and never skips — it always wins.
+
+| Attribute | Skip if alias exists? | When to use |
+|---|---|---|
+| `#[DefaultImpl]` | Yes — yields to explicit registrations | Your own bindings when nothing registers first |
+| `#[OverrideImpl]` | No — always replaces | Replacing a framework-registered binding |
+
+### Explicit interface argument
+
+Same inference rules as `#[DefaultImpl]` — if the class implements multiple app-namespace interfaces, specify which one:
+
+```php
+#[OverrideImpl(FlagContextResolverInterface::class)]
+final class CustomFlagContextResolver implements FlagContextResolverInterface, ResettableInterface
+{
+    // ...
+}
+```
+
+### Error collection
+
+Unlike `DefaultImplCompilerPass` (which throws on the first error), `OverrideImplCompilerPass` **collects all errors** and throws a single exception listing every problem:
+
+```
+2 container configuration error(s) found:
+
+  [1] #[OverrideImpl] on "App\Foo\Bar" (src/Foo/Bar.php:14)
+      → Class does not implement "SomeInterface". Add "implements SomeInterface" or fix the attribute argument.
+
+  [2] #[OverrideImpl] on "App\Baz\Qux" (src/Baz/Qux.php:22)
+      → #[OverrideImpl] conflict: both "App\Other" and "App\Baz\Qux" override "SomeInterface". Only one class may override an interface.
+```
+
+### Compile-Time Errors
+
+| Situation | Error |
+|---|---|
+| Multiple app-namespace interfaces and no `interface` arg | "Ambiguous: specify `interface` explicitly" |
+| `interface` arg names an interface the class does not implement | "Class does not implement X" |
+| Two classes both carry `#[OverrideImpl]` for the same interface | "Conflict: only one class may override an interface" |
+
+All errors are collected before the exception is thrown — you see every misconfiguration in one boot failure, not one at a time.
+
+### Inspecting bindings
+
+`#[OverrideImpl]` bindings are stored in the `vortos.override_impl.bindings` container parameter. To inspect them, use `debug:container`:
+
+```bash
+php vortos debug:container --parameter=vortos.override_impl.bindings
+```
+
+## #[AsDecorator]
+
+`#[AsDecorator]` wraps an existing service with a new class — without touching the original class or any of its callers. The outer alias is updated at compile time; the original implementation is kept and injected as `$inner` into the decorator.
+
+```php
+use Vortos\Foundation\DependencyInjection\Attribute\AsDecorator;
+
+#[AsDecorator(decorates: FlagContextResolverInterface::class)]
+final class AuditingFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly FlagContextResolverInterface $inner) {}
+
+    public function resolve(): FlagContext
+    {
+        $context = $this->inner->resolve();
+        $this->audit($context);
+        return $context;
+    }
+}
+```
+
+`DecoratorCompilerPass` runs at compile time. It finds `AuditingFlagContextResolver` (tagged `vortos.decorator` via autoconfiguration), resolves the existing alias for `FlagContextResolverInterface`, and rewires the container:
+
+```
+Before:
+  FlagContextResolverInterface → DefaultFlagContextResolver
+
+After:
+  FlagContextResolverInterface              → AuditingFlagContextResolver
+  FlagContextResolverInterface.vortos_inner_0  → DefaultFlagContextResolver
+```
+
+`$inner` on `AuditingFlagContextResolver` is bound to the inner alias automatically. All callers that depend on `FlagContextResolverInterface` now receive the decorator transparently.
+
+### What `$decorates` accepts
+
+`$decorates` is a plain string — the target does not have to be an interface:
+
+```php
+// Interface FQCN (most common)
+#[AsDecorator(decorates: FlagContextResolverInterface::class)]
+
+// Concrete class FQCN
+#[AsDecorator(decorates: DefaultFlagContextResolver::class)]
+
+// Any string service ID registered in the container
+#[AsDecorator(decorates: 'app.some_service')]
+```
+
+When the target is an interface, the decorator must implement it. When the target is a concrete class or a string ID, no interface check is performed — the only requirement is that a constructor parameter typed to the target exists.
+
+### Inner parameter discovery
+
+The pass scans the decorator's constructor for a parameter whose declared type matches `$decorates` exactly. The parameter can be named anything:
+
+```php
+#[AsDecorator(decorates: FlagContextResolverInterface::class)]
+final class TracingFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(
+        private readonly FlagContextResolverInterface $decorated, // name does not matter
+        private readonly Tracer $tracer,
+    ) {}
+}
+```
+
+### Chaining multiple decorators
+
+Multiple decorators on the same target form a chain ordered by `priority`. **Higher priority = outer wrapper** (called first, wraps everything beneath it).
+
+```php
+#[AsDecorator(decorates: FlagContextResolverInterface::class, priority: 10)]
+final class TracingFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly FlagContextResolverInterface $inner) {}
+}
+
+#[AsDecorator(decorates: FlagContextResolverInterface::class, priority: 5)]
+final class CachingFlagContextResolver implements FlagContextResolverInterface
+{
+    public function __construct(private readonly FlagContextResolverInterface $inner) {}
+}
+```
+
+Resolved call chain at runtime:
+
+```
+FlagContextResolverInterface
+  → TracingFlagContextResolver  (priority 10, outermost)
+    → CachingFlagContextResolver  (priority 5)
+      → DefaultFlagContextResolver  (original)
+```
+
+Container aliases after compilation:
+
+```
+FlagContextResolverInterface               → TracingFlagContextResolver
+FlagContextResolverInterface.vortos_inner_0  → DefaultFlagContextResolver   (innermost)
+FlagContextResolverInterface.vortos_inner_1  → CachingFlagContextResolver
+```
+
+### Compile-time errors
+
+All errors are collected before the exception is thrown — you see every misconfiguration in one boot failure:
+
+```
+3 container configuration error(s) found:
+
+  [1] #[AsDecorator] on "App\Foo\AuditDecorator" (src/Foo/AuditDecorator.php:12)
+      → Target "App\Foo\UnknownInterface" has no alias or definition in the container.
+        Cannot decorate a service that does not exist.
+
+  [2] #[AsDecorator] on "App\Foo\BadDecorator" (src/Foo/BadDecorator.php:20)
+      → No constructor parameter typed to "App\Foo\SomeInterface" found on "App\Foo\BadDecorator".
+        Add a constructor argument with type "App\Foo\SomeInterface" to receive the inner service.
+
+  [3] #[AsDecorator] on "App\Foo\ConflictDecorator" (src/Foo/ConflictDecorator.php:31)
+      → Priority conflict on "App\Foo\SomeInterface": both "App\Foo\OtherDecorator" and
+        "App\Foo\ConflictDecorator" have priority 0. Assign distinct priorities to control chain order.
+```
+
+| Situation | Error |
+|---|---|
+| `$decorates` target has no alias or definition in the container | "Target has no alias or definition" |
+| Decorator class name equals `$decorates` | "A class cannot decorate itself" |
+| Target is an interface and decorator does not implement it | "Does not implement the interface" |
+| No constructor parameter typed to `$decorates` | "No constructor parameter typed to X found" |
+| Two decorators on the same target share the same priority | "Priority conflict" |
+
+### Pass ordering
+
+`DecoratorCompilerPass` runs at `TYPE_BEFORE_OPTIMIZATION` priority `-5` — after `DefaultImplCompilerPass` (priority 5) and `OverrideImplCompilerPass` (priority 0). All interface aliases are fully settled before decoration begins, so `#[AsDecorator]` composes correctly on top of both `#[DefaultImpl]` and `#[OverrideImpl]` bindings.
+
+| Pass | Priority | Effect |
+|---|---|---|
+| `DefaultImplCompilerPass` | 5 | Creates alias if none exists |
+| `OverrideImplCompilerPass` | 0 | Unconditionally replaces alias |
+| `DecoratorCompilerPass` | -5 | Wraps whatever the alias currently points to |
+
+### Choosing between the three attributes
+
+| Need | Attribute |
+|---|---|
+| Register a new binding when nothing registered it yet | `#[DefaultImpl]` |
+| Replace a framework-registered binding entirely | `#[OverrideImpl]` |
+| Add behaviour around an existing binding without replacing it | `#[AsDecorator]` |
 
 ## ConsoleCommandPass
 

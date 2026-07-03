@@ -1,0 +1,46 @@
+---
+title: Deploy Audit Ledger
+description: A hash-chained, HMAC-signed, append-only record of every deploy and rollback — verifiable and exportable independent of the underlying database's own integrity.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Deploy Audit Ledger
+
+Every [deploy and rollback](/docs/deploy) action is recorded into a hash-chained audit ledger — the same chaining technique [Auth's audit log integrity](/docs/auth/audit-logging#tamper-detection--the-hash-chain) uses, applied here to deploy history specifically. The goal is the same: prove the record hasn't been altered, not just trust that it hasn't.
+
+## How entries chain
+
+`AuditHashChain` computes each entry's content hash from its own fields plus the previous entry's hash, then signs the result with HMAC-SHA256 — identical structure to the Auth audit chain, deliberately, so there's one mental model for "tamper-evident append-only log" across the framework rather than two subtly different ones.
+
+```php
+$projector->record($deployAuditEntry); // DeployAuditProjector — chains automatically
+```
+
+`DeployAuditProjector` is what [Deploy's `LifecycleEvent`s](/docs/deploy) (and [Alerts' `DeployAuditAlertSink`](/docs/alerts#integrations)) actually write through — every deploy, rollback, and reconcile action lands here as a chained entry, not as a plain database row that could be edited without detection.
+
+## Verifying the chain
+
+```bash
+php bin/console vortos:observability:audit:verify --env=production
+```
+
+```
+Walking the deploy audit ledger for production...
+847 entries verified. Chain intact.
+```
+
+`AuditChainVerifier` walks the ledger and reports the first broken link it finds — a content hash mismatch, a sequence gap, or a signature that doesn't verify against the configured HMAC key — the same fail-at-first-break behavior as the Auth chain verifier, for the same reason: an incident investigation should start from an exact point, not a haystack.
+
+## Exporting for compliance
+
+```bash
+php bin/console vortos:observability:audit:export --env=production --format=ndjson > deploy-audit-2026-06.ndjson
+php bin/console vortos:observability:audit:export --env=production --format=csv > deploy-audit-2026-06.csv
+```
+
+`AuditExportService` streams the ledger out (NDJSON or CSV) rather than loading it all into memory — a year of deploy history exports without exhausting memory on the host running the export. The export carries a `SignedAuditManifest` — a signature over the export itself, so a compliance reviewer can verify the exported file hasn't been altered after the fact, independent of re-verifying the live chain.
+
+<Callout type="info" title="Why deploy history specifically gets this treatment">
+A deploy audit trail is frequently the thing a security review or compliance audit actually asks for — "who deployed what, when, and was it rolled back." Making this tamper-evident by construction means the answer to "can we trust this log" doesn't depend on trusting whoever has database write access; it's a property you can verify directly.
+</Callout>

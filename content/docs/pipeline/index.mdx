@@ -1,0 +1,254 @@
+---
+title: Pipeline
+description: A provider-agnostic CI/CD pipeline model — native ARM64 builds, fully digest-pinned actions, and OIDC instead of standing registry secrets.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Pipeline
+
+`vortos-pipeline` doesn't run your builds — it generates the workflow files that do, from a single provider-agnostic model. Write your pipeline once as a `Pipeline` model object; an emitter renders it into the YAML a specific CI provider understands. The model is what you maintain; the YAML is what gets checked in and regenerated, not hand-edited.
+
+<Callout type="info" title="Why generate instead of hand-write YAML">
+Hand-written GitHub Actions YAML drifts: someone edits the workflow file directly, the next person's "fix" conflicts with it, and nobody notices the build matrix and the deploy matrix have quietly diverged. `pipeline:verify` exists to catch exactly this — it regenerates from the model and diffs against what's committed.
+</Callout>
+
+## The model
+
+```
+PipelineDefinition  (what to build, which architectures, OIDC on/off)
+    │
+    ▼ PipelineBuilder
+Pipeline  (Stage[] — test, static-analysis, agnosticism, build, deploy, split)
+    │
+    ▼ PipelineEmitterInterface (Ops Kit driver)
+EmittedArtifactSet  (the actual workflow file contents)
+```
+
+`PipelineBuilder` assembles stages from a `PipelineDefinition` and a `StageGate`. Some stages (`Test`, `StaticAnalysis`, `Agnosticism`, `Deploy`, `Split`) always emit; others are gated behind `enabledFutureStages` so a stage can exist in the model before its supporting tooling is ready everywhere, without forcing every consumer onto it immediately.
+
+## Configuring the pipeline (`config/pipeline.php`)
+
+The `PipelineDefinition` is the **single source of truth**. It is built by `PipelineDefinitionFactory` from environment variables plus an optional `config/pipeline.php`, and injected into both `pipeline:generate` and `pipeline:verify` — so the model you configure is exactly the model that gets emitted and drift-checked. (You no longer override the service, and the commands no longer construct a throwaway default.)
+
+```php title="config/pipeline.php"
+use Vortos\Pipeline\Model\ServiceContainer;
+
+return [
+    // Emit to deploy.yml with `name: Deploy` instead of clobbering an existing ci.yml
+    'workflow_filename' => 'deploy.yml',
+    'workflow_name'     => 'Deploy',
+
+    // The generated pipeline can BE your CI: real test command, service containers, extra steps
+    'test_command'    => './vendor/bin/phpunit --testsuite=Unit',
+    'analyse_command' => './vendor/bin/phpstan analyse --level=9',
+    'test_service_containers' => [
+        new ServiceContainer(
+            name: 'postgres',
+            image: 'postgres:18-alpine',
+            ports: ['5432:5432'],
+            env: ['POSTGRES_PASSWORD' => 'test'],
+            options: ['--health-cmd=pg_isready'],
+        ),
+    ],
+    'test_steps' => [
+        ['name' => 'Run migrations', 'run' => 'bin/console vortos:migrate --no-interaction'],
+        ['name' => 'Contract check', 'run' => 'bin/console vortos:contracts:check'],
+    ],
+
+    'image_repository'  => 'ghcr.io/acme/app',
+    'registry_provider' => 'ghcr',
+];
+```
+
+<Callout type="info" title="Config wins over env">
+Scalars can also be set via env (`PIPELINE_WORKFLOW_FILENAME`, `PIPELINE_TEST_COMMAND`, `PIPELINE_IMAGE_REPOSITORY`, …) for CI overrides. Structured settings (service containers, test steps) come from `config/pipeline.php`, which takes precedence. Service containers render as GitHub Actions `services:` on the test job; `test_steps` run after `composer install` and before the test command.
+</Callout>
+
+## Pinned actions — no floating tags
+
+Every third-party GitHub Action referenced anywhere in a generated workflow is represented as a `PinnedAction`, and the constructor refuses anything that isn't a full 40-character commit SHA:
+
+```php
+final readonly class PinnedAction
+{
+    public function __construct(
+        public string $owner,
+        public string $repo,
+        public string $sha,
+        public string $versionComment,
+    ) {
+        if (preg_match('/^[0-9a-f]{40}$/', $sha) !== 1) {
+            throw UnpinnedActionException::forSha($sha);
+        }
+    }
+}
+```
+
+```yaml
+# generated output — the SHA is what actually runs; the comment is for humans
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+```
+
+A tag like `@v4` can be force-moved by the action's maintainer (or an attacker who compromises their account) to point at different code without you ever seeing a diff. A pinned SHA cannot change without you noticing — `pipeline:verify` would immediately flag it.
+
+## Native ARM64 builds
+
+`BuildMode` distinguishes two ways to produce an ARM64 image:
+
+```php
+enum BuildMode: string
+{
+    case Native = 'native';        // build directly on an arm64 runner
+    case BuildxQemu = 'buildx-qemu'; // emulate arm64 on an amd64 runner
+}
+```
+
+QEMU emulation works but is slow and, more importantly, hides architecture-specific build failures until they hit production. `BuildMode::Native` generates a workflow matrix that runs the ARM64 build on an actual ARM64 runner — slower to set up, but the build behaves like the real deployment target from the first CI run, not just at release time.
+
+## Architecture verification
+
+After a multi-arch image is pushed, `ArchAssertionScript` generates a verification step that inspects the published manifest and fails the build if the architecture doesn't match what was requested:
+
+```bash
+MANIFEST=$(docker manifest inspect ghcr.io/org/app:sha-abc123)
+ARCH=$(echo "$MANIFEST" | grep -o '"architecture"...')
+if [ "$ARCH" != "arm64" ] || [ "$OS" != "linux" ]; then
+  echo "::error::Architecture mismatch: expected linux/arm64, got linux/$ARCH"
+  exit 1
+fi
+```
+
+This closes a specific failure mode: a buildx configuration mistake that silently produces an amd64 image tagged as the arm64 variant. Without this check, that image runs (badly, or not at all) only once it's pulled onto real ARM64 hardware — by which point you're debugging in production. With it, the build fails in CI, immediately, with the exact mismatch named.
+
+## Multi-registry support
+
+The build stage login step is generated by a `CiRegistryLoginProviderInterface` driver selected via `registryProvider` on `PipelineDefinition`. Three providers ship out of the box:
+
+| `registryProvider` | Registry | Credentials needed |
+|---|---|---|
+| `ghcr` (default) | GitHub Container Registry (`ghcr.io`) | Built-in `GITHUB_TOKEN` — no extra secrets |
+| `docker-hub` | Docker Hub (`docker.io`) | `DOCKER_USERNAME` + `DOCKER_TOKEN` repository secrets |
+| `gcp-artifact-registry` | GCP Artifact Registry | `GCP_SA_KEY` repository secret (service account JSON) |
+
+```php
+// GHCR — default, no extra secrets required
+new PipelineDefinition(imageRepository: 'ghcr.io/org/app');
+
+// Docker Hub
+new PipelineDefinition(
+    imageRepository: 'docker.io/org/app',
+    registryProvider: 'docker-hub',
+);
+
+// GCP Artifact Registry — registryHost extracted from imageRepository automatically
+new PipelineDefinition(
+    imageRepository: 'europe-west4-docker.pkg.dev/my-proj/my-repo/app',
+    registryProvider: 'gcp-artifact-registry',
+);
+```
+
+Each provider uses the pinned `docker/login-action` SHA (the same as `KnownActionFactory::dockerLogin()`) and declares only the job permissions it actually needs. GHCR requests `packages: write`; Docker Hub and GCP declare no additional permissions beyond the base `contents: read`.
+
+Custom providers are additive — implement `CiRegistryLoginProviderInterface`, tag it `#[AsDriver('my-registry')]`, and select it with `registryProvider: 'my-registry'`.
+
+## OIDC instead of standing registry secrets
+
+For GHCR (the default), set `oidc: true` and the generated workflow requests the `id-token: write` permission instead of relying on a long-lived registry password stored as a repository secret:
+
+```php
+new PipelineDefinition(imageRepository: 'ghcr.io/org/app', oidc: true);
+```
+
+```yaml
+permissions:
+  id-token: write
+  contents: read
+  packages: write   # from GhcrCiLoginProvider::requiredPermissions()
+```
+
+The workflow exchanges a short-lived OIDC token for registry access at build time — there's no `REGISTRY_PASSWORD` secret sitting in the repository's settings for anyone (or any compromised dependency with access to secrets) to exfiltrate. This is the same zero-standing-secrets principle [Deploy's credential providers](/docs/deploy/credentials) apply to deploy-time access, applied to the build pipeline itself.
+
+## The generated deploy job
+
+When a build stage is emitted, the deploy job is **deploy-in-image**: it runs [`vortos:release:record-manifest`](/docs/release#recording-a-build) → `deploy:doctor` → `deploy` via `docker run <repo>@<digest> php bin/console …`, so the application's own config and keys are present by construction — no PHP, Composer, or key files on the runner. The deploy step requests `id-token: write` only when `oidc: true`.
+
+The generated secrets follow your credential posture. On the OIDC path the deploy job references **no** standing secret (only the built-in `GITHUB_TOKEN`); an architecture test fails the build if anything else leaks in. On the [`ssh-key`](/docs/deploy/credentials#ssh-key) path (`oidc: false`) the job exposes exactly one secret — the age KEK `VORTOS_AGE_IDENTITY` — and mounts your committed, age-encrypted secrets store into the container. Nothing else.
+
+## Permissions are explicit and minimal
+
+`Permissions` rejects duplicate scopes at construction and defaults to read-only:
+
+```php
+Permissions::readOnly(); // contents: read — and nothing else, unless you add it
+```
+
+```php
+$permissions = Permissions::readOnly()
+    ->with(new Permission(PermissionScope::IdToken, PermissionAccess::Write))
+    ->with(new Permission(PermissionScope::Packages, PermissionAccess::Write));
+```
+
+A generated workflow never has a broader permission than the stages it actually runs require — there's no `permissions: write-all` shortcut available in the model.
+
+## CLI
+
+```bash
+# generate workflow files from the model
+php bin/console pipeline:generate --emitter=github
+
+# preview without writing anything
+php bin/console pipeline:generate --emitter=github --dry-run
+
+# overwrite existing workflow files
+php bin/console pipeline:generate --emitter=github --force
+
+# detect drift between the model and what's actually committed
+php bin/console pipeline:verify --emitter=github
+```
+
+`pipeline:verify` regenerates the workflow in memory and diffs it against the committed file — run it in CI on every PR so a manually edited workflow file is caught the same run it's introduced, not discovered weeks later when the build matrix and the model have drifted apart.
+
+## Emitters
+
+`PipelineEmitterInterface` is the [Ops Kit](/docs/ops-kit) port. `GitHubActionsEmitter` is the shipped driver, rendering the provider-agnostic `Pipeline` model into `.github/workflows/*.yml`. Because the model itself never mentions GitHub-specific concepts directly in the core builder, a second emitter for a different CI provider is additive — implement the port, register `#[AsDriver('...')]`, and `--emitter=<key>` selects it.
+
+## Step-by-step: adding native ARM64 to your build
+
+<Steps>
+<Step>
+Declare the architecture in your pipeline definition:
+
+```php
+$definition = new PipelineDefinition(
+    imageRepository: 'ghcr.io/org/app',
+    architectures: [Arch::Amd64, Arch::Arm64],
+    buildMode: BuildMode::Native,
+    oidc: true,
+);
+```
+</Step>
+
+<Step>
+Regenerate the workflow:
+
+```bash
+php bin/console pipeline:generate --emitter=github --force
+```
+</Step>
+
+<Step>
+Commit the generated `.github/workflows/*.yml` alongside the model change — never hand-edit it afterward.
+</Step>
+
+<Step>
+Wire `pipeline:verify` into your own CI as a check on every PR, so drift between the model and the committed workflow fails the build instead of accumulating silently.
+</Step>
+</Steps>
+
+<Cards>
+  <Card title="Deploy" href="/docs/deploy" description="deploy:doctor's TargetArchCheck consults the same architecture awareness this package builds for." />
+  <Card title="Secrets" href="/docs/secrets" description="The off-host key custody model OIDC-based pipelines pair with." />
+</Cards>

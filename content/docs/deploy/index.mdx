@@ -1,0 +1,264 @@
+---
+title: Deploy
+description: A fail-closed deploy engine — content-hashed plans, swappable targets, phase-gated migrations, and zero-standing-secrets credentials.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Deploy
+
+`vortos-deploy` is the engine that turns "ship this build to production" into a sequence of verifiable, resumable steps instead of a shell script someone runs by hand and hopes works. It is built around one rule: **when in doubt, refuse, don't guess.** A deploy that can't verify its preflight checks, can't confirm a cutover went live, or can't prove a rollback is schema-safe stops — it never silently proceeds on a best-effort basis.
+
+<Callout type="info" title="Pure planning, then execution">
+Planning a deploy and executing it are two separate, deliberately decoupled steps. `DeployPlanner::plan()` is pure — given the same `DeployContext`, it always produces the same `DeployPlan`, with no I/O. Only `deploy:doctor` and the actual target driver touch real infrastructure. This is what makes `--dry-run` meaningful: it runs the exact same planning code path as a real deploy, it just stops before the target driver is invoked.
+</Callout>
+
+## How a deploy plan is built
+
+```
+DeploymentDefinition (your config: strategy, target, environment)
+    │
+    ▼
+DeployContext (definition + CurrentDeployState — what's actually running now)
+    │
+    ▼ DeployPlanner::plan()
+    ├── PhaseGate::assertNoPendingContract()   — refuse if a contract migration is still pending
+    ├── DeployStrategyRegistry::get(strategy)  — resolve the configured strategy
+    ├── strategy->phases($context)             — strategy decides the phase sequence
+    └── PhaseOrderPolicy::assertValid($phases)  — refuse if phase ordering is unsafe
+    │
+    ▼
+DeployPlan (an ordered list of DeployStep, each tagged with a DeployPhase)
+    │
+    ▼ PlanHash::fromPlanJson()
+content-hashed plan — sha256 over the canonical JSON
+```
+
+Every plan is content-hashed. Two deploys with identical definitions and identical current state produce byte-identical plans with the same hash — this is what lets `deploy --resume` verify that the plan it's resuming is the plan it already started executing, not a different one that happened to be requested with the same command.
+
+## Targets — where a deploy actually runs
+
+`DeployTargetInterface` is the [Ops Kit](/docs/ops-kit) port every deploy target implements:
+
+```php
+interface DeployTargetInterface extends DriverInterface
+{
+    public function plan(DeployContext $context): DeployPlan;
+    public function assertImageAvailable(ImageReference $image): void;
+    public function migrate(DeployPlan $plan): void;
+    public function release(DeployPlan $plan, EnvironmentName $env): TargetStatus;
+    public function rollback(DeployPlan $plan, EnvironmentName $env, ?BuildManifest $targetManifest = null): TargetStatus;
+    public function status(EnvironmentName $env): TargetStatus;
+}
+```
+
+There is no `push()`: the CI build job is the only thing that pushes an image. Before mutating anything, a target instead calls `assertImageAvailable()` — a fail-closed, daemonless check that the pinned `repo@digest` really exists in its registry — so a missing or mistyped digest fails loudly up front rather than as a broken pull on the target. The repository a target deploys is read from the plan (threaded from the build manifest), never hardcoded.
+
+Two targets ship today:
+
+| Target | Driver key | Use case |
+|---|---|---|
+| SSH + Docker Compose | `ssh-compose` | A bare VPS or small fleet — no orchestrator required |
+| Kubernetes | `k8s` (from [DeployK8s](/docs/deploy/k8s)) | A cluster — installed as a separate package |
+
+Because both implement the same port, switching targets is a config change, not a rewrite of your deploy pipeline.
+
+## Strategies
+
+A strategy decides the phase sequence for a deploy — what happens, in what order, and what each phase needs from the target. Each declares its requirements via [Ops Kit capabilities](/docs/ops-kit#capabilities), so a target lacking a needed capability is rejected at plan time, not mid-rollout:
+
+| Strategy | What it does |
+|---|---|
+| `BlueGreenStrategy` | Deploy to the idle color, verify, cut traffic over atomically |
+| `CanaryStrategy` | Route a small percentage of traffic to the new version, analyze, then promote or abort |
+| `RollingStrategy` | Replace instances incrementally across a node set |
+| `RecreateStrategy` | Tear down, then stand up — simplest, briefest downtime window |
+
+See [Strategies](/docs/deploy/strategies) for how to pick one and how to write a custom strategy.
+
+## The phase gate and expand/contract migrations
+
+The phase gate exists for one specific danger: deploying a contract migration (one that *removes* something — a column, a table) in the same deploy as the code that depends on the old schema being gone, while the old code might still be running on another instance during a rolling deploy.
+
+```php
+$this->phaseGate->assertNoPendingContract($context->currentState);
+```
+
+If a contract migration is still pending from a previous expand/contract cycle, planning refuses outright with `ContractInSameDeployException` — rather than risk a window where half your fleet runs old code against new schema. See [Phase Gate](/docs/deploy/phase-gate) for the full expand/contract lifecycle and how it ties into [Release's rollback invariant](/docs/release#the-rollback-invariant).
+
+## Cutover and the edge router
+
+For strategies that switch traffic atomically (blue-green), `CutoverCoordinator` is the choreography: cut over, **verify the new upstream is actually live**, and only then record the new release. If verification fails, it automatically reverts to the previous color and records why — a cutover never leaves you on an unverified upstream silently.
+
+```php
+$result = $cutoverCoordinator->cutover($desiredRoute, $imageDigest, $buildId, $planHash, $previousEndpoint);
+```
+
+Every recorded release carries a monotonically increasing `generation` number, providing compare-and-swap semantics for the edge router state — a stale reconciler can never overwrite a newer release by accident. See [Caddy Cutover](/docs/deploy/caddy-cutover) for the edge-router driver and the reconciler that keeps Caddy's running config converged with the desired route.
+
+## Container registry authentication
+
+At deploy time, the target driver authenticates to the container registry before pushing or pulling images. `RegistryAuthStrategyInterface` is the Ops Kit port — each strategy handles one credential type and passes secrets via stdin, never in CLI argv:
+
+```php
+interface RegistryAuthStrategyInterface extends DriverInterface
+{
+    public function supports(RegistryCredential $credential): bool;
+    public function login(CommandRunnerInterface $runner, RegistryCredential $credential): void;
+    public function redactTokens(RegistryCredential $credential): array;
+}
+```
+
+Three typed credential classes cover the registries that ship out of the box:
+
+| Credential class | Registry | Auth mechanism |
+|---|---|---|
+| `PatTokenCredential` | GHCR | Username + PAT, passed via `--password-stdin` |
+| `BasicAuthCredential` | Docker Hub, custom | Username + password, passed via `--password-stdin` |
+| `GcpServiceAccountCredential` | GCP Artifact Registry | Service account JSON, `_json_key` login via stdin |
+
+The `ContainerRegistryInterface` port is what `StepExecutor` and `SshComposeTarget` use — swap the default `GhcrRegistry` for `DockerHubRegistry` or `GcpArtifactRegistry` by rebinding the alias in your DI config. Custom registries are additive: implement the port, tag with `#[AsDriver('my-registry')]`.
+
+## Zero-standing-secrets credentials
+
+Deploy never holds a long-lived credential at rest. `CredentialProviderInterface::issue()` mints a short-lived credential (an SSH certificate signed by an internal CA, an OIDC-exchanged registry token) at the moment it's needed, scoped to one environment, and it expires shortly after:
+
+```php
+interface CredentialProviderInterface extends DriverInterface
+{
+    public function issue(EnvironmentName $env): IssuedCredential;
+    public function assertIssuable(EnvironmentName $env): void;
+}
+```
+
+`assertIssuable()` is the important part for safety: it's a **non-mutating** check that proves a credential *could* be minted — config present, signer reachable, backing secret available — without actually minting one. This is what `deploy:doctor` calls. A preflight check should never itself create a standing secret just to verify the path works.
+
+See [Credentials](/docs/deploy/credentials) for the SSH-CA-OIDC, SSH-key, and pull-agent providers.
+
+## Configuring a deployment (`config/deploy.php`)
+
+The base deployment definition is built from `config/deploy.php` — a closure that receives the default `DeploymentDefinitionBuilder` and returns a configured one. This file is now loaded by the package (previously it was documented but never read, so you had to override the service). Per-environment overrides layer on top.
+
+```php title="config/deploy.php"
+use Vortos\Deploy\Definition\DeploymentDefinitionBuilder;
+
+return static fn (DeploymentDefinitionBuilder $b) => $b
+    ->host('ssh-compose')
+    ->registry('ghcr')
+    ->strategy('blue-green')
+    ->forEnvironment('production', static fn (DeploymentDefinitionBuilder $b) => $b->autoRollback(true));
+```
+
+<Callout type="info" title="Works out of the box on a stock container">
+A stock install now compiles and runs without app-side glue: `deploy`, `deploy:doctor`, and `deploy:rollback` always register (they print remediation and return failure if `vortos-release`/`vortos-migration` are missing, rather than silently vanishing); a Guzzle PSR-18/PSR-17 client is bound by default for the Caddy/OIDC/SSH-CA/registry clients if you haven't provided one; and the SSH-CA / registry-exchange endpoint parameters are set from env with safe empty defaults.
+</Callout>
+
+### Pull-based delivery
+
+Push over SSH-compose is the default. Pull-based delivery (the target polls a signed manifest, no inbound network) is opt-in:
+
+```bash
+VORTOS_DEPLOY_DELIVERY_MODE=pull
+VORTOS_DEPLOY_PULL_REGISTRY_URL=ghcr.io
+VORTOS_DEPLOY_PULL_REPOSITORY=acme/app
+VORTOS_DEPLOY_PULL_RELEASE_PUBLIC_KEY=age1...
+```
+
+Only in `pull` mode are the OCI manifest source, release-key verifier, and reconciler registered. `deploy:agent` stays visible in push mode and fails loudly if invoked.
+
+## CLI
+
+`deploy` reads the latest recorded [build manifest](/docs/release#recording-a-build) for the environment, so `vortos:release:record-manifest` must have run for that build first (the generated [pipeline](/docs/pipeline) does this for you). `--image-repository` / `--image-digest` override the manifest's image when you need to pin or promote a specific one by hand.
+
+```bash
+# rehearse: doctor + plan + preview, zero mutation
+php bin/console deploy --env=production --dry-run
+
+# deploy for real
+php bin/console deploy --env=production --actor=alice
+
+# promote a specific image by hand (overrides the recorded manifest)
+php bin/console deploy --env=production \
+    --image-repository=ghcr.io/acme/app --image-digest=sha256:... --actor=alice
+
+# resume an interrupted run — verifies the plan hash matches before continuing
+php bin/console deploy --env=production --resume
+
+# fail-closed preflight — the same checks deploy runs first, on their own
+php bin/console deploy:doctor --env=production --json
+
+# roll back to the previous known-good build, or an explicit one
+php bin/console deploy:rollback --env=production
+php bin/console deploy:rollback --env=production --to=build-20260601-1 --actor=alice
+
+# reconcile the edge router with the desired route (idempotent, rate-limited)
+php bin/console deploy:reconcile --env=production
+```
+
+<Callout type="warn" title="deploy:doctor runs automatically">
+`deploy` runs the same fail-closed preflight as `deploy:doctor` before touching infrastructure, every time — including on `--resume`. There is no way to skip preflight by accident; if you need to see what it checks without deploying, run `deploy:doctor` directly.
+</Callout>
+
+## Step-by-step: your first deploy
+
+<Steps>
+<Step>
+Define the environment:
+
+```php title="config/deploy.php"
+use Vortos\Deploy\DependencyInjection\VortosDeployConfig;
+
+return static function (VortosDeployConfig $config): void {
+    $config->environment('production')
+        ->target('ssh-compose')
+        ->strategy('blue-green')
+        ->credentialProvider('ssh-ca-oidc');
+};
+```
+</Step>
+
+<Step>
+Check that everything required is actually in place — secrets, credentials, target reachability:
+
+```bash
+php bin/console deploy:doctor --env=production
+```
+</Step>
+
+<Step>
+Rehearse the plan with zero mutation:
+
+```bash
+php bin/console deploy --env=production --dry-run
+```
+</Step>
+
+<Step>
+Deploy:
+
+```bash
+php bin/console deploy --env=production --image-digest=sha256:abc... --actor=$(whoami)
+```
+</Step>
+
+<Step>
+If something's wrong, roll back — Deploy consults [Release's rollback invariant](/docs/release#the-rollback-invariant) automatically and refuses if the target schema isn't a safe subset of what's currently applied:
+
+```bash
+php bin/console deploy:rollback --env=production
+```
+</Step>
+</Steps>
+
+## Sections
+
+<Cards>
+  <Card title="Strategies" href="/docs/deploy/strategies" description="Blue-green, canary, rolling, and recreate — how each works and how to write your own." />
+  <Card title="Phase Gate" href="/docs/deploy/phase-gate" description="Expand/contract migration safety and the rollback guard." />
+  <Card title="Caddy Cutover" href="/docs/deploy/caddy-cutover" description="The edge-router driver, reconciler, and generation-based compare-and-swap." />
+  <Card title="Credentials" href="/docs/deploy/credentials" description="Zero-standing-secrets: SSH-CA-OIDC, SSH key, and pull-agent providers." />
+  <Card title="deploy:doctor" href="/docs/deploy/doctor" description="The fail-closed preflight every deploy runs, and every check it makes." />
+  <Card title="Kubernetes Target" href="/docs/deploy/k8s" description="The DeployK8s package — a second target implementing the same port." />
+</Cards>

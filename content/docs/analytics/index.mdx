@@ -1,0 +1,197 @@
+---
+title: Analytics
+description: A privacy-by-default product analytics port — denies consent until your app says otherwise, redacts PII independently of configuration, and bridges feature flag exposures.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Analytics
+
+`vortos-analytics` is the product-analytics port — "what are users doing" — deliberately kept separate from [Observability](/docs/observability)'s system telemetry. The two are never allowed to conflate (an architecture test enforces this): observability tells you whether your system is healthy, analytics tells you how people use your product, and a metric pipeline that quietly becomes a tracking pipeline (or vice versa) is exactly the kind of scope creep this boundary exists to prevent.
+
+<Callout type="info" title="The base install sends nothing, by design">
+`DenyAllConsentResolver` is the framework default — every distinct ID is denied consent until your application supplies its own `ConsentResolverInterface`. This isn't a conservative default that you're expected to relax; it's the guarantee that installing `vortos-analytics` does not, by itself, cause any user data to leave the process. Even with a real driver (PostHog) wired and configured, nothing is sent until your app explicitly resolves consent for a user.
+</Callout>
+
+## The port
+
+```php
+interface AnalyticsInterface extends DriverInterface
+{
+    public function capture(AnalyticsEvent $event): void;
+    public function identify(IdentitySet $identity): void;
+    public function group(GroupAssociation $group): void;
+    public function flush(): void;
+}
+```
+
+Every method is best-effort and **must not throw into the caller** — the same discipline [Alerts' `NotifierInterface`](/docs/alerts#dedupe--one-incident-one-notification) and Observability's error sinks follow. A PostHog outage can never become a second failure on your request path just because you tried to track an event.
+
+Application code never receives the bare driver — `AnalyticsExtension` always wires the decorator chain (privacy filtering, then batching) wrapping whichever driver is configured. There's no code path that bypasses privacy filtering, because there's no way to obtain a reference to the undecorated driver in the first place.
+
+## Privacy, layered
+
+Three independent gates run before an event ever reaches a driver — independent meaning each one is a backstop for the others, not a single point that, if misconfigured, lets everything through:
+
+```
+AnalyticsEvent
+    │
+    ▼ ConsentGate          — drops the event entirely unless consent is Granted
+    ▼ PropertyAllowlist     — drops any property key not explicitly allowed
+    ▼ PiiRedactor           — hashes anything still shaped like an email/phone/card number
+    │
+    ▼
+driver->capture()
+```
+
+### Consent
+
+```php
+final class ConsentGate
+{
+    public function allows(DistinctId $distinctId): bool
+    {
+        $decision = $this->resolver->resolve($distinctId);
+        if ($decision === ConsentDecision::Granted) {
+            return true;
+        }
+
+        $this->droppedCount++; // the count is the only artifact of a denied event — never its content
+
+        return false;
+    }
+}
+```
+
+A denied or unknown-consent event is dropped before it's ever inspected further — only a counter increments. To actually send anything, implement `ConsentResolverInterface` against your own consent records (a cookie banner's stored choice, a user preference) and wire it in place of `DenyAllConsentResolver`.
+
+### Property allowlisting
+
+`PropertyAllowlist` is a positive list — only properties you've explicitly named are forwarded. Anything else on the event is dropped silently rather than forwarded "just in case it's useful later," which is exactly how unintended PII ends up in an analytics platform.
+
+### PII redaction — independent of the allowlist
+
+`PiiRedactor` is a second, independent layer that scans whatever properties *did* survive the allowlist for email, phone-number, and credit-card-shaped strings, and replaces them with a salted SHA-256 hash:
+
+```php
+$redactor = new PiiRedactor(salt: $_ENV['ANALYTICS_PII_SALT'], rawAllowedKeys: ['plan_tier']);
+$redactor->redact(['email' => 'alice@example.com', 'plan_tier' => 'pro']);
+// ['email' => 'sha256:9f86d0...', 'plan_tier' => 'pro']
+```
+
+Hashing is deterministic — the same value always produces the same digest for a given salt, so cohort joins downstream (e.g. "did this hashed email convert") still work without the raw value ever being stored. The important property here: **a misconfigured allowlist still cannot leak raw PII.** If someone accidentally allowlists an `email` property, the redactor catches it anyway — it's not a fallback for the allowlist being right, it's a second, independently-reasoned check.
+
+## Feature flag exposure bridge
+
+If [Feature Flags](/docs/feature-flags) is installed, `AnalyticsExposureObserver` bridges accepted flag exposures into a `feature_flag_exposure` analytics event — automatically, but only when you opt in:
+
+```php
+final class AnalyticsExposureObserver implements ExposureObserverInterface
+{
+    public function onExposure(string $flag, ?string $variant, string $contextKey): void
+    {
+        if (!$this->enabled) {  // opt-in, default false — can't silently consume your analytics quota
+            return;
+        }
+
+        if (!$this->sampler->isSampledIn($contextKey, $flag)) {  // deterministically sampled — can't flood it either
+            return;
+        }
+
+        $this->analytics->capture(new AnalyticsEvent(
+            new DistinctId($contextKey),
+            self::EVENT_NAME,
+            ['flag' => $flag, 'variant' => $variant ?? ''],
+        ));
+    }
+}
+```
+
+The event shape this emits (`feature_flag_exposure`, `{flag, variant}`) is deliberately provider-agnostic — no PostHog-specific naming leaks into the core bridge. `PosthogEventMapper` (in the PostHog driver package) is what translates this into PostHog's native `$feature_flag_called` event shape. The framework doesn't build its own statistical-significance engine for experiment analysis — PostHog (or whatever analytics platform you point this at) already does that well.
+
+This wiring only activates when `interface_exists(ExposureObserverInterface::class)` — installing `vortos-analytics` without `vortos-feature-flags` is a no-op for this bridge, not an error.
+
+## The PostHog driver
+
+`vortos-analytics-posthog` is a split package — the pattern documented generally in [Ops Kit](/docs/ops-kit#make-driver) — that implements `AnalyticsInterface` against PostHog's HTTP API:
+
+```bash
+composer require vortos/vortos-analytics-posthog
+```
+
+```bash
+POSTHOG_HOST=https://us.i.posthog.com
+POSTHOG_PROJECT_API_KEY=phc_...
+```
+
+The API key is read from the environment at use-time, never logged or persisted on the instance — it's a write-only ingestion key (PostHog project keys can only send events, not read data), so even a leaked key has a narrow blast radius. `PosthogAnalytics` buffers calls locally and collapses them into a single `/batch` POST on `flush()` — on top of the agnostic-level batching the core decorator chain already does, this means a request that calls `capture()` several times still produces one outbound HTTP call.
+
+```php title="config/analytics.php"
+use Vortos\Analytics\DependencyInjection\VortosAnalyticsConfig;
+
+return static function (VortosAnalyticsConfig $config): void {
+    $config->driver('posthog');
+    $config->consentResolver(MyCookieConsentResolver::class);
+    $config->allowedProperties(['plan_tier', 'feature_used', 'page']);
+};
+```
+
+## CLI
+
+```bash
+# flush any buffered/spooled events immediately
+php bin/console vortos:analytics:flush
+```
+
+A `FlushOnTerminateSubscriber` also flushes automatically at the end of every request via `kernel.terminate`, so events captured during a request don't sit buffered indefinitely waiting for the next call.
+
+## Step-by-step: wiring real consent
+
+<Steps>
+<Step>
+Implement a resolver backed by your actual consent storage:
+
+```php
+final class CookieConsentResolver implements ConsentResolverInterface
+{
+    public function resolve(DistinctId $distinctId): ConsentDecision
+    {
+        return $this->cookieJar->get('analytics_consent') === 'granted'
+            ? ConsentDecision::Granted
+            : ConsentDecision::Denied;
+    }
+}
+```
+</Step>
+
+<Step>
+Register it in place of the default:
+
+```php
+$config->consentResolver(CookieConsentResolver::class);
+```
+</Step>
+
+<Step>
+Configure the property allowlist — name only what you actually need:
+
+```php
+$config->allowedProperties(['plan_tier', 'page', 'feature_used']);
+```
+</Step>
+
+<Step>
+Install and configure a real driver:
+
+```bash
+composer require vortos/vortos-analytics-posthog
+```
+</Step>
+</Steps>
+
+<Cards>
+  <Card title="Feature Flags" href="/docs/feature-flags" description="The exposure pipeline this package's bridge observes." />
+  <Card title="Observability" href="/docs/observability" description="The system-telemetry layer this package is deliberately kept separate from." />
+</Cards>

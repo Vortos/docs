@@ -1,0 +1,315 @@
+---
+title: Extending
+description: Custom lease drivers, enqueue backends, schedule policies, and how to integrate with your infrastructure.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Extending
+
+The scheduler is built on ports — interfaces that describe what a component needs, without caring about how the implementation works. Every infrastructure concern is behind a port. You can replace any of them.
+
+## Custom lease driver
+
+The lease port is the distributed mutex. The default implementations are SQL, Redis, and Postgres Advisory. If you need something else (DynamoDB, etcd, Zookeeper, a Redis Cluster implementation), implement `LeasePort`:
+
+```php
+use Vortos\Scheduler\Lease\LeasePort;
+use Vortos\Scheduler\Lease\Lease;
+use Vortos\Scheduler\Lease\LeaseToken;
+
+final class EtcdLeaseStore implements LeasePort
+{
+    public function __construct(
+        private readonly EtcdClient $etcd,
+        private readonly ClockPort $clock,
+    ) {}
+
+    public function acquire(string $leaseKey, int $ttlSec): ?Lease
+    {
+        $token = LeaseToken::generate();
+
+        $acquired = $this->etcd->putIfAbsent(
+            key:   "scheduler/leases/{$leaseKey}",
+            value: $token->value(),
+            ttl:   $ttlSec,
+        );
+
+        if (!$acquired) {
+            return null;
+        }
+
+        return new Lease(
+            key:       $leaseKey,
+            token:     $token,
+            expiresAt: $this->clock->now()->modify("+{$ttlSec} seconds"),
+        );
+    }
+
+    public function renew(Lease $lease): Lease
+    {
+        $refreshed = $this->etcd->refresh(
+            key:   "scheduler/leases/{$lease->key}",
+            value: $lease->token->value(),
+            ttl:   $lease->ttlSec,
+        );
+
+        if (!$refreshed) {
+            throw new LeaseNotOwnedException($lease->key);
+        }
+
+        return $lease->withExpiresAt(
+            $this->clock->now()->modify("+{$lease->ttlSec} seconds"),
+        );
+    }
+
+    public function release(Lease $lease): void
+    {
+        $this->etcd->deleteIfOwner(
+            key:   "scheduler/leases/{$lease->key}",
+            value: $lease->token->value(),
+        );
+    }
+}
+```
+
+Register it with a service tag so `LeaseDriverPass` picks it up:
+
+```php title="config/services.php"
+$services->set(EtcdLeaseStore::class)
+    ->args([service(EtcdClient::class), service(ClockPort::class)])
+    ->tag('vortos.scheduler.lease_driver', ['alias' => 'etcd']);
+```
+
+Then set the env var:
+
+```dotenv
+SCHEDULER_LEASE_DRIVER=etcd
+```
+
+## Custom enqueue backend
+
+The default enqueuer writes to a DBAL outbox table (`DbalSchedulerEnqueuer`). If you want to enqueue directly to RabbitMQ, Amazon SQS, or a custom transport, implement `SchedulerEnqueuerPort`:
+
+```php
+use Vortos\Scheduler\Engine\SchedulerEnqueuerPort;
+use Vortos\Scheduler\Fire\ScheduledFire;
+use Vortos\Scheduler\Schedule\Schedule;
+
+final class SqsSchedulerEnqueuer implements SchedulerEnqueuerPort
+{
+    public function __construct(private readonly SqsClient $sqs) {}
+
+    public function enqueue(ScheduledFire $fire, Schedule $schedule): void
+    {
+        $this->sqs->sendMessage([
+            'QueueUrl'    => getenv('SCHEDULER_SQS_QUEUE_URL'),
+            'MessageBody' => json_encode([
+                'scheduleId' => $fire->scheduleId->toString(),
+                'slot'       => $fire->slot,
+                'command'    => $schedule->command->class,
+                'payload'    => $schedule->command->payload,
+            ]),
+            'MessageGroupId'         => $fire->scheduleId->toString(),
+            'MessageDeduplicationId' => $fire->slot,
+        ]);
+    }
+}
+```
+
+Register it:
+
+```php title="config/services.php"
+$services->set(SqsSchedulerEnqueuer::class);
+$services->alias(SchedulerEnqueuerPort::class, SqsSchedulerEnqueuer::class);
+```
+
+## Custom schedule policy
+
+`SchedulePolicyInterface` controls who can perform which operations. The default implementation integrates with the Vortos auth engine. If you have custom authorization logic — for instance, tenants can only schedule their own commands, or certain schedules require department head approval — implement your own:
+
+```php
+use Vortos\Scheduler\Security\SchedulePolicyInterface;
+use Vortos\Scheduler\Security\UserIdentityInterface;
+use Vortos\Scheduler\Schedule\Schedule;
+
+final class DepartmentSchedulePolicy implements SchedulePolicyInterface
+{
+    public function __construct(
+        private readonly DepartmentRepository $departments,
+        private readonly BaseSchedulePolicy $base,
+    ) {}
+
+    public function canCreate(UserIdentityInterface $actor, Schedule $schedule): bool
+    {
+        if (!$this->base->canCreate($actor, $schedule)) {
+            return false;
+        }
+
+        // Extra check: department heads can only schedule within their department
+        $dept = $this->departments->forUser($actor->getId());
+        return $schedule->metadata['department'] === $dept->id;
+    }
+
+    public function requiresFourEyesForCreate(Schedule $schedule): bool
+    {
+        // Any production schedule needs 4-eyes
+        return $schedule->metadata['env'] === 'production';
+    }
+
+    // delegate the rest to base
+    public function canPause(UserIdentityInterface $actor, Schedule $schedule): bool
+    {
+        return $this->base->canPause($actor, $schedule);
+    }
+
+    // ... implement all methods
+}
+```
+
+## Custom audit projector
+
+The default `SchedulerAuditProjector` writes to a DBAL table. If you want to additionally ship audit events to a SIEM, an S3 bucket, or a logging aggregator, wrap the projector:
+
+```php
+use Vortos\Scheduler\Audit\SchedulerAuditProjector;
+use Vortos\Scheduler\Audit\SchedulerAuditEntry;
+
+final class SiemForwardingAuditProjector extends SchedulerAuditProjector
+{
+    public function __construct(
+        SchedulerAuditRepositoryInterface $repository,
+        private readonly SiemClient $siem,
+    ) {
+        parent::__construct($repository);
+    }
+
+    public function record(SchedulerAuditEntry $entry): void
+    {
+        parent::record($entry);
+
+        // Fire-and-forget to SIEM — do not let SIEM failures break the scheduler
+        try {
+            $this->siem->ingest($entry->toArray());
+        } catch (\Throwable) {}
+    }
+}
+```
+
+Register it:
+
+```php title="config/services.php"
+$services->set(SiemForwardingAuditProjector::class);
+$services->alias(SchedulerAuditProjector::class, SiemForwardingAuditProjector::class);
+```
+
+<Callout type="warn">
+Never let a SIEM or secondary audit destination failure propagate. Wrap calls in try/catch and log the failure. The scheduler must not stop firing jobs because a third-party logging service is down.
+</Callout>
+
+## Custom metrics port
+
+The metrics port is `SchedulerMetricsPort`. The default implementation uses `CardinalityGuardedSchedulerMetrics` (which wraps `SchedulerMetrics` from the Prometheus adapter). If you want to use a different metrics backend:
+
+```php
+use Vortos\Scheduler\Observability\SchedulerMetricsPort;
+
+final class StatsdSchedulerMetrics implements SchedulerMetricsPort
+{
+    public function __construct(private readonly StatsdClient $statsd) {}
+
+    public function recordFire(string $scheduleId, string $result): void
+    {
+        $this->statsd->increment("scheduler.fire.{$result}", tags: [
+            'schedule' => $this->sanitise($scheduleId),
+        ]);
+    }
+
+    public function recordFireDuration(string $scheduleId, float $seconds): void
+    {
+        $this->statsd->timing("scheduler.fire.duration", $seconds, tags: [
+            'schedule' => $this->sanitise($scheduleId),
+        ]);
+    }
+
+    // ... implement all methods
+
+    private function sanitise(string $id): string
+    {
+        return str_replace(['.', ':'], ['_', '_'], $id);
+    }
+}
+```
+
+Register it:
+
+```php title="config/services.php"
+$services->alias(SchedulerMetricsPort::class, StatsdSchedulerMetrics::class);
+```
+
+## Adding custom doctor checks
+
+`SchedulerDoctor` runs its built-in 9 checks. You can add application-specific checks by implementing a tagged service:
+
+```php
+use Vortos\Scheduler\Doctor\SchedulerDoctorFinding;
+use Vortos\Scheduler\Doctor\SchedulerDoctorStatus;
+
+final class DatabaseConnectionPoolCheck
+{
+    public function check(): SchedulerDoctorFinding
+    {
+        try {
+            $healthy = $this->pool->healthCheck();
+            return new SchedulerDoctorFinding(
+                checkId: 'C10',
+                status:  $healthy ? SchedulerDoctorStatus::Pass : SchedulerDoctorStatus::Fail,
+                detail:  $healthy ? 'Connection pool healthy' : 'Pool exhausted',
+            );
+        } catch (\Throwable $e) {
+            return new SchedulerDoctorFinding(
+                checkId: 'C10',
+                status:  SchedulerDoctorStatus::Fail,
+                detail:  $e->getMessage(),
+            );
+        }
+    }
+}
+```
+
+Tag it as `vortos.scheduler.doctor_check`:
+
+```php title="config/services.php"
+$services->set(DatabaseConnectionPoolCheck::class)
+    ->tag('vortos.scheduler.doctor_check');
+```
+
+## Implementing a conformance test
+
+If you implement a custom `LeasePort`, `ScheduleStoreInterface`, or `ScheduleRunStoreInterface`, use the provided conformance test cases to verify your implementation:
+
+```php title="tests/Conformance/MyCustomLeaseStoreConformanceTest.php"
+use Vortos\Scheduler\Testing\LeasePortConformanceTestCase;
+
+final class MyCustomLeaseStoreConformanceTest extends LeasePortConformanceTestCase
+{
+    protected function createStore(): LeasePort
+    {
+        return new MyCustomLeaseStore(/* ... */);
+    }
+
+    protected function createClock(): MutableClock
+    {
+        return new MutableClock(new DateTimeImmutable('now', new DateTimeZone('UTC')));
+    }
+
+    protected function supportsExplicitTtlExpiry(): bool
+    {
+        return true; // Set false if your backend uses real clock for TTL (like SQL)
+    }
+}
+```
+
+The conformance test case runs ~20 scenarios covering: acquire, release, renew, mutex exclusion, TTL expiry, and concurrent access. All scenarios must pass.
+
+Similar test cases exist for `ScheduleStoreConformanceTestCase` and `ScheduleRunStoreConformanceTestCase`.

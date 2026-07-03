@@ -1,0 +1,136 @@
+---
+title: Supply Chain Security
+description: SBOM generation, cosign signature verification, SLSA provenance attestation, and a KEV-aware CVE gate that refuses deploys before they reach infrastructure.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Supply Chain Security
+
+Most of the security surface this framework covers protects your application at runtime. `vortos-security`'s supply chain module protects the step before that: making sure the artifact you're about to deploy is the artifact you think it is, built from what you think it was built from, and free of known-exploited vulnerabilities — checked before deployment, not discovered after.
+
+## The four ports
+
+Every capability here follows the [Ops Kit](/docs/ops-kit) pattern — a port plus swappable drivers, so a tool change (Trivy to Grype, Syft to a different SBOM generator) never touches calling code:
+
+| Port | Shipped drivers | Purpose |
+|---|---|---|
+| `SbomGeneratorInterface` | `syft`, in-memory | Generate a Software Bill of Materials for a built artifact |
+| `VulnerabilityScannerInterface` | `trivy`, in-memory | Scan an SBOM or image for known vulnerabilities |
+| `ArtifactSignerInterface` | `cosign`, in-memory | Sign and verify artifact signatures |
+| `KevCatalogProviderInterface` | `cisa`, in-memory | Check vulnerabilities against CISA's Known Exploited Vulnerabilities catalog |
+
+Every driver ships an in-memory variant alongside the real one, and a `Null*` variant exists for each — so the supply chain pipeline is fully testable without invoking real tooling, and a deployment that hasn't configured a real signer/scanner degrades to an explicit no-op rather than a confusing failure.
+
+## SBOM generation
+
+```bash
+syft <image> -o cyclonedx-json
+```
+
+```php
+enum SbomFormat: string
+{
+    case CycloneDxJson = 'cyclonedx-json';
+    case SpdxJson = 'spdx-json';
+}
+```
+
+`SyftSbomGenerator` shells out to Syft and parses the result into an `SbomDocument` — a structured list of `SbomComponent`s (name, version, package type, licenses) your application can query, diff between builds, or hand to the vulnerability scanner.
+
+## The CVE gate — KEV-aware
+
+A vulnerability scan produces a long list of CVEs; most teams either ignore the list entirely or block every deploy on any finding, which trains people to ignore the gate. `CveGate::evaluate()` is built to be neither:
+
+```php
+final class CveGate
+{
+    private function shouldFail(Vulnerability $vuln, ?KevCatalog $kev, CveGatePolicy $policy): bool
+    {
+        $isKev = $kev !== null && $kev->contains($vuln->id);
+
+        if ($isKev && $policy->failOnKevAnySeverity) {
+            return true;  // a known-exploited CVE fails the gate regardless of severity score
+        }
+
+        if (!$vuln->severity->isAtLeast($policy->failOn)) {
+            return false;
+        }
+
+        if ($policy->requireFixAvailable && !$vuln->hasFixAvailable()) {
+            return false; // no point blocking on something you can't currently fix
+        }
+
+        return true;
+    }
+}
+```
+
+A CVE listed in CISA's **Known Exploited Vulnerabilities** catalog fails the gate regardless of its CVSS severity score — a "medium" severity CVE that's actively being exploited in the wild is a worse risk than a "critical" one that's purely theoretical, and the gate reflects that ordering instead of blindly following severity numbers. `requireFixAvailable` is the other half of making this practical: a policy can choose not to block on a vulnerability with no available fix, since failing the build wouldn't actually let you remediate it any faster.
+
+```php
+$decision = $cveGate->evaluate($vulnerabilityReport, $kevCatalog, $policy, now: new \DateTimeImmutable());
+
+if (!$decision->passed) {
+    foreach ($decision->reasons as $reason) {
+        echo $reason; // "CVE-2024-1234 critical openssl@3.0.1 fix=3.0.2 KEV"
+    }
+}
+```
+
+Time-boxed exceptions are explicit, not silent — `CveGatePolicy::isIgnored()` checks a list of `CveIgnoreEntry` records, each with its own expiry, so an "we'll fix this next sprint" exception can't quietly become a permanent bypass nobody remembers granting.
+
+## Signature verification — fail-closed at deploy
+
+`SignatureVerificationCheck` is a [Deploy preflight check](/docs/deploy/doctor) — the supply chain module integrates with Deploy as a doctor check, the same pattern [IaC's drift check](/docs/iac#drift-detection-feeds-the-doctor-not-just-a-report) and [Secrets' preflight](/docs/secrets#preflight-checks) use:
+
+```php
+final class SignatureVerificationCheck implements PreflightCheckInterface
+{
+    public function check(PreflightContext $context): PreflightFinding
+    {
+        if ($this->policy === null) {
+            return PreflightFinding::skip(/* ... */); // explicitly not configured — not a silent pass
+        }
+
+        $result = $signer->verify($digest, $this->policy);
+
+        if (!$result->ok) {
+            return PreflightFinding::fail(/* ... */); // unsigned or wrong-key image never reaches deploy:apply
+        }
+
+        return PreflightFinding::pass(/* ... */);
+    }
+}
+```
+
+An unsigned image, or one signed by a key your `VerificationPolicy` doesn't trust, fails preflight — `deploy:doctor` catches this before [Deploy](/docs/deploy) ever calls a target's `release()`. Note the explicit `skip` (not `pass`) when no policy is configured — the check distinguishes "verified and trusted" from "not configured to check," so a missing policy shows up as a gap in your preflight output rather than a quiet, indistinguishable pass.
+
+## SLSA provenance
+
+```php
+final readonly class SlsaProvenance
+{
+    public function __construct(
+        public string $predicateType,
+        public ProvenanceBuilder $builder,
+        public string $buildType,
+        public array $subjects,   // what was built — at least one required
+        public array $materials = [], // what it was built from
+    ) {}
+}
+```
+
+`ProvenanceBuilder::assemble()` ties together what was built, what built it, and what it was built from into a SLSA-shaped attestation — answering "how was this artifact actually produced" verifiably, rather than asking everyone downstream to trust an unsigned claim. `AttestationAssembler` and `AttestationChainVerifier` produce and verify the full bundle (SBOM + provenance + signature) as one unit. [Release's `ManifestAttestationAttacher`](/docs/release#build-manifests) wires this attestation onto a build manifest automatically, so a manifest carries cryptographic proof of its own provenance rather than just an assertion.
+
+## Runtime CVE watching
+
+A scan at build time only tells you about vulnerabilities known *then*. `RuntimeCveWatcher` re-checks already-deployed artifacts against newly published CVEs and KEV catalog updates, and `RuntimeCveAlertSource` routes a newly-discovered, actively-exploited vulnerability in something you've already shipped straight to [Alerts](/docs/alerts) — closing the gap between "this was safe when we deployed it" and "this is now a known-exploited vulnerability running in production."
+
+## Secret hygiene auditing
+
+`SecretHygieneAuditor` scans for two independent problems: literal-looking leaked credentials (AWS access keys, PEM private key headers, GitHub tokens, generic `password=...`-shaped strings) and secrets that are simply overdue for rotation per their configured policy. `StaleSecretAlertSource` routes overdue rotations to [Alerts](/docs/alerts) — rotation policy violations don't have to wait for someone to remember to check.
+
+<Callout type="info" title="This complements, not replaces, Secrets">
+`SecretHygieneAuditor`'s leak patterns are a detection backstop — finding a credential that ended up somewhere it shouldn't (a log line, a config file). It's not a substitute for [vortos-secrets](/docs/secrets)' redact-by-construction `SecretValue`, which prevents the leak from happening in the first place. Use both: construction-time prevention as the primary defense, pattern-based auditing to catch what slips through anyway.
+</Callout>

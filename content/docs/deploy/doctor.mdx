@@ -1,0 +1,51 @@
+---
+title: deploy:doctor
+description: The fail-closed preflight that gates every deploy — checked individually by humans, and as a machine-readable report by CI.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# deploy:doctor
+
+`deploy:doctor` is the fail-closed preflight every `deploy` run executes automatically before touching infrastructure. You can also run it on its own — exactly the same checks, the same exit code contract — to verify an environment is deploy-ready without actually deploying.
+
+```bash
+php bin/console deploy:doctor --env=production
+```
+
+```
+[OK] credential.ssh-ca-oidc       OIDC token source reachable, CA signer configured
+[OK] driver-set.target            'ssh-compose' driver registered
+[OK] schema.compatibility         target schema fingerprint compatible with current
+[OK] target-arch.k8s              build available for configured architecture
+[FAIL] migration.drift            pending migrations not reflected in schema fingerprint
+```
+
+Exit code `0` means clear — `1` on any failure. This is the same `PreflightReport::isClear()` value both the human-readable output and `--json` mode read, and the same value `deploy` itself consults before proceeding to plan and execute. There's exactly one source of truth for "is this environment ready," consumed by two callers.
+
+```bash
+# machine-readable, for CI gating
+php bin/console deploy:doctor --env=production --json
+
+# treat warnings as failures too
+php bin/console deploy:doctor --env=production --strict
+```
+
+## Built-in checks
+
+| Check | What it verifies |
+|---|---|
+| `CredentialCheck` | Every configured [credential provider](/docs/deploy/credentials) can actually issue, via `assertIssuable()` — without minting anything |
+| `DriverSetCheck` | The configured target, strategy, and edge router drivers are all registered |
+| `CapabilityDescriptorCheck` | The configured strategy's required capabilities are satisfied by the configured target |
+| `SchemaCompatibilityCheck` | The desired build's schema fingerprint is compatible with what's currently applied |
+| `MigrationDriftCheck` | No pending migrations exist that aren't reflected in the manifest's schema fingerprint |
+| `TargetArchCheck` | A build exists for the architecture the target actually runs ([Pipeline](/docs/pipeline) ARM64/AMD64 awareness) |
+| `CanaryAnalyzerReadyCheck` | If using the canary strategy, the configured analyzer can actually evaluate SLOs |
+| `IacDriftCheck` | The infrastructure [IaC](/docs/iac) expects to exist hasn't drifted from what's actually provisioned |
+
+Every check returns a `PreflightFinding` rather than throwing — `deploy:doctor`'s job is to collect every problem in one pass, not stop at the first one. The aggregate `PreflightReport` is what callers actually consult.
+
+<Callout type="warn" title="Doctor never mutates anything">
+Every check here is read-only by design — `CredentialCheck` calls `assertIssuable()`, never `issue()`; `MigrationDriftCheck` reads applied state, never runs a migration. Running `deploy:doctor` against production repeatedly, including in a monitoring loop, is always safe.
+</Callout>

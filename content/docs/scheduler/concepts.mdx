@@ -1,0 +1,130 @@
+---
+title: Concepts
+description: The mental model behind the scheduler — triggers, slots, leases, misfire, overlap, and why it works the way it does.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Concepts
+
+Understanding a few core ideas makes everything else fall into place. This page explains why the scheduler is designed the way it is, not just what it does.
+
+## Triggers
+
+A trigger answers one question: "what wall-clock times should this schedule fire at?"
+
+There are two kinds:
+
+**CronTrigger** — fires at the times described by a 5-field cron expression. Uses the [dragonmantank/cron-expression](https://github.com/dragonmantank/cron-expression) library under the hood.
+
+```
+┌─────────── minute (0–59)
+│ ┌───────── hour (0–23)
+│ │ ┌─────── day of month (1–31)
+│ │ │ ┌───── month (1–12)
+│ │ │ │ ┌─── day of week (0–6, Sunday=0)
+│ │ │ │ │
+* * * * *
+```
+
+Examples: `0 2 * * *` (daily at 2am), `*/5 * * * *` (every 5 minutes), `0 9 * * 1-5` (weekdays at 9am).
+
+**IntervalTrigger** — fires every N seconds. Simpler than cron and timezone-agnostic. Good for tasks that don't need to run at a specific time of day.
+
+## Slots
+
+A slot is a specific, content-addressed execution window for a schedule. Every time a trigger fires, it produces a slot. The slot key is derived from the schedule ID and the fire time:
+
+```
+{scheduleId}:{ISO8601_fire_time}
+```
+
+For example: `01900000-0000-7000-0000-000000000001:2026-07-01T10:00:00+00:00`
+
+Slots are the fundamental unit of idempotency in the scheduler. Before dispatching, the engine checks whether this slot already exists in the run store. If it does, the fire is a no-op. If it doesn't, it creates the row atomically and enqueues the command.
+
+This means the scheduler can safely retry, restart, and recover without ever firing the same job twice — even if two processes race to the same slot at exactly the same moment.
+
+## Leases
+
+A distributed lease is a mutex that spans multiple processes and machines. The scheduler daemon acquires a lease before it starts processing. Only one daemon instance holds the lease at any time. If the lease expires (because the holder crashed), another instance can acquire it.
+
+The lease is not "held" for the entire duration of a job. It is held only during the tick — the scan, slot calculation, and enqueue phase. The jobs themselves run in the background independently of the lease.
+
+The lease heartbeat guard watches renewal timing. If a renewal goes silent for more than 90% of the TTL, the guard prevents further dispatches until the renewal succeeds again. This catches scenarios where the daemon process is alive but its database or Redis connection is silently failing.
+
+### Sharding
+
+For high-volume deployments, the scheduler supports multiple shards. Each shard has its own lease. Multiple daemon processes can hold different shards simultaneously, and the schedule load is divided between them. Shard assignment is stable — the same schedule always lands in the same shard, determined by `hash(scheduleId) % shardCount`.
+
+For most deployments, one shard is sufficient. Sharding is an optimization, not a requirement.
+
+## Misfire
+
+A misfire happens when the daemon was not running at the time a schedule was due. This is normal — deployments, restarts, and maintenance windows all cause misfires. The question is what to do about them.
+
+Each schedule has a `MisfirePolicy` that controls this:
+
+**SkipMissed** — the default for most cases. When the daemon starts up (or recovers from a gap), it ignores all missed slots and picks up from the next due time. No historical backfill.
+
+**FireOnce** — fire exactly once to "catch up", regardless of how many slots were missed. Good for tasks where it matters that the work happens eventually but firing it 47 times is worse than firing it once.
+
+**FireAll** — fire every missed slot. Use this only when order and completeness matter more than efficiency. Can produce a large burst of jobs if the gap was long.
+
+<Callout type="warn">
+`FireAll` with a large catchup window (`SCHEDULER_MAX_CATCHUP_AGE_SECONDS`) can enqueue hundreds of jobs after a long outage. Make sure your job queue can handle the burst, or set a shorter catchup window.
+</Callout>
+
+The `SCHEDULER_MAX_CATCHUP_AGE_SECONDS` env var (default: 86400) caps how far back the misfire resolver looks. Slots older than this are always dropped, regardless of policy.
+
+## Overlap
+
+Overlap controls what happens when a new slot is due and the previous run of the same schedule is still in progress.
+
+**AllowConcurrent** — the default. New runs start regardless of whether a previous run is still active. Good for short tasks where timing is more important than exclusivity.
+
+**SkipIfRunning** — if the previous run is not yet complete, the new slot is dropped. Good for tasks that must not run concurrently but can tolerate missing a beat.
+
+**QueueBehind** — if the previous run is not complete, the new slot is held back and fires as soon as the previous run finishes. Good for tasks where every run must eventually complete but concurrent execution is harmful.
+
+## The dispatch path
+
+Here is the complete path from "a schedule is due" to "a command is running":
+
+```
+DueScan
+  └─ for each due schedule
+       └─ MisfireResolver: calculate slot(s) accounting for gaps
+            └─ SlotCalculator: produce content-addressed slot key
+                 └─ FireDispatcher
+                      ├─ Check OverlapPolicy (is the previous run done?)
+                      ├─ Atomic INSERT into scheduler_runs (idempotency guard)
+                      ├─ Atomic INSERT into scheduler_fire_queue (outbox)
+                      └─ Emit audit event
+```
+
+The `FireDispatcher` wraps these two INSERTs in a single database transaction. Either both happen, or neither does. There is no window where a slot is "claimed" but not enqueued.
+
+The consumer side picks up entries from `scheduler_fire_queue`, dispatches the command to the message bus, and writes a completion event. `RunCompletionMiddleware` transitions the run to `Completed` inside the same transaction as the command handler.
+
+## Static vs. dynamic schedules
+
+**Static schedules** are defined in PHP using the `#[Scheduled]` attribute on a `StaticScheduleDefinition` class. They are registered at compile time by `StaticSchedulePass`. Static schedules cannot be mutated at runtime — they are part of the application code. This is appropriate for infrastructure tasks (database pruning, report generation, health syncs) that should be version-controlled.
+
+**Dynamic schedules** are stored in the `vortos_scheduler_schedules` table and managed via `ScheduleService` or the CLI. They can be created, paused, resumed, and deleted at runtime. This is appropriate for user-configurable tasks or tenant-specific workloads.
+
+Both types go through the same dispatch path. A static schedule produces the same kind of `ScheduledFire` as a dynamic one.
+
+## Idempotency and exactly-once semantics
+
+The scheduler provides "at-most-once enqueue" guarantees — it will never enqueue the same slot twice. Actual job execution happens outside the scheduler, in your command handler. If your command handler needs to be idempotent (which it should be), that is a separate concern.
+
+If a command handler fails after the slot has been enqueued, the scheduler does not automatically retry it. Retries are the responsibility of the message bus (Vortos messaging) or the queue worker. The scheduler only handles the "should this fire at all?" decision.
+
+## The audit trail
+
+Every slot dispatch, every schedule mutation, every operator action is written to an append-only audit log. Each entry is chained to the previous one using an HMAC-signed hash. Tampering with a row (or deleting one) breaks the chain.
+
+Verification scales with O(n/epochSize) instead of O(n) because the chain is periodically checkpointed. A checkpoint is a signed summary of all entries since the last checkpoint. To verify a range, you only need to walk from the last checkpoint, not from the beginning.
+
+See [Audit](/docs/scheduler/audit) for the full picture.

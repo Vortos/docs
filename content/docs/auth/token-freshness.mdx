@@ -1,0 +1,57 @@
+---
+title: Token Freshness & Global Revocation
+description: Reject tokens issued before a global revocation epoch — the emergency "kill every session, everywhere, right now" lever.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Token Freshness & Global Revocation
+
+Revoking a single user's token is a routine operation — [token storage](/docs/auth/token-storage) handles that. Token freshness exists for a different, much rarer situation: something has gone wrong badly enough that you need **every** access token currently in existence, for every user, to stop working immediately — a leaked signing key, a suspected mass compromise, anything where "wait for tokens to expire naturally" isn't an acceptable answer.
+
+## The global minimum issued-at epoch
+
+```bash
+php bin/console vortos:auth:revoke-all-tokens
+```
+
+```
+Global min_iat set to 1719331200 (2026-06-25T14:00:00+00:00).
+All tokens issued before this are now rejected.
+```
+
+This sets a single epoch timestamp in the configured store. From that moment on, every token whose `iat` (issued-at) claim predates the epoch is rejected — regardless of whether its signature is valid and it hasn't technically expired yet. There is no per-user or per-token enumeration involved; one write, and every previously-issued token across your entire user base stops working on the next request that uses it.
+
+## How it's checked
+
+```php
+final class MinIatGuard implements TokenFreshnessGuardInterface
+{
+    public function check(string $userId, int $authzVersion, int $issuedAt): ?string
+    {
+        $minIat = $this->store->get();
+
+        if ($minIat !== null && $issuedAt < $minIat) {
+            return 'Token issued before global revocation epoch.';
+        }
+
+        return null;
+    }
+}
+```
+
+`check()` returns `null` when the token is fresh, or a rejection reason string when it isn't — `AuthMiddleware` runs this on every authenticated request through `CompositeTokenFreshnessGuard`, which lets you stack `MinIatGuard` alongside other freshness checks ([authorization version](/docs/auth/authorization-version) is the other one shipped) without either needing to know about the other.
+
+<Callout type="warn" title="A store read failure fails closed, not open">
+If the `MinIatStoreInterface` read throws — Redis is unreachable, say — `MinIatGuard` returns a rejection (`'Token freshness check unavailable.'`), not `null`. A broken freshness check rejecting requests is the safe failure direction here: the alternative (treating an unreadable revocation epoch as "no revocation in effect") would mean an outage silently defeats the exact emergency mechanism you'd be relying on during an incident.
+</Callout>
+
+## Choosing between this and per-user revocation
+
+| Mechanism | Scope | Use for |
+|---|---|---|
+| [Token storage revocation](/docs/auth/token-storage) | One user, one or all of their sessions | A user logs out, changes their password, or reports a stolen device |
+| [Authorization version](/docs/auth/authorization-version) | One user, invalidated on role/permission change | A user's permissions changed and cached authorization decisions need to be invalidated |
+| **Global min-iat** | Every user, every token, everywhere | A signing key leaked, a suspected platform-wide compromise — an incident-response action, not routine account management |
+
+Reach for global revocation rarely and deliberately — it logs out every active session for every user the moment it's set, which is exactly the point, but it's also disruptive enough that it should be a conscious incident-response decision, not something triggered casually.

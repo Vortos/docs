@@ -1,0 +1,178 @@
+---
+title: Security
+description: Command allowlist, RBAC policy, 4-eyes approval gate, and how to configure who can do what with schedules.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Security
+
+The scheduler is a system that executes arbitrary commands on a timer. Getting the access controls right is critical. A misconfigured scheduler that allows arbitrary code execution, or that allows users to schedule each other's jobs, is a serious vulnerability.
+
+Vortos Scheduler has a multi-layer security model:
+
+1. **Command allowlist** — only explicitly approved command classes can be scheduled
+2. **RBAC policy** — who can create, pause, resume, delete, and fire-now which schedules
+3. **4-eyes gate** — high-risk operations require a second person's approval
+4. **Audit trail** — every action is logged with actor identity, timestamp, and HMAC chain
+
+## Command allowlist
+
+Every command class that can be scheduled must be explicitly tagged with `#[SchedulableCommand]`:
+
+```php
+use Vortos\Scheduler\Security\Attribute\SchedulableCommand;
+
+#[SchedulableCommand]
+final class GenerateMonthlyReportCommand
+{
+    public function __construct(
+        public readonly string $tenantId,
+        public readonly string $month,
+    ) {}
+}
+```
+
+`CommandSpecValidator` checks this at schedule creation time. Any attempt to schedule a class without `#[SchedulableCommand]` throws `CommandNotAllowlistedException` immediately — before any database write, before any policy check.
+
+This prevents privilege escalation through the scheduler: even if an attacker gains write access to the schedule management UI or API, they can only schedule commands that a developer has explicitly approved. They cannot schedule `RunShellScriptCommand` or some other dangerous class.
+
+<Callout type="warn">
+Be thoughtful about which commands you mark as schedulable. Any command tagged `#[SchedulableCommand]` can be scheduled by anyone with the appropriate RBAC permission. If a command can take destructive or expensive actions, consider whether it should be schedulable at all, or whether you need extra validation inside the command handler.
+</Callout>
+
+## RBAC with SchedulePolicy
+
+Schedule operations are gated by `SchedulePolicyInterface`. The default implementation (`SchedulePolicy`) integrates with the Vortos authorization engine.
+
+The permission catalog defines these permissions:
+
+| Permission | What it controls |
+|---|---|
+| `scheduler.schedule.create` | Create a new schedule |
+| `scheduler.schedule.pause` | Pause a schedule |
+| `scheduler.schedule.resume` | Resume a paused schedule |
+| `scheduler.schedule.delete` | Delete a schedule |
+| `scheduler.schedule.fire_now` | Manually trigger a fire |
+| `scheduler.schedule.read` | List and view schedules |
+| `scheduler.approval.approve` | Approve a 4-eyes request |
+| `scheduler.approval.reject` | Reject a 4-eyes request |
+| `scheduler.retention.manage` | Set or remove a per-tenant run-retention override (`scheduler:retention:set`/`remove`) |
+
+Register these permissions in your application's role definitions:
+
+```php title="config/authorization.php"
+$policy->role('scheduler-operator', [
+    'scheduler.schedule.read',
+    'scheduler.schedule.pause',
+    'scheduler.schedule.resume',
+    'scheduler.schedule.fire_now',
+    'scheduler.approval.approve',
+    'scheduler.approval.reject',
+]);
+
+$policy->role('scheduler-admin', [
+    'scheduler.schedule.*',
+    'scheduler.approval.*',
+    'scheduler.retention.manage',
+]);
+```
+
+<Callout type="info">
+Unlike pause/resume/fire-now, `scheduler.retention.manage` deliberately has no self-service `.own` variant. Retention policy is a compliance/operator decision — how long a tenant's audit trail must legally survive — not something a tenant should be able to shorten or extend for themselves.
+</Callout>
+
+If you want to bypass all RBAC checks (e.g., in a trusted internal service), register `NullSchedulePolicy` instead:
+
+```php title="config/services.php"
+$services->alias(SchedulePolicyInterface::class, NullSchedulePolicy::class);
+```
+
+<Callout type="warn">
+Only use `NullSchedulePolicy` in internal services that have no user-facing access. Never expose a `NullSchedulePolicy` endpoint to end users.
+</Callout>
+
+## 4-eyes approval gate
+
+Some schedule operations are high-risk enough that they should require a second pair of eyes before executing. The `FourEyesGate` enforces this.
+
+When a user attempts an operation that requires approval, `FourEyesApprovalRequiredException` is thrown and an `ApprovalRequest` is created in the `vortos_scheduler_approvals` table. The operation does not proceed until a different user approves it.
+
+To configure which operations require 4-eyes approval, implement `SchedulePolicyInterface`:
+
+```php title="src/Scheduler/TightSchedulePolicy.php"
+use Vortos\Scheduler\Security\SchedulePolicyInterface;
+use Vortos\Scheduler\Security\UserIdentityInterface;
+use Vortos\Scheduler\Schedule\Schedule;
+
+final class TightSchedulePolicy implements SchedulePolicyInterface
+{
+    public function canCreate(UserIdentityInterface $actor, Schedule $schedule): bool
+    {
+        return $actor->hasPermission('scheduler.schedule.create');
+    }
+
+    public function canDelete(UserIdentityInterface $actor, Schedule $schedule): bool
+    {
+        // Deletion always requires 4-eyes
+        return false;
+    }
+
+    public function requiresFourEyesForDelete(Schedule $schedule): bool
+    {
+        return true;
+    }
+
+    // ... implement other methods
+}
+```
+
+```php title="config/services.php"
+$services->alias(SchedulePolicyInterface::class, TightSchedulePolicy::class);
+```
+
+### Approval lifecycle
+
+1. User A attempts to delete a schedule
+2. `SchedulePolicy::requiresFourEyesForDelete()` returns true
+3. `FourEyesGate` creates an `ApprovalRequest` with status `Pending`
+4. `FourEyesApprovalRequiredException` is thrown (the delete does not happen yet)
+5. User B (different person) reviews and approves via `scheduler:approve {id} --action=approve`
+6. The original operation executes
+7. The audit log records both User A's request and User B's approval
+
+Self-approval is enforced at the gate level — if User A tries to approve their own request, `SelfApprovalException` is thrown.
+
+## Multi-tenancy isolation
+
+When `tenantId` is set on a schedule, the policy layer enforces that users can only see and modify schedules belonging to their own tenant. A user in tenant A cannot list, pause, resume, or fire schedules in tenant B, even if they have the `scheduler.schedule.*` permission.
+
+The tenant isolation check happens inside `SchedulePolicy.canRead()`, `canPause()`, etc. — before any database write. The enforcement is in code, not just in SQL filters.
+
+## Sensitive schedules
+
+Mark a schedule `sensitive: true` to prevent its command payload from appearing in the audit log:
+
+```php
+#[Scheduled(
+    id:        '01900000-dead-7000-0000-000000000005',
+    name:      'process-payment-tokens',
+    cron:      '*/15 * * * *',
+    command:   'App\Command\ProcessPaymentTokensCommand',
+    sensitive: true,
+)]
+```
+
+The payload is replaced with `[REDACTED]` in the audit log. The schedule still runs normally.
+
+## Security hardening checklist
+
+- [ ] Every command class that is scheduled has `#[SchedulableCommand]` and nothing else does
+- [ ] Scheduler management endpoints (CLI and admin UI) are protected by the RBAC policy
+- [ ] Sensitive schedules have `sensitive: true` to redact payloads from audit
+- [ ] 4-eyes approval is required for schedule deletion and for `fire_now` in production
+- [ ] The `scheduler_admin` role is not granted to general application users
+- [ ] Approval store is protected — `scheduler.approval.approve` is not in the default user role
+- [ ] `scheduler.retention.manage` is admin-only — a tenant should never be able to shorten its own audit retention
+- [ ] `deploy:doctor` is in your CI/CD pipeline so a broken scheduler blocks deploys
+- [ ] Audit chain verification (`SchedulerAuditChainVerifier`) runs periodically outside `scheduler:doctor` — it is not currently one of the doctor's 11 checks

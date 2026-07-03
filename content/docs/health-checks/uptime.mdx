@@ -1,0 +1,82 @@
+---
+title: Uptime Monitoring
+description: Off-host synthetic monitoring through a control-plane-only port — declarative multi-step journeys, idempotent sync, and real detector independence.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Uptime Monitoring
+
+In-app health probes share a fundamental blind spot: they run on the host they're checking. If the host goes fully dark — not degraded, just gone — every probe running on it is gone too, and nothing alerts anyone. Uptime monitoring closes that gap by running the actual check from somewhere else entirely.
+
+```php
+interface UptimeMonitorInterface extends DriverInterface
+{
+    public function sync(MonitorDescriptor $descriptor): string;
+    public function status(string $monitorId): MonitorStatus;
+    public function statuses(array $monitorIds): array;
+}
+```
+
+`UptimeMonitorInterface` is deliberately **control-plane-only**: your application declares a journey and later reads the verdict, but it never runs the synthetic check itself. The actual probing happens on the provider's infrastructure (BetterStack's, in the shipped driver) — that's the entire point. An architecture test enforces this by construction, not just by convention.
+
+## Journeys, not pings
+
+`SyntheticJourney` refuses to be a trivial "200 OK on `/`" check:
+
+```php
+new SyntheticJourney('checkout-flow', [
+    new JourneyStep(method: 'POST', path: '/login', bodyContains: '"token"'),
+    new JourneyStep(method: 'GET', path: '/api/orders/latest', bodyContains: '"id"'),
+]);
+```
+
+Construction enforces two rules:
+
+- **At least two steps.** A single-step check degrades to a bare liveness ping — the journey concept exists specifically so monitoring asserts a real user flow (login, then fetch something only a logged-in user could fetch), not just "is something listening on port 443."
+- **At least one body-invariant assertion** (`bodyContains`). A journey that only checks HTTP status codes can report green while the page underneath is rendering an error state with a `200` status — body assertions catch that.
+
+Both rules throw at construction, not at review time — a journey that would degrade to a meaningless check simply cannot be built.
+
+## Idempotent sync
+
+```bash
+php bin/console health:monitor:sync
+```
+
+`sync()` declares or updates the monitor for a journey on the provider's side, and it's contractually idempotent — re-running it with an unchanged descriptor must not mutate provider state. This is what makes the sync command safe to run repeatedly (in CI, on every deploy) without worrying about creating duplicate monitors or resetting incident history on the provider's end.
+
+```bash
+php bin/console health:monitor:status
+```
+
+Reads back the current off-host verdict for every synced monitor. `status()` is bounded by a hard connect/total timeout and **never throws into a scheduler loop** — a slow or completely broken provider returns `MonitorState::Unknown` rather than taking down whatever's polling it.
+
+## Driving the dead-man heartbeat
+
+```bash
+php bin/console health:monitor:tick
+```
+
+`MonitorTickCommand` is the scheduled job that ties uptime monitoring to [Observability's dead-man heartbeat](/docs/observability/heartbeat): it runs the local probe rollup, and `HeartbeatPolicy` decides whether to emit a `Start`, `Success`, or `Fail` heartbeat ping based on the result. This reuses the heartbeat mechanism directly rather than reimplementing it — the tick command is a driver of an existing system, not a parallel one.
+
+## The BetterStack driver
+
+```bash
+composer require vortos/vortos-health   # ships in-core, no separate package needed
+```
+
+```php title="config/health.php"
+$config->uptimeMonitor('betterstack')
+    ->apiToken($_ENV['BETTERSTACK_API_TOKEN']);
+```
+
+`BetterStackUptimeMonitor` implements the port against BetterStack's API via `BetterStackClient`. `BetterStackJourneyRenderer` translates a `SyntheticJourney` into BetterStack's native multi-step monitor configuration. As with every [Ops Kit](/docs/ops-kit) driver, a different provider is a new driver implementing the same port — the journey model itself stays provider-agnostic.
+
+## Why detector independence matters
+
+[Health's doctor check](/docs/health-checks#pre-flight-diagnostics) refuses a production deploy without three independent failure detectors: in-app probes, the dead-man heartbeat, and a real external synthetic prober. An uptime monitor configured with the `null` driver (the default — sends nothing anywhere) doesn't count, and the check verifies the configured driver actually declares the `SyntheticJourney` capability, not just that *some* driver key is set.
+
+<Callout type="warn" title="A monitor that probes the host that's down can't tell you it's down">
+The independence requirement isn't bureaucratic box-checking — it's the specific scenario where your application crashes, your in-app probes go with it, and your dead-man heartbeat (which also runs on that host) stops too. Only a check running somewhere else entirely can still page someone when that happens.
+</Callout>

@@ -393,3 +393,11 @@ Sessions are tracked in Redis using a sorted set per user. When a new login occu
 - Refresh tokens are stored in Redis with TTL. They can be revoked individually or all-at-once on logout.
 - The `Authorization: Bearer` header is the only supported token transport — cookies are not used.
 - All JWT validation errors (expired, tampered, wrong type) return `401 Unauthorized` with no detail leakage.
+
+## Hardening
+
+<Cards>
+  <Card title="SCIM Provisioning & SSO" href="/docs/auth/scim" description="RFC 7643/7644 user and group provisioning, tenant-scoped, with IdP group-to-role mapping." />
+  <Card title="Resilience" href="/docs/auth/resilience" description="Fail-open/fail-closed modes and circuit breakers for when Redis goes away." />
+  <Card title="Token Freshness" href="/docs/auth/token-freshness" description="The global revocation epoch — the emergency kill-every-session lever." />
+</Cards>

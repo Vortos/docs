@@ -1,0 +1,82 @@
+---
+title: Restore Drills & DR
+description: Automated restore drills against ephemeral databases, invariant checks, RTO measurement against declared objectives, and DR runbook generation.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Restore Drills & DR
+
+A backup that passes checksum verification proves the *bytes* are intact. It says nothing about whether those bytes actually restore into a working database with the data you expect. `backup:drill` closes that gap by actually restoring the latest backup into a throwaway environment, on a schedule, and checking the result against real invariants.
+
+## What a drill does
+
+```
+DrillRunner::run($engine, $environment)
+    │
+    ▼ 1. catalog->latest($engine, $environment)      — find the most recent artifact
+    ▼ 2. provisioner->provision()                     — stand up an ephemeral database
+    ▼ 3. restoreCoordinator->restore()                 — restore the artifact into it
+    ▼ 4. run every InvariantCheck against the result
+    ▼ 5. provisioner teardown                          — discard the ephemeral environment
+    │
+    ▼
+DrillReport (outcome, RTO in milliseconds, per-invariant results)
+```
+
+`DrillEnvironmentProvisionerInterface` has Postgres and MongoDB drivers that each spin up a genuinely ephemeral database — not a shared staging environment a drill could collide with, and not the production database itself. The drill emits `BackupEvent` — `DrillSucceeded` (info) or `DrillFailed` (critical) — through the same [Alerts](/docs/alerts) event sink every other backup operation uses, so a failed drill pages someone the same way a failed nightly backup would.
+
+```bash
+# full drill — provision, restore, check invariants, teardown
+php bin/console backup:drill --engine=postgres --environment=production
+
+# shallow drill — faster, lighter invariant set, for frequent scheduling
+php bin/console backup:drill --engine=postgres --environment=production --shallow
+```
+
+## Invariant checks
+
+An invariant check is a pluggable assertion run against the restored database — not just "did the restore command exit 0," but "does the data actually look right":
+
+| Check | What it verifies |
+|---|---|
+| `RowCountInvariant` | Named tables have at least a minimum row count |
+| `ReferentialIntegrityInvariant` | Foreign-key relationships in the restored data are intact |
+| `SmokeQueryInvariant` | A configured query (e.g. "can we read the most recent order") returns a sane result |
+
+```php
+new RowCountInvariant(tables: ['orders', 'users'], minRows: 1);
+```
+
+Each check returns an `InvariantResult` (`pass` or `fail`, with a reason) rather than throwing — `DrillRunner` runs every configured check and reports all of them, so a drill failure tells you exactly which invariant broke, not just that something did.
+
+## RTO — measured, not assumed
+
+`DrillRunner` times the full provision-restore cycle in milliseconds and stamps it on the `DrillReport`. `RecoveryObjectives` defines your declared targets:
+
+```php
+$objectives = new RecoveryObjectives(rpoSeconds: 300, rtoSeconds: 1800);
+$objectives->rtoExceeded($report->rtoMs); // true if the drill took longer than your declared RTO
+```
+
+This is the only honest way to know whether your declared recovery time objective is real — the drill either restores within the window you've told stakeholders to expect, or it doesn't, measured on an actual restore, not estimated from how big the backup file is.
+
+<Callout type="warn" title="An RTO target nobody has measured is a guess">
+If `backup:drill` has never been run against a production-sized dataset, your DR documentation's RTO number is unverified. Schedule drills on a cadence that matches how often your data volume changes meaningfully — a drill against a 2GB test fixture doesn't tell you anything about restoring a 200GB production database.
+</Callout>
+
+## DR runbook generation
+
+```bash
+php bin/console backup:dr-runbook
+```
+
+`DrRunbookGenerator` produces a runbook from **live configuration plus the most recent drill data** — not a static document someone wrote once and never updated. Every time it's regenerated, it reflects the actual current backup schedule, retention policy, and the most recently measured RTO from a real drill. This is the same principle behind [Pipeline's generated workflows](/docs/pipeline) and [IaC's exported Terraform](/docs/iac) — the source of truth is the system's actual current state, and the document is a projection of it, not a hand-maintained artifact that quietly goes stale.
+
+## 3-2-1 replication
+
+```bash
+php bin/console backup:replicate
+```
+
+`SecondaryReplicator` reconciles the catalog: any artifact missing a copy at its declared secondary location gets copied there. Run this on a schedule alongside `backup:run` — an artifact that exists in only one location for more than a short window is a 3-2-1 violation the next replication cycle will fix automatically.

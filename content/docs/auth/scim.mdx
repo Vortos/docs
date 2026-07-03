@@ -1,0 +1,124 @@
+---
+title: SCIM Provisioning & SSO Role Mapping
+description: RFC 7643/7644 SCIM 2.0 user and group provisioning, tenant-scoped and idempotent, plus mapping IdP groups and claims to platform roles.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# SCIM Provisioning & SSO Role Mapping
+
+Enterprise customers don't create user accounts by hand — their identity provider (Okta, Azure AD, Google Workspace) pushes users and group memberships to you automatically, and expects your application's role model to stay in sync. `vortos-auth`'s SCIM module implements RFC 7643/7644 for exactly this, with the tenant isolation and idempotency that a real multi-tenant SCIM integration needs.
+
+## Tenant isolation, enforced fail-closed
+
+Every `ScimService` operation resolves the current tenant via `TenantContext::requireTenantId()` **before any storage access happens.** A missing tenant context throws immediately — there's no code path where a SCIM operation can accidentally read or write across a tenant boundary because the tenant lookup failed silently and defaulted to something.
+
+## Idempotent by externalId
+
+SCIM identity providers retry deliveries — a network blip during a provisioning push means the IdP will send the same `createUser` request again. `ScimService` keys operations by `externalId`:
+
+```php
+public function createUser(array $data): ScimUser
+{
+    $tenantId = $this->tenantContext->requireTenantId();
+    $externalId = (string) ($data['externalId'] ?? '');
+
+    if ($externalId !== '') {
+        $existing = $this->userStorage->findByExternalId($tenantId, $externalId);
+        if ($existing !== null) {
+            return $this->replaceUser($existing->id, $data); // re-delivery → update, not a duplicate
+        }
+    }
+    // ...
+}
+```
+
+A re-delivered `createUser` for a user that already exists becomes an update, not a duplicate account — this is what makes the integration safe against the retries every real IdP eventually sends.
+
+## Deactivation revokes roles, not just access
+
+```php
+// deactivating a SCIM User sets active=false AND marks every platform role revoked
+```
+
+When an IdP deactivates a user (someone leaves the company), `active` flips to `false` **and** every platform role association is marked revoked in the same operation. Downstream authorization checks read `active` — a deactivated SCIM user can't retain effective permissions through a role that technically still shows as assigned but should have been revoked at the same moment.
+
+## Mapping IdP groups and claims to platform roles
+
+`ClaimsRoleMapper` is the bridge between your IdP's vocabulary (a group called `Engineering-Admins`, a claim like `app_role:admin`) and your application's own role slugs:
+
+```php
+$mapper = new ClaimsRoleMapper(
+    mappings: [
+        new ClaimsRoleMapping(idpIdentifier: 'Engineering-Admins', platformRole: 'admin'),
+        new ClaimsRoleMapping(idpIdentifier: 'Engineering-*', platformRole: 'engineer'),
+    ],
+    defaultRole: 'member',
+);
+
+$mapper->mapGroupsToRoles(['Engineering-Admins', 'Everyone']); // ['admin']
+```
+
+<Callout type="warn" title="A malformed mapping fails closed to zero roles, not the default role">
+If any configured mapping pattern throws `RoleMappingException` while evaluating a group or claim, `ClaimsRoleMapper` logs the failure and returns an **empty** role list for that call — not the default role, not whatever roles matched before the failure. A broken regex in one mapping rule can't accidentally grant `defaultRole` (or worse, a previously-matched privileged role) to someone it wasn't supposed to. Fix the mapping; don't rely on the default role as a safety net for a bad pattern.
+</Callout>
+
+## Restricting which roles a SCIM token can assign
+
+Not every SCIM integration token should be able to provision an `admin` role. `ScimRoleGuard` checks every role a SCIM operation would assign against what the presenting token is actually permitted to grant:
+
+```php
+final class ScimRoleGuard
+{
+    public function assertPermittedRoles(ScimTokenRecord $token, array $roles): void
+    {
+        foreach ($roles as $role) {
+            if (!$token->isRolePermitted($role)) {
+                throw new ScimRoleForbiddenException($role, $token->id);
+            }
+        }
+    }
+}
+```
+
+Scope your SCIM tokens narrowly — a token that only needs to provision regular members shouldn't be configured with the ability to assign `admin`, even if the IdP-side group mapping would otherwise produce that result.
+
+## SCIM tokens and audit
+
+`ScimTokenService` issues and validates the bearer tokens an IdP authenticates with (`Redis`- or in-memory-backed via `ScimTokenStorageInterface`). Every accepted operation is recorded through `ScimAuditLogger` — who (which token), what operation, on which resource — so a provisioning push that grants or revokes access leaves the same kind of audit trail any other sensitive action does. See [Audit Logging](/docs/auth/audit-logging) for how this fits into the broader audit system.
+
+## Step-by-step: wiring an IdP
+
+<Steps>
+<Step>
+Issue a SCIM token scoped to the roles this integration should be allowed to assign:
+
+```bash
+php bin/console vortos:auth:keys:generate --scope=scim --permitted-roles=member,engineer
+```
+</Step>
+
+<Step>
+Configure your IdP's SCIM connector with your application's SCIM base URL and the issued bearer token. `ScimDiscoveryController` serves the RFC 7644 discovery endpoints (`/scim/v2/ServiceProviderConfig`, `/scim/v2/ResourceTypes`, `/scim/v2/Schemas`) most IdPs probe automatically during setup.
+</Step>
+
+<Step>
+Map the IdP's groups to your platform roles:
+
+```php title="config/auth.php"
+$config->scim()->roleMapping([
+    new ClaimsRoleMapping('Engineering-Admins', 'admin'),
+    new ClaimsRoleMapping('Engineering-*', 'engineer'),
+], defaultRole: 'member');
+```
+</Step>
+
+<Step>
+Trigger a sync from the IdP side and confirm provisioning landed correctly:
+
+```bash
+php bin/console vortos:auth:keys:list --scope=scim
+```
+</Step>
+</Steps>

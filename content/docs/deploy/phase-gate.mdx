@@ -1,0 +1,96 @@
+---
+title: Phase Gate & Rollback Guard
+description: Expand/contract migration safety, phase ordering rules, and the rollback guard that consults Release before allowing a rollback.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Phase Gate & Rollback Guard
+
+Two checks stand between a deploy plan and disaster: the **phase gate**, which refuses to plan a deploy while a contract migration is still pending, and the **rollback guard**, which refuses to roll back to a build whose schema requirements aren't actually satisfied by what's currently applied.
+
+## Expand/contract, briefly
+
+A schema change that's safe during a rolling or blue-green deploy is split into two migrations:
+
+- **Expand** — additive only (add a column, add a table). Both old and new code can run against the expanded schema.
+- **Contract** — destructive (drop a column, drop a table). Only safe once every instance is running code that no longer needs the old shape.
+
+Running expand and contract as a single migration during one deploy means there's a window — while old and new instances coexist during the rollout — where one of them is wrong about the schema. Splitting them across two deploys removes that window.
+
+## The phase gate
+
+`PhaseGate::assertNoPendingContract()` runs as the very first step of planning, before a strategy is even consulted:
+
+```php
+public function plan(DeployContext $context): DeployPlan
+{
+    $this->phaseGate->assertNoPendingContract($context->currentState);
+    // ...
+}
+```
+
+If `CurrentDeployState::$pendingContractMigrations` is non-empty, planning throws `ContractInSameDeployException` immediately. In practice this means: if your last deploy ran an expand migration and the matching contract migration hasn't shipped yet, the *next* deploy that tries to bundle a new expand phase with that lingering contract is refused — you have to ship the contract on its own first.
+
+## Phase ordering
+
+`PhaseOrderPolicy::assertValid()` checks the phase sequence a strategy produced, regardless of which strategy produced it. Two rules are enforced today:
+
+1. **`RollWorkers` must precede `Cutover`** — if workers roll after traffic has already cut over, you risk a message being consumed twice (old worker still draining, new worker already started, both pointed at the same queue).
+2. **`RollWorkers` must precede `StageColor`** — both the old and new worker code must be able to tolerate the *expanded* schema before the new color is even staged, otherwise there's a window where a worker can't process a job correctly.
+
+A violation throws a `\LogicException` naming exactly which rule failed and why — at plan time, before any step executes.
+
+## The rollback guard
+
+Rolling back is not the inverse of deploying — it's a separate operation with its own legality check. `RollbackGuard::assertLegal()` is what `deploy:rollback` calls before it touches anything:
+
+```php
+final class RollbackGuard
+{
+    public function assertLegal(BuildManifest $target, EnvironmentName $env): void
+    {
+        $applied = $this->appliedReader->currentApplied();
+        $known = $this->manifestReadModel->knownMigrationSetForEnvironment($env->value);
+
+        $decision = RollbackInvariant::evaluate($target->schemaFingerprint, $applied, $known);
+
+        if (!$decision->legal) {
+            throw new RollbackRefusedException($decision);
+        }
+    }
+}
+```
+
+This delegates directly to [Release's `RollbackInvariant`](/docs/release#the-rollback-invariant) — Deploy doesn't reimplement schema-safety math, it asks Release the same question Release answers everywhere else in the framework. If the target build's schema fingerprint isn't a subset of what's currently applied, the rollback is refused with a `RollbackRefusedException` that carries the same actionable `RollbackDecision::explain()` message Release produces.
+
+```bash
+php bin/console deploy:rollback --env=production --to=build-20260601-1
+```
+
+```
+Error: Rollback refused: target requires migration(s) [20260605_add_orders_index]
+that are not in the currently applied set. Recovery: roll forward to apply the
+missing migration(s), or create a compensating expand migration.
+```
+
+<Callout type="warn" title="This is why rollback isn't always available">
+If you're tempted to treat `deploy:rollback` as an emergency undo button, know that it will refuse outright rather than risk corrupting the schema. The recovery path in a true emergency is usually rolling *forward* with a fix, not backward past a contract migration.
+</Callout>
+
+## Where this fits
+
+```
+deploy --env=production
+    │
+    ▼ DeployPlanner::plan()
+    └── PhaseGate::assertNoPendingContract()   ← refuses if a contract migration is owed
+    └── PhaseOrderPolicy::assertValid()         ← refuses on unsafe phase ordering
+
+deploy:rollback --env=production
+    │
+    ▼ RollbackGuard::assertLegal()
+    └── Release\RollbackInvariant::evaluate()   ← refuses if target schema isn't a safe subset
+```
+
+Both checks are pure decision logic with the actual I/O (reading current state, reading the manifest read model) kept at the boundary — see [Release](/docs/release) for the underlying `SchemaFingerprint` and `RollbackInvariant` math.

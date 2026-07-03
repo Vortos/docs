@@ -1,0 +1,34 @@
+---
+title: Dead-Man Heartbeat
+description: A scheduled check-in to an off-host monitor — detected by absence, so a host that goes fully dark still gets noticed.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Dead-Man Heartbeat
+
+A "dead man's switch" only works because the check is on the *absence* side, watched by something other than the thing it's checking. The heartbeat emitter is the push half of that — your application pings an external monitor on a schedule, and **the monitor**, not your application, decides what "the ping stopped arriving" means.
+
+```php
+interface HeartbeatEmitterInterface
+{
+    /** Send one ping. Returns true if the external monitor acknowledged it. */
+    public function emit(HeartbeatPing $ping): bool;
+}
+```
+
+`emit()` must be bounded by a hard timeout and must never block or throw into whatever scheduler loop is calling it — a heartbeat mechanism that can itself hang defeats its own purpose.
+
+```bash
+php bin/console vortos:observability:heartbeat
+```
+
+Run this on a schedule (cron, a sidecar loop) pointed at any off-host dead-man-switch service. `HttpHeartbeatEmitter` is the shipped driver — a simple HTTP ping to a configured URL, since most dead-man-switch services (Healthchecks.io-style, BetterStack's heartbeat monitors, your own) expect exactly that.
+
+## How this fits the bigger picture
+
+[Health's `DetectorIndependenceDoctorCheck`](/docs/health-checks#pre-flight-diagnostics) treats this heartbeat as one of three independent failure detectors a production deploy is required to have configured — alongside in-app probes and an external [synthetic uptime monitor](/docs/health-checks/uptime). [Health's `health:monitor:tick` command](/docs/health-checks/uptime#driving-the-dead-man-heartbeat) drives this heartbeat directly from the local probe rollup, deciding whether to send a `Start`, `Success`, or `Fail` ping based on what the probes found.
+
+<Callout type="warn" title="The point is independence from the host's own health">
+If your liveness probe and your heartbeat both run on the same host and that host crashes completely, neither one fires — which is exactly why the heartbeat alone isn't sufficient and the doctor check requires a genuinely external synthetic prober as the third leg. A heartbeat that stops arriving tells you "something is wrong," but only an off-host check that actively probes your service tells you what.
+</Callout>

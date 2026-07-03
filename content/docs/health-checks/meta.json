@@ -1,6 +1,8 @@
 {
   "title": "Health Checks",
   "pages": [
-    "index"
+    "index",
+    "uptime",
+    "capacity-and-cert"
   ]
 }

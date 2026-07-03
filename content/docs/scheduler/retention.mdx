@@ -1,0 +1,233 @@
+---
+title: Run Retention (Auto-Prune)
+description: Automatic pruning of the run ledger, per-tenant retention overrides, legal holds, and the fire-queue consumer that actually executes scheduled commands.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Run Retention (Auto-Prune)
+
+`vortos_scheduler_runs` — the fire ledger — records one row per dispatched slot. Left alone, it grows forever: a deployment with 100 schedules firing every 5 minutes adds roughly 28,800 rows a day. The scheduler prunes this table automatically, on by default, with per-tenant overrides for compliance needs like legal holds.
+
+<Callout type="info">
+This page also documents the fire-queue consumer (`scheduler:consume`), because auto-prune depends on it: pruning is itself a scheduled command, so it only actually runs if the consumer is running. If you only run `scheduler:run` and not `scheduler:consume`, **no scheduled command executes at all** — schedules fire and enqueue, but nothing drains the queue. See [Two processes, not one](#two-processes-not-one) below.
+</Callout>
+
+## Zero-effort default
+
+Install the package, run migrations, start both worker processes (`scheduler:run` and `scheduler:consume` — see below) — that's it. A static schedule named `prune-scheduler-runs` is registered automatically by the framework itself (you never define it), firing daily at 03:00 UTC with a 15-minute jitter window, deleting completed/failed runs older than 30 days.
+
+Nothing to configure for the common case. Everything below is for tuning or overriding that default.
+
+## Two processes, not one
+
+Before S12, the scheduler had a real gap: `SchedulerDaemon` (`scheduler:run`) only scans for due schedules and writes a row into `vortos_scheduler_fire_queue` — it never executed anything. A second process, the **fire-queue consumer**, actually claims queued rows and dispatches them through the CQRS `CommandBus`.
+
+```
+scheduler:run      → scans, claims slots, writes ledger row + fire-queue row
+scheduler:consume  → claims fire-queue rows, hydrates the command, dispatches
+                      via CommandBusInterface, marks the ledger Completed/Failed
+```
+
+Both processes are required in production. Start the consumer the same way as the daemon:
+
+```bash
+php vortos scheduler:consume --loop
+```
+
+Options:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--loop` | off | Run continuously, polling for new rows, until `SIGTERM`/`SIGINT` |
+| `--batch-size` | `SCHEDULER_CONSUME_BATCH_SIZE` (50) | Rows claimed per batch |
+| `--poll-interval` | `SCHEDULER_CONSUME_POLL_INTERVAL_SEC` (2) | Seconds to sleep after an empty batch, in `--loop` mode |
+
+Without `--loop`, `scheduler:consume` processes exactly one batch and exits — useful for a cron-triggered consumer instead of a long-lived process, though `--loop` under a supervisor is the recommended production setup (same pattern as `scheduler:run`).
+
+```ini title="/etc/supervisor/conf.d/scheduler-consumer.conf"
+[program:vortos-scheduler-consumer]
+command=php /var/www/html/vortos scheduler:consume --loop
+directory=/var/www/html
+user=www-data
+autostart=true
+autorestart=true
+startretries=10
+stderr_logfile=/var/log/supervisor/scheduler-consumer.err.log
+stdout_logfile=/var/log/supervisor/scheduler-consumer.out.log
+```
+
+The consumer claims rows with `FOR UPDATE SKIP LOCKED` on Postgres, so it is safe to run more than one replica concurrently. On SQLite it is single-writer only — do not run multiple replicas there.
+
+<Callout type="warn">
+The consumer requires `vortos/vortos-cqrs` to be installed (it dispatches through `CommandBusInterface`). If Cqrs isn't installed, the consumer is never registered and `scheduler:doctor` check **C11** reports why — it is not a silent no-op.
+</Callout>
+
+## Commands your app schedules
+
+Anything referenced by `#[Scheduled]`'s `command` must be a `Vortos\Domain\Command\CommandInterface` DTO with a paired `#[AsCommandHandler]` handler — the same shape as every other write operation in the framework, not a Symfony Console command:
+
+```php
+use Vortos\Domain\Command\CommandInterface;
+use Vortos\Cqrs\Attribute\AsCommandHandler;
+use Vortos\Scheduler\Security\Attribute\SchedulableCommand;
+
+#[SchedulableCommand]
+final class GenerateMonthlyReportCommand implements CommandInterface
+{
+    public function __construct(
+        public readonly string $tenantId,
+        public readonly string $month,
+    ) {}
+
+    public function idempotencyKey(): ?string
+    {
+        return null; // the ledger's UNIQUE(tenant_id, schedule_id, slot) already guarantees exactly-once
+    }
+}
+
+#[AsCommandHandler]
+final class GenerateMonthlyReportHandler
+{
+    public function __invoke(GenerateMonthlyReportCommand $command): void
+    {
+        // ...
+    }
+}
+```
+
+`SchedulableCommandPass` asserts at container-compile time that every allowlisted command implements `CommandInterface` — a mistake here is a deploy-time failure, not a runtime surprise.
+
+## Global default
+
+```dotenv
+# Days to keep completed/failed runs. 0 disables auto-prune entirely.
+SCHEDULER_RUN_RETENTION_DAYS=30
+```
+
+Setting it to `0` means the framework does not register the prune schedule at all — no schedule, no daily no-op fire, no growth of the table it exists to shrink. `scheduler:prune` remains available as a manual command either way.
+
+## Per-tenant overrides
+
+A tenant with different retention needs (a longer compliance window, or a permanent legal hold) gets its own value, independent of the global default:
+
+```bash
+# This tenant needs 90-day retention for a contract clause
+php vortos scheduler:retention:set --tenant=acme --days=90 --actor=jsmith --reason="SOC2 contract clause 4.2"
+
+# Legal hold — never pruned, until explicitly removed
+php vortos scheduler:retention:set --tenant=acme --days=0 --actor=jsmith --reason="litigation hold, case #4821"
+
+# Revert to the global default
+php vortos scheduler:retention:remove --tenant=acme --actor=jsmith
+```
+
+<Callout type="warn">
+`--days=0` on the **per-tenant** override means "legal hold — never prune this tenant." This is different from the **global** `SCHEDULER_RUN_RETENTION_DAYS=0`, which disables auto-prune for everyone. Don't confuse the two.
+</Callout>
+
+Both commands require the `scheduler.retention.manage` permission (see [Security](/docs/scheduler/security)). There is deliberately no `.own` scope — retention policy is a compliance/operator decision, not something a tenant can self-service, unlike pause/resume/run-now.
+
+There is no separate "list overrides" command — the full tenant → retention-days table is already in `scheduler:doctor --json` output (check C10).
+
+## How multi-tenant pruning actually works
+
+One daily fire prunes every tenant at its own resolved retention in a single pass:
+
+1. Read every per-tenant override.
+2. For each override with `days > 0`: prune that tenant at `now − days`.
+3. Skip any override with `days = 0` (legal hold) entirely.
+4. Prune every *other* tenant (and rows with no tenant) at the global cutoff, explicitly excluding the tenants already handled in step 2.
+
+This is one query per overridden tenant, plus one "everyone else" query — not one query per tenant in your deployment.
+
+## Batched deletes
+
+The very first prune after upgrading an existing installation can face a large backlog — years of un-pruned history. Deleting it all in one statement is a real lock/IO risk, so pruning happens in bounded chunks:
+
+```dotenv
+SCHEDULER_PRUNE_BATCH_SIZE=5000        # rows deleted per chunk
+SCHEDULER_PRUNE_MAX_DURATION_SEC=240   # wall-clock budget for the entire sweep
+```
+
+If the duration budget is exhausted before every eligible row is deleted, the sweep stops and reports how many rows it deleted — **this is expected, not an error.** The next day's fire picks up where it left off. A large first-run backlog may take several days to fully catch up; `scheduler:doctor` (check C10) reports this via a `truncated` flag so it's never a silent surprise.
+
+## Fire-queue retention
+
+The run ledger isn't the only table that grows. Since S12 the fire-queue consumer marks each processed row `dispatched` or `failed` **instead of deleting it**, so the outcome of every fire stays inspectable in `vortos_scheduler_fire_queue`. Left alone, that table grows without bound too — the same disease the run ledger had.
+
+Terminal fire-queue rows are therefore pruned automatically as a side-step of the same daily sweep. Unlike the run ledger, the fire-queue is *transient dispatch intent* — the durable record of what ran lives in `vortos_scheduler_runs` and `vortos_scheduler_audit_log` — so it defaults to a much shorter horizon:
+
+```dotenv
+# Days to keep terminal (dispatched/failed) fire-queue rows. 0 disables. Default 7.
+SCHEDULER_FIRE_QUEUE_RETENTION_DAYS=7
+```
+
+Only `dispatched` and `failed` rows past the cutoff are deleted — `pending` and `processing` rows are never touched, regardless of age (an old pending row is a *stuck* row, surfaced by doctor check C11, not a candidate for silent deletion). The delete is chunked and time-budgeted with the same `SCHEDULER_PRUNE_BATCH_SIZE` / `SCHEDULER_PRUNE_MAX_DURATION_SEC` knobs as the run-ledger prune.
+
+<Callout type="info">
+Fire-queue pruning piggybacks on the **daily auto-prune fire**, which only exists when `SCHEDULER_RUN_RETENTION_DAYS > 0` (the default, 30). If you explicitly disable run retention by setting it to `0`, the prune schedule is never registered, so fire-queue pruning stops with it. This coupling is deliberate — the shared sweep is the single load-spreading mechanism, and it avoids a second scheduled job that would delete all terminal runs when run retention is meant to be off.
+</Callout>
+
+## Manual pruning
+
+`scheduler:prune` still exists, and now has two modes:
+
+```bash
+# Default: runs the exact same policy every tenant already gets automatically
+php vortos scheduler:prune
+
+# Explicit cutoff, bypassing all policy — e.g. incident cleanup
+php vortos scheduler:prune --before="2026-01-01T00:00:00Z" --tenant=acme
+
+# Preview without deleting
+php vortos scheduler:prune --dry-run --json
+```
+
+Both modes write an audit entry under the real operator's identity (not `system`), and the `--before` bypass is tagged `resolved: false` in the audit trail so it's visibly distinct from a policy-driven prune.
+
+| Flag | Meaning |
+|---|---|
+| `--before <ISO8601>` | Explicit cutoff; bypasses per-tenant/global policy resolution entirely |
+| `--tenant <id>` | Scope to one tenant — only valid together with `--before` |
+| `--actor <id>` | Operator identity for the audit log (default: `cli-operator`) |
+| `--dry-run` | Show what would happen without deleting |
+| `--json` | Machine-readable output |
+
+## Audit trail
+
+Every prune — automatic or manual — writes a `runs.pruned` entry to the same append-only, hash-chained `vortos_scheduler_audit_log` used for every other schedule mutation. It uses "never fail an already-completed prune over an audit hiccup" semantics: if the audit write itself fails, the prune result still stands (the delete already happened and can't be undone), and the failure is only counted, not thrown. Setting or removing a retention override does throw on audit failure — those are operator mutations, same contract as pause/resume/delete.
+
+## Observability
+
+Two new Prometheus metrics, following the existing cardinality-guard convention:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `vortos_scheduler_runs_pruned_total` | Counter | `tenant_id` |
+| `vortos_scheduler_fire_queue_pruned_total` | Counter | *(none — fire-queue prune is global)* |
+| `vortos_scheduler_prune_duration_seconds` | Histogram | `trigger` (`auto`\|`manual`) |
+| `vortos_scheduler_consume_results_total` | Counter | `result`, `schedule_id`, `tenant_id` |
+
+A `scheduler.prune` OTel span wraps every sweep; a `scheduler.consume` span wraps every fire-queue batch.
+
+## Doctor checks
+
+`scheduler:doctor` has two checks specific to this feature:
+
+- **C10 — retention config + liveness.** Reports the global retention setting and every per-tenant override (legal holds flagged). Also checks that a prune has actually *completed* recently — not just that it's configured. If more than 48 hours pass with no successful completion, it fails: "auto-prune is configured but has not completed successfully — check `scheduler:consume --loop` is running." A fresh install with no prune attempt yet reports `Skip`, not `Fail`.
+- **C11 — fire-queue consumer liveness.** Checks the oldest `pending` row in `vortos_scheduler_fire_queue`. Empty queue or a young oldest-pending row passes; an old one fails with "the consumer does not appear to be running or is falling behind." This check isn't retention-specific — it catches a dead consumer for *any* scheduled command, generically.
+
+## Config file
+
+Every setting on this page is also available as a fluent, IDE-autocompleted config object instead of raw env vars — see [Installation](/docs/scheduler/installation#configuration) for `config/scheduler.php`.
+
+```php title="config/scheduler.php"
+return static function (VortosSchedulerConfig $config): void {
+    $config
+        ->runRetentionDays(90)
+        ->fireQueueRetentionDays(3)
+        ->pruneBatchSize(2000)
+        ->consumeBatchSize(200);
+};
+```

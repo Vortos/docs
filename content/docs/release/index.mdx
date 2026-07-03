@@ -1,0 +1,234 @@
+---
+title: Release
+description: Immutable build manifests, schema fingerprinting, the rollback invariant, and coordinated semver tagging across the monorepo.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Release
+
+`vortos-release` answers a question that's easy to get wrong under pressure: **is it safe to roll this deployment back?** A rollback that reintroduces code expecting a database column that a later migration dropped doesn't fail loudly — it fails as silent data corruption, hours later. Release exists so that question has a mathematically checkable answer instead of a guess.
+
+It also handles the boring-but-error-prone parts of shipping a split monorepo: computing the next semver for each package from conventional commits, tagging all of them atomically, and generating changelogs — without you maintaining version numbers by hand.
+
+<Callout type="info" title="Why this is its own package">
+Schema fingerprinting and the rollback invariant only work because [Migration](/docs/migrations) tracks every migration ID ever applied. Release sits on top of Migration and [Deploy](/docs/deploy) rather than duplicating their state — a `BuildManifest` records a schema fingerprint at build time, and Deploy's [phase gate](/docs/deploy/phase-gate) asks Release whether a rollback is legal before it acts on one.
+</Callout>
+
+## The rollback invariant
+
+A rollback is legal exactly when the schema the *target* build expects is a **subset** of the schema currently applied. If the target needs a migration that hasn't run, rolling back to it would leave the app expecting columns or tables that don't exist. If the currently-applied set contains a migration nobody has a manifest for, something was applied outside the normal release flow — rolling back blind is no longer safe to assume.
+
+```php
+use Vortos\Release\Schema\RollbackInvariant;
+
+$decision = RollbackInvariant::evaluate(
+    target: $targetManifest->schemaFingerprint,
+    applied: $currentlyAppliedFingerprint,
+    known: $knownMigrationSet,
+);
+
+if (!$decision->legal) {
+    throw new RuntimeException($decision->explain());
+}
+```
+
+`RollbackDecision::explain()` doesn't just say no — it says *why*, and what to do about it:
+
+```
+Rollback refused: target requires migration(s) [20260601_add_orders_index] that are
+not in the currently applied set. Recovery: roll forward to apply the missing
+migration(s), or create a compensating expand migration.
+```
+
+```
+Rollback refused: the currently applied set contains unknown migration(s)
+[20260615_hotfix] not present in any recorded manifest. This may indicate a manual
+hotfix. Recovery: record a manifest for the current state before rolling back.
+```
+
+This is pure value-object math — `SchemaFingerprint`, `KnownMigrationSet`, and `RollbackInvariant` have no I/O. Given the same three inputs, the answer is always the same, which is exactly what you want from a check that gates a rollback.
+
+## Schema fingerprints
+
+A `SchemaFingerprint` is a sorted, deduplicated set of migration IDs reduced to a single SHA-256 hash:
+
+```php
+use Vortos\Release\Schema\SchemaFingerprint;
+
+$fingerprint = new SchemaFingerprint(['20260601_a', '20260602_b']);
+
+$fingerprint->hash;          // 'sha256:...' — stable regardless of input order
+$fingerprint->isSubsetOf($other);
+$fingerprint->relationTo($other); // FingerprintRelation::Equal|Subset|Superset|Overlapping|Disjoint
+```
+
+Two fingerprints with the same migration IDs always produce the same hash — order-independence is what lets you compare a fingerprint computed at build time against one computed at deploy time without worrying about how the IDs happened to be listed.
+
+## Build manifests
+
+A `BuildManifest` is the immutable record tying a specific build to the exact schema state it expects:
+
+```php
+use Vortos\Release\Manifest\Arch;
+use Vortos\Release\Manifest\BuildManifest;
+
+$manifest = new BuildManifest(
+    buildId: 'build-20260625-1',
+    gitSha: '4f9c2a1',
+    imageRepository: 'ghcr.io/acme/app',
+    imageDigest: 'sha256:' . str_repeat('a', 64),
+    targetArch: Arch::Amd64,
+    environment: 'production',
+    schemaFingerprint: $fingerprint,
+    createdAt: new \DateTimeImmutable(),
+);
+```
+
+`gitSha`, `imageRepository`, and `imageDigest` are validated against strict patterns at construction — a manifest can never be built with a malformed digest or a repository that carries a tag/digest suffix. `pullReference()` joins the repository and digest into the fully-pinned `ghcr.io/acme/app@sha256:…` — the only image string a deploy target ever pulls. In practice you rarely build a manifest by hand: the generated deploy job runs [`vortos:release:record-manifest`](#recording-a-build) for you. Manifests are recorded through `ManifestRepositoryInterface::record()`, which is **append-only**: the DBAL implementation throws `ManifestAlreadyExistsException` on a duplicate `buildId` rather than silently overwriting history. This is the same write-once guarantee the [audit hash chain](/docs/auth/audit-logging) and [observability audit ledger](/docs/observability/audit-ledger) rely on elsewhere in the framework.
+
+<Callout type="warn" title="Manifests are evidence, not configuration">
+Don't reach for a `BuildManifest` to store deploy configuration — that's [Deploy](/docs/deploy)'s job. A manifest exists purely so that, months later, you can answer "what schema did build X expect" and "is it safe to go back to it" without trusting memory.
+</Callout>
+
+## Recording a build
+
+A `BuildManifest` has to be recorded before [Deploy](/docs/deploy) can act on a build — `deploy` reads the latest manifest for the environment, so with no manifest it refuses (there is nothing to deploy). `vortos:release:record-manifest` writes that record. It runs in the deploy job, **after** the image is built and pushed and **before** `deploy`, and derives the schema fingerprint from the build's available migrations (not the applied set — the migrations have not run yet at this point).
+
+```bash
+php bin/console vortos:release:record-manifest \
+    --env=production \
+    --repository=ghcr.io/acme/app \
+    --digest=sha256:abc... \
+    --git-sha=$(git rev-parse HEAD) \
+    --arch=arm64
+```
+
+It is **idempotent on build id**, so a retried CI job re-recording the same build is a success, not an error. The generated [pipeline](/docs/pipeline) emits this step for you — you rarely run it by hand.
+
+## Coordinated package tagging
+
+The monorepo splits into dozens of installable packages (see [the split workflow](/docs/contributing)). `vortos:release:tag` computes the next version for every package from [Conventional Commits](https://www.conventionalcommits.org/), plans the bump, and tags them all in one atomic transaction.
+
+```bash
+# see what would happen — no tags created, nothing pushed
+php bin/console vortos:release:tag
+
+# actually create and push tags
+php bin/console vortos:release:tag --apply
+
+# sign tags with your configured GPG/SSH key
+php bin/console vortos:release:tag --apply --sign
+
+# force a bump level instead of inferring from commits
+php bin/console vortos:release:tag --apply --bump=minor
+
+# tag only specific packages
+php bin/console vortos:release:tag --apply --package=vortos/vortos-auth --package=vortos/vortos-security
+```
+
+<Callout type="warn" title="Dry-run by default">
+`vortos:release:tag` never creates or pushes a tag unless you pass `--apply`. Run it without `--apply` first to review the plan.
+</Callout>
+
+### Undoing a tagging run
+
+Every apply gets a transaction ID. If something goes wrong immediately after, undo it:
+
+```bash
+php bin/console vortos:release:tag --undo=<transaction-id>
+```
+
+This removes exactly the tags that transaction created — nothing else.
+
+### Version skew
+
+`VersionSkewGuard` detects packages whose current tagged version has drifted out of sync with the rest of the monorepo (for example, a package that was tagged manually outside this command). If skew is detected, `--apply` refuses to run until you've reconciled it — a dry-run still shows you the plan so you can see exactly which packages are affected.
+
+## Versioning strategy
+
+Versions are computed by a pluggable `VersioningStrategyInterface`. The shipped default is `ConventionalSemverStrategy`, which parses commit messages (`feat:`, `fix:`, `BREAKING CHANGE:`) into a `BumpLevel` (`None`, `Patch`, `Minor`, `Major`) and applies it to the current `SemverVersion`:
+
+```php
+use Vortos\Release\Version\SemverVersion;
+use Vortos\Release\Version\BumpLevel;
+
+$current = SemverVersion::parse('v2.3.1');
+$next = $current->withBump(BumpLevel::Minor); // v2.4.0
+```
+
+An `AlphaCounterStrategy` is also available for packages still pre-1.0 that want a monotonically increasing alpha counter instead of full semver.
+
+## Changelogs
+
+```bash
+# print the changelog for every package
+php bin/console vortos:release:changelog
+
+# write CHANGELOG.md into each package directory
+php bin/console vortos:release:changelog --write
+
+# only show what hasn't been released yet
+php bin/console vortos:release:changelog --unreleased
+
+# limit to one package
+php bin/console vortos:release:changelog --package=vortos/vortos-auth
+```
+
+`ChangelogGenerator` groups parsed conventional commits by type (features, fixes, breaking changes) per package. `SecretPatternScrubber` runs over every entry before rendering — commit messages that accidentally include something matching a secret pattern are scrubbed before they ever reach a published `CHANGELOG.md`.
+
+## Step-by-step: cutting a release
+
+<Steps>
+<Step>
+Make sure your working tree is clean (or pass `--allow-dirty` if you really mean it):
+
+```bash
+git status
+```
+</Step>
+
+<Step>
+Review the plan:
+
+```bash
+php bin/console vortos:release:tag
+```
+</Step>
+
+<Step>
+Generate and review changelogs:
+
+```bash
+php bin/console vortos:release:changelog
+```
+</Step>
+
+<Step>
+Apply — this tags and pushes every affected package atomically:
+
+```bash
+php bin/console vortos:release:tag --apply --sign
+```
+</Step>
+
+<Step>
+Write changelogs to disk and commit them:
+
+```bash
+php bin/console vortos:release:changelog --write
+git add '**/CHANGELOG.md' && git commit -m "docs: update changelogs"
+```
+</Step>
+</Steps>
+
+## How Deploy uses this
+
+[Deploy](/docs/deploy)'s [phase gate](/docs/deploy/phase-gate) calls `RollbackInvariant::evaluate()` before allowing a rollback to proceed. This is why a rollback that would corrupt the schema is refused automatically, rather than relying on whoever is running the deploy to remember to check.
+
+<Cards>
+  <Card title="Deploy" href="/docs/deploy" description="Strategies, the pure planner, and the phase gate that consults Release before rolling back." />
+  <Card title="Migrations" href="/docs/migrations" description="The migration tracking that schema fingerprints are built from." />
+</Cards>

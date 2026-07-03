@@ -1,0 +1,229 @@
+---
+title: Troubleshooting
+description: Common problems, how to diagnose them, and how to fix them.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Troubleshooting
+
+Start with `php vortos scheduler:doctor`. It runs 11 health checks (C1–C11) and reports exactly what is wrong, with a remediation hint for each failure. Most common problems are immediately visible there.
+
+## Schedules "fire" but nothing ever happens
+
+This is the single most common problem, and it isn't obvious from the daemon logs — the daemon looks completely healthy. Check whether `scheduler:consume` is running:
+
+```bash
+ps aux | grep 'scheduler:consume'
+php vortos scheduler:doctor   # check C11
+```
+
+`scheduler:run` only scans for due schedules and writes them into `vortos_scheduler_fire_queue` — it never executes anything itself. A separate process, `scheduler:consume --loop`, drains that queue and dispatches through the CQRS bus. If it isn't running (or isn't installed — it requires `vortos/vortos-cqrs`), fire-queue rows accumulate in `pending` state forever, and every scheduled command silently never runs, no matter how healthy the daemon looks.
+
+**Fix**: start the consumer.
+
+```bash
+php vortos scheduler:consume --loop
+```
+
+See [Two processes, not one](/docs/scheduler/retention#two-processes-not-one) for the full explanation, and [Running](/docs/scheduler/running#scheduler-consume) for supervisor configuration.
+
+<Callout type="warn">
+If you're upgrading an existing installation and never ran `scheduler:consume` before, check C11 will fail immediately once you upgrade — this is expected. It means the check is working, not that the upgrade broke something.
+</Callout>
+
+## Schedules are not firing
+
+**Check 1: Is the daemon running?**
+
+```bash
+ps aux | grep 'scheduler:run'
+```
+
+If no process is running, start it:
+
+```bash
+php vortos scheduler:run
+```
+
+Or check your supervisor/Docker Compose configuration.
+
+**Check 2: Is the schedule active?**
+
+```bash
+php vortos scheduler:list --name=your-schedule-name
+```
+
+Check the `Status` column. If it is `Paused`, resume it:
+
+```bash
+php vortos scheduler:resume your-schedule-name
+```
+
+If there is a force-override set by an operator, clear it from the admin UI under Overrides.
+
+**Check 3: Is the lease being acquired?**
+
+The daemon logs its lease acquisition. Check the daemon logs for:
+
+```
+[INFO] Lease acquired for shard 0
+```
+
+If you see:
+
+```
+[INFO] Lease not available for shard 0, skipping tick
+```
+
+Another instance holds the lease. That is normal if you accidentally started two daemons. Kill the extra one.
+
+If the lease appears stuck (another process held it and crashed before releasing), wait for the TTL to expire (`SCHEDULER_LEASE_TTL_SEC`, default: 30 seconds), or use `postgres-advisory` which releases instantly on disconnect.
+
+**Check 4: Is the circuit breaker open?**
+
+The circuit breaker isn't a dedicated `scheduler:doctor` check — if the dispatch backend has failed `SCHEDULER_CB_FAILURE_THRESHOLD` consecutive times (default: 5), the circuit opens and every subsequent dispatch returns `CircuitOpen` without touching the backend. Check daemon logs for `CircuitOpen` results, or run `scheduler:doctor` check C4 (lease driver reachable) and C5 (migrations applied) to rule out the most common underlying causes. The circuit resets after `SCHEDULER_CB_RECOVERY_WINDOW_SEC` (default: 30 seconds) and probes once. Fix the underlying backend issue first.
+
+**Check 5: Is the due scan finding the schedule?**
+
+Check whether the schedule's next fire time is in the future:
+
+```bash
+php vortos scheduler:list --name=your-schedule-name
+```
+
+The `Next Due` column should show a time in the near past (meaning it is due and should be dispatched on the next tick) or the near future. If it shows a time far in the future, your cron expression might be wrong.
+
+---
+
+## A schedule is firing more than expected
+
+The scheduler guarantees at-most-once enqueue, not at-most-once execution. If a job fires multiple times, the issue is probably on the consumer side:
+
+- The command handler is not idempotent — it does not check if the work was already done
+- The message bus is retrying a failed execution
+- Two different consumer workers processed the same message
+
+Check your command handler for idempotency. It should be safe to call twice with the same input.
+
+The scheduler itself is protected against enqueueing the same slot twice by a `UNIQUE(tenant_id, schedule_id, slot)` constraint on `vortos_scheduler_runs` — a duplicate enqueue attempt fails at the database level before it ever reaches the fire queue. If you're seeing genuine double-execution, the duplication is happening downstream (consumer/command handler), not in the scheduler's dispatch path.
+
+---
+
+## The daemon keeps restarting
+
+Check the exit code. A clean shutdown exits with code 0. A code 1 exit indicates a startup error — check the logs for initialization failures.
+
+Common causes:
+- Database not reachable at startup
+- Redis not reachable (if using the Redis lease driver)
+- Migration not run — tables are missing
+
+Run `scheduler:doctor` to get a diagnosis:
+
+```bash
+php vortos scheduler:doctor
+```
+
+---
+
+## The audit chain is broken
+
+A broken audit chain means either:
+
+1. A row in the `vortos_scheduler_audit_log` table was modified or deleted
+2. The HMAC chain key changed
+3. There is a bug in the audit projector (should not happen with a standard installation)
+
+**Immediate action**: do not modify or delete any more rows. Take a backup of the current state of the audit table.
+
+**Investigation**: check which entry is broken:
+
+```php
+$result = $auditChainVerifier->verify(tenantId: null);
+echo "Broken at entry: " . $result->brokenAtEntryId . "\n";
+```
+
+Then look at the surrounding rows in `vortos_scheduler_audit_log` for that entry ID and the rows before it. Check whether the `previous_hash` and `hash` columns match what they should be.
+
+**If the chain is broken due to a legitimate operational decision** (e.g., a legal hold release required deleting specific rows), the chain must be re-sealed from a known-good checkpoint. This requires a manual operation — contact the Vortos team.
+
+---
+
+## Misfire recovery created too many jobs
+
+If the daemon was down for a long time and came back with many misfired schedules using `FireAll`, the job queue may be flooded.
+
+**Immediate mitigation**: reduce the catchup window temporarily:
+
+```dotenv
+SCHEDULER_MAX_CATCHUP_AGE_SECONDS=3600
+```
+
+Then restart the daemon. It will only catch up on the last hour, not the full 24 hours.
+
+**After recovery**: decide whether your schedules should use `FireAll` or `FireOnce`. For most schedules, `SkipMissed` is the safest default.
+
+---
+
+## A 4-eyes approval is blocking an urgent change
+
+In an incident where you need to make an immediate change to a schedule but the normal approver is unavailable:
+
+1. Check whether the approval requires a specific role or just any second person
+2. Find another person with `scheduler.approval.approve` permission
+3. Have them approve via CLI: `php vortos scheduler:approve {requestId} --action=approve`
+
+If the 4-eyes gate itself is the problem (e.g., the approval store is unreachable), you may need to temporarily use an override:
+
+```bash
+php vortos scheduler:pause prune-audit-logs  # If you need to stop it
+php vortos scheduler:resume prune-audit-logs  # Or force-resume
+```
+
+Overrides bypass the normal policy and take effect immediately. Use them only during emergencies and document the reason in the audit log by adding a note via the admin UI.
+
+---
+
+## The admin UI shows a blank page or 403
+
+**Blank page**: usually a missing asset. Run:
+
+```bash
+php vortos vortos:assets:publish
+```
+
+Check that `public/bundles/scheduler-admin/` exists and contains CSS and JS files.
+
+**403 Forbidden**: your user lacks the `scheduler.schedule.read` permission. Check your RBAC role configuration. The admin UI enforces the same policy as the CLI.
+
+---
+
+## Memory leak in long-running daemon
+
+Check whether memory grows unboundedly:
+
+```bash
+watch -n 5 'ps -o rss,vsz,pid,cmd -p $(pgrep -f scheduler:run)'
+```
+
+RSS growth of a few MB over hours is normal (PHP internal caches). Growth of hundreds of MB suggests a leak.
+
+Common causes:
+- Accumulation of log entries in memory (check your logger configuration)
+- Growing static schedule registry (if you are dynamically adding to it, which you should not do)
+- A custom extension (metrics sink, SIEM forwarder) that accumulates state
+
+Run with Xdebug or blackfire to profile. The daemon's main loop is in `SchedulerDaemon::run()` — check what grows between `runOnce()` calls.
+
+---
+
+## Upgrade notes
+
+When upgrading `vortos/vortos-scheduler`, always check the changelog for:
+
+- New database columns that require a migration (`vortos:migrate`)
+- Changes to env var names or defaults
+- Removed or renamed service IDs that you may have overridden in your service configuration
+
+Run `scheduler:doctor` after every upgrade to verify everything is still healthy.

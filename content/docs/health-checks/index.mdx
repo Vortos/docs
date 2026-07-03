@@ -1,41 +1,27 @@
 ---
 title: Health Checks
-description: Production health endpoints, readiness checks, token-gated diagnostics, criticality, and custom health checks.
+description: Tri-state liveness/readiness/startup probes, a budget-bound aggregator, legacy check compatibility, and pre-flight diagnostics.
 ---
 
 import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
 
 # Health Checks
 
-Vortos ships with health endpoints for load balancers, container platforms, monitoring tools, and human debugging. The framework separates “the process is alive” from “the app can safely receive traffic” so production infrastructure can make the right decision.
+`vortos-health` is the canonical probe system — it answers "is the process alive," "can it safely receive traffic," and "has it finished starting up" as three genuinely separate questions, each with its own endpoint, so your container platform can make the right decision for each one instead of one fuzzy health check trying to answer all three.
+
+<Callout type="info" title="Three states, not two">
+Every probe reports `pass`, `warn`, or `fail` — not just healthy/unhealthy. `warn` lets a probe flag "this is getting concerning" (disk at 88% used, a certificate expiring in nine days) without flipping `/health/ready` to a 503. Only `fail` takes an instance out of rotation.
+</Callout>
 
 ## Endpoints
 
-| Endpoint | Purpose | Runs dependency checks | Fails on optional checks |
-|---|---:|---:|---:|
-| `GET /health/live` | Process liveness | No | No |
-| `GET /health/ready` | Traffic readiness | Critical checks only | No |
-| `GET /health` | Operational summary | All checks | No |
-
-Use `/health/live` for container liveness probes. Use `/health/ready` for Kubernetes readiness probes, deployment gates, and load balancer traffic decisions. Use `/health` for dashboards and humans.
-
-## Liveness
-
-```bash
-curl -i http://localhost:8000/health/live
-```
-
-```json
-{
-  "status": "ok",
-  "mode": "live",
-  "timestamp": "2026-05-06T10:35:21+00:00"
-}
-```
-
-`/health/live` does not touch the database, Redis, MongoDB, Kafka, or any custom check. It only tells the platform that the PHP process can answer HTTP.
-
-## Readiness
+| Endpoint | Probe kind | Purpose |
+|---|---:|---|
+| `GET /health/live` | `ProbeKind::Liveness` | Process liveness — container platform restarts on failure |
+| `GET /health/ready` | `ProbeKind::Readiness` | Traffic readiness — load balancer / k8s readiness gate |
+| `GET /health/startup` | `ProbeKind::Startup` | Has the process finished its startup sequence |
+| `GET /health` | — | Operational summary — runs every probe, for dashboards and humans |
 
 ```bash
 curl -i http://localhost:8000/health/ready
@@ -44,360 +30,138 @@ curl -i http://localhost:8000/health/ready
 ```json
 {
   "status": "ok",
-  "mode": "ready",
-  "timestamp": "2026-05-06T10:35:21+00:00",
   "checks": {
-    "database": { "status": "ok" },
-    "redis": { "status": "ok" }
+    "database": { "status": "pass" },
+    "redis": { "status": "pass" },
+    "disk-capacity": { "status": "warn" }
   }
 }
 ```
 
-Readiness runs only critical checks. If a critical check is degraded, Vortos returns `503 Service Unavailable`:
+## The probe contract
 
-```json
+```php
+interface HealthProbeInterface extends DriverInterface
 {
-  "status": "degraded",
-  "mode": "ready",
-  "checks": {
-    "database": { "status": "degraded" }
-  }
+    public function name(): string;
+    public function kind(): ProbeKind;
+    public function check(): ProbeResult;
 }
 ```
 
-## Full Health Summary
+`ProbeKind` is `Liveness`, `Readiness`, or `Startup` — a probe declares which question it answers, and the aggregator only runs the probes relevant to the endpoint that was hit. A probe that talks to the database has no business running on `/health/live`, which exists specifically so a database outage doesn't make your container platform think the *process* is dead and start restarting it.
 
-```bash
-curl -i http://localhost:8000/health
-```
-
-```json
+```php
+enum ProbeStatus: string
 {
-  "status": "ok",
-  "mode": "health",
-  "timestamp": "2026-05-06T10:35:21+00:00",
-  "checks": {
-    "database": { "status": "ok" },
-    "redis": { "status": "ok" },
-    "kafka": { "status": "degraded" }
-  }
-}
-```
+    case Pass = 'pass';
+    case Warn = 'warn';
+    case Fail = 'fail';
 
-`/health` runs every registered check. Optional degraded checks are reported, but they do not make the endpoint return `503`. Critical degraded checks do.
-
-## Detail Policy
-
-Public responses only show per-check status. Detailed responses include latency, criticality, timeout markers, and stable error codes.
-
-Vortos reads detail behavior from environment variables:
-
-```bash
-HEALTH_DETAILS=never
-HEALTH_TOKEN=change-me
-HEALTH_EXPOSE_ERRORS=false
-```
-
-| Variable | Default | Values | Meaning |
-|---|---|---|---|
-| `HEALTH_DETAILS` | `never` | `never`, `token`, `debug`, `always` | Controls when detailed output is returned |
-| `HEALTH_TOKEN` | empty | any secret string | Required when detail access uses the token path |
-| `HEALTH_EXPOSE_ERRORS` | `false` | boolean | Allows raw exception messages outside dev/debug |
-
-Policies:
-
-| Policy | Behavior |
-|---|---|
-| `debug` | Detailed output in `APP_ENV=dev` or `APP_DEBUG=true`; token also works in other environments |
-| `token` | Detailed output only when `X-Health-Token` matches `HEALTH_TOKEN` |
-| `never` | Detailed output is disabled |
-| `always` | Detailed output is always returned |
-
-<Callout type="warn" title="Production Default">
-The default is `never` — detailed output is disabled unless you explicitly set `HEALTH_DETAILS`. For monitored production systems, use `HEALTH_DETAILS=token` and set a strong `HEALTH_TOKEN`. Never use `always` on a public network.
-</Callout>
-
-## Detailed Output
-
-```bash
-curl \
-  -H "X-Health-Token: change-me" \
-  http://localhost:8000/health
-```
-
-```json
-{
-  "status": "degraded",
-  "mode": "health",
-  "checks": {
-    "database": {
-      "status": "degraded",
-      "latency_ms": 14.22,
-      "critical": true,
-      "error_code": "database_unreachable"
-    },
-    "kafka": {
-      "status": "degraded",
-      "latency_ms": 0,
-      "critical": false,
-      "error_code": "kafka_extension_missing"
+    public function isHealthy(): bool
+    {
+        return $this !== self::Fail;
     }
-  }
 }
 ```
 
-Raw exception messages are hidden outside `APP_ENV=dev` and `APP_DEBUG=true` unless `HEALTH_EXPOSE_ERRORS=true` is set:
+## The aggregator and its budget
 
-```json
+`HealthAggregator` runs every probe registered for the requested kind and combines the results, bounded by a `HealthBudget`:
+
+```php
+final readonly class HealthBudget
 {
-  "status": "degraded",
-  "latency_ms": 14.22,
-  "critical": true,
-  "error_code": "database_unreachable",
-  "error": "SQLSTATE[08006] connection failed"
+    public function __construct(
+        public int $perProbeDeadlineMs = 3000,    // a single slow probe can't hang the whole check
+        public int $overallBudgetMs = 10000,      // the entire aggregation has a hard ceiling
+        public int $readyCacheTtlMs = 1000,       // /health/ready briefly caches its result
+    ) {}
 }
 ```
 
-## Built-In Checks
+`perProbeDeadlineMs` must be less than or equal to `overallBudgetMs` — enforced at construction, not discovered at 3am when a hung probe takes your readiness endpoint down with it. The short `readyCacheTtlMs` window means a load balancer hammering `/health/ready` every few hundred milliseconds doesn't re-run every probe on every single request.
 
-| Check | Module | Critical | What it does |
-|---|---|---:|---|
-| `database` | Persistence DBAL | Yes | Executes `SELECT 1` through Doctrine DBAL |
-| `redis` | Cache | Yes | Sends Redis `PING` |
-| `mongodb` | Persistence Mongo | Yes | Sends MongoDB admin `ping` |
-| `kafka` | Messaging (Kafka driver) | No | Fetches Kafka broker metadata when Kafka transports exist |
+## Custom probes
 
-If a module is not active, its check is not registered.
+```php title="src/Payment/Infrastructure/Health/PaymentGatewayProbe.php"
+use Vortos\Health\Probe\HealthProbeInterface;
+use Vortos\Health\Probe\ProbeKind;
+use Vortos\Health\Probe\ProbeResult;
+use Vortos\Health\Probe\ProbeStatus;
+use Vortos\OpsKit\Attribute\AsDriver;
+use Vortos\OpsKit\Driver\Capability\CapabilityDescriptor;
 
-## Criticality
-
-Critical checks decide whether `/health/ready` and `/health` return `200` or `503`. Optional checks are useful for visibility, but they do not remove the instance from service.
-
-Use critical checks for dependencies required to serve normal traffic. Use optional checks for background systems, analytics pipelines, or integrations where the app can still handle requests.
-
-## Timeouts
-
-Each health check can declare a timeout in milliseconds. If a check reports latency above that timeout, Vortos marks it degraded with:
-
-```json
+#[AsDriver('payment-gateway')]
+final class PaymentGatewayProbe implements HealthProbeInterface
 {
-  "status": "degraded",
-  "error_code": "health_check_timeout",
-  "timed_out": true
-}
-```
-
-<Callout type="info" title="Timeout Semantics">
-The timeout is enforced as a health classification after the check returns. Configure the underlying client timeouts too, so database, Redis, MongoDB, Kafka, and HTTP clients cannot block the request for too long.
-</Callout>
-
-## Custom Checks
-
-Add `#[AsHealthCheck]` to any class that implements `HealthCheckInterface`.
-
-```php title="src/Payment/Infrastructure/Health/PaymentGatewayHealthCheck.php"
-<?php
-
-declare(strict_types=1);
-
-namespace App\Payment\Infrastructure\Health;
-
-use Vortos\Foundation\Health\Attribute\AsHealthCheck;
-use Vortos\Foundation\Health\Contract\HealthCheckInterface;
-use Vortos\Foundation\Health\HealthResult;
-
-#[AsHealthCheck(critical: false, timeoutMs: 1500)]
-final class PaymentGatewayHealthCheck implements HealthCheckInterface
-{
-    public function __construct(private readonly PaymentGatewayClient $client) {}
+    public function __construct(private PaymentGatewayClient $client) {}
 
     public function name(): string
     {
         return 'payment-gateway';
     }
 
-    public function check(): HealthResult
+    public function kind(): ProbeKind
     {
-        $start = hrtime(true);
+        return ProbeKind::Readiness;
+    }
 
+    public function capabilities(): CapabilityDescriptor
+    {
+        return CapabilityDescriptor::create([]);
+    }
+
+    public function check(): ProbeResult
+    {
         try {
             $this->client->ping();
 
-            return new HealthResult($this->name(), true, $this->ms($start));
+            return ProbeResult::pass($this->name());
         } catch (\Throwable $e) {
-            return new HealthResult(
-                $this->name(),
-                false,
-                $this->ms($start),
-                $e->getMessage(),
-                'payment_gateway_unreachable',
-            );
-        }
-    }
-
-    private function ms(int $start): float
-    {
-        return round((hrtime(true) - $start) / 1_000_000, 2);
-    }
-}
-```
-
-The compiler pass auto-registers attributed checks from `src/`. Framework modules register their own checks through their package extension.
-
-## CLI Health Check
-
-Run all registered health checks from the terminal with `vortos:health`:
-
-```bash
-php bin/console vortos:health
-```
-
-```
-VORTOS HEALTH
-────────────────────────────────────────────────────────────
-
-  [OK]     database              1.2ms
-  [OK]     redis                 0.8ms
-  [WARN]   kafka                 2.5ms  [non-critical]
-           broker metadata timeout
-
-────────────────────────────────────────────────────────────
-  2 passed  1 warned  0 failed
-```
-
-Exit code `0` when all critical checks pass, `1` when any critical check fails — compatible with CI pipelines and deployment gates.
-
-### Options
-
-```bash
-# run only critical checks
-php bin/console vortos:health --critical-only
-
-# machine-readable JSON output
-php bin/console vortos:health --format=json
-```
-
-JSON output:
-
-```json
-{
-    "status": "ok",
-    "checks": {
-        "database": {
-            "status": "ok",
-            "latency_ms": 1.2,
-            "critical": true
-        },
-        "redis": {
-            "status": "ok",
-            "latency_ms": 0.8,
-            "critical": true
+            return ProbeResult::fail($this->name(), $e->getMessage());
         }
     }
 }
 ```
 
-`status` is `ok` when all critical checks pass, `degraded` when any critical check fails. Optional degraded checks are reported but do not change the status to `degraded`.
+Probes follow the [Ops Kit](/docs/ops-kit) driver pattern — `#[AsDriver]` plus `registerForAutoconfiguration()` is all the wiring needed; `CollectHealthProbesPass` collects every registered probe automatically.
 
-## Deployment Examples
+## Legacy compatibility
 
-Kubernetes:
+If your application still has health checks written against the older `Vortos\Foundation\Health\Contract\HealthCheckInterface` / `#[AsHealthCheck]` API, you don't need to migrate them. `BridgeLegacyHealthChecksPass` finds every class implementing the legacy interface and wraps each one in a `LegacyHealthCheckProbe` automatically — they run through the same aggregator, budget, and endpoints as native `HealthProbeInterface` probes, with zero code changes on your side.
 
-```yaml
-livenessProbe:
-  httpGet:
-    path: /health/live
-    port: 8000
-readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 8000
-```
+## Pre-flight diagnostics
 
-Deployment gate:
-
-```bash
-until curl -sf http://localhost:8000/health/ready; do
-  sleep 2
-done
-```
-
-Monitoring with details:
-
-```bash
-curl -sf \
-  -H "X-Health-Token: $HEALTH_TOKEN" \
-  http://localhost:8000/health
-```
-
-## Pre-flight Diagnostics
-
-`vortos:doctor` checks configuration correctness before you boot — environment variables, module settings, and known misconfigurations. Unlike `vortos:health` (which probes live infrastructure), `vortos:doctor` checks things that are wrong before any external service is involved.
+`vortos:doctor` checks configuration correctness before you boot. This is separate from `vortos:health`, which probes live infrastructure:
 
 ```bash
 php bin/console vortos:doctor
 ```
 
+Two doctor checks specifically guard against a dangerous blind spot — having no way to know your monitoring itself has failed:
+
+| Check | What it refuses |
+|---|---|
+| `LivenessIndependenceDoctorCheck` | A liveness probe that depends on the same infrastructure it's meant to detect failures in |
+| `DetectorIndependenceDoctorCheck` | Fewer than 3 independent failure detectors configured in production: in-app probes, the [dead-man heartbeat](/docs/observability/heartbeat), and an external [synthetic uptime monitor](/docs/health-checks/uptime) |
+
 ```
-VORTOS DOCTOR
-────────────────────────────────────────────────────────────
-
-  [OK]     messaging.replay-secret       VORTOS_REPLAY_SECRET is configured
-  [WARN]   messaging.kafka-brokers       KAFKA_BROKERS is not set
-           Fix: Add KAFKA_BROKERS=localhost:9092 to your .env file.
-
-────────────────────────────────────────────────────────────
-  1 passed  1 warned  0 failed
-```
-
-Exit code `0` unless errors are present. Use `--fail-on-warning` to treat warnings as failures in CI:
-
-```bash
-php bin/console vortos:doctor --fail-on-warning
+[FAIL] health.detector_independence   1 of 3 independent failure detectors configured: in-app probes.
+       Fix: Wire the dead-man heartbeat (vortos-observability) and a real external synthetic
+       monitor driver (e.g. "betterstack") declaring SyntheticJourney — a dead host and its
+       own monitoring being dead simultaneously is the failure mode this check exists to catch.
 ```
 
-### Built-in Checks
+The reasoning behind requiring three independent detectors: if your only failure detection lives *on* the host that might fail, a host that goes fully dark (not just unhealthy — gone) never alerts anyone, because the thing that would have alerted is dead too. An external synthetic prober runs on someone else's infrastructure entirely, so it's the one detector that keeps working when yours doesn't.
 
-| Check | Module | What it checks |
-|---|---|---|
-| `messaging.replay-secret` | Messaging | `VORTOS_REPLAY_SECRET` is set and ≥ 32 characters |
+<Callout type="warn" title="This check is fail-closed in production, not elsewhere">
+Outside `prod`/`production`, a gap in detector independence surfaces as a passing check with an explanatory note — not a blocker. There's no advisory "warning" preflight state in the framework; every check is pass, fail, or skip, so non-prod environments intentionally aren't held to the same bar.
+</Callout>
 
-### Custom Checks
+## Sections
 
-Implement `DoctorCheckInterface` and add `#[AsDoctor]` to register it automatically:
-
-```php title="src/Payment/Infrastructure/Doctor/PaymentGatewayConfigCheck.php"
-use Vortos\Foundation\Doctor\Attribute\AsDoctor;
-use Vortos\Foundation\Doctor\Contract\DoctorCheckInterface;
-use Vortos\Foundation\Doctor\DoctorResult;
-
-#[AsDoctor]
-final class PaymentGatewayConfigCheck implements DoctorCheckInterface
-{
-    public function name(): string
-    {
-        return 'payment.gateway-key';
-    }
-
-    public function run(): DoctorResult
-    {
-        if (getenv('PAYMENT_GATEWAY_KEY') === false) {
-            return DoctorResult::error(
-                $this->name(),
-                'PAYMENT_GATEWAY_KEY is not set — payment processing will fail',
-                'Add PAYMENT_GATEWAY_KEY=<key> to your .env file.',
-            );
-        }
-
-        return DoctorResult::ok($this->name(), 'PAYMENT_GATEWAY_KEY is configured');
-    }
-}
-```
-
-The `run()` method must return a `DoctorResult` — never throw. Three factory methods cover all cases:
-
-```php
-DoctorResult::ok('check.name', 'Everything is fine');
-DoctorResult::warning('check.name', 'Optional thing missing', 'How to fix it');
-DoctorResult::error('check.name', 'Required thing broken', 'How to fix it');
-```
+<Cards>
+  <Card title="Uptime Monitoring" href="/docs/health-checks/uptime" description="Off-host synthetic monitoring via BetterStack — declarative journeys, idempotent sync, and the independence guarantee." />
+  <Card title="Capacity & Certificate Probes" href="/docs/health-checks/capacity-and-cert" description="Disk, memory, and CPU capacity probes, and TLS certificate expiry checks." />
+</Cards>

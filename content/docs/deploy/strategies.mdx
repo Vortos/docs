@@ -1,0 +1,97 @@
+---
+title: Strategies
+description: Blue-green, canary, rolling, and recreate strategies — how each builds its phase plan, and how to write a custom one.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Strategies
+
+A strategy's whole job is to turn a `DeployContext` into an ordered list of `DeployPhase` objects. It never touches infrastructure directly — `phases()` is pure, called by `DeployPlanner::plan()`, and the resulting plan is what gets executed (or just printed, for `--dry-run`).
+
+```php
+interface DeployStrategyInterface
+{
+    public function key(): DeployStrategy;
+    public function requires(): RequiredCapabilities;
+
+    /** @return list<DeployPhase> */
+    public function phases(DeployContext $context): array;
+}
+```
+
+`requires()` is checked against the target's declared [capabilities](/docs/ops-kit#capabilities) before planning even begins — a strategy that needs `Canary` support is rejected outright if the configured target doesn't declare it, with a message naming exactly what's missing.
+
+## Blue-Green
+
+`BlueGreenStrategy` requires `DeployCapability::BlueGreen` and `HealthGate`. Its phase sequence:
+
+```
+ExpandMigrate   (if the desired build has pending expand-phase migrations)
+RollWorkers     (drain and restart background workers)
+StageColor      (pull the image, start the idle color's container)
+HealthGate      (wait for the staged color's /health/ready)
+Smoke           (run smoke tests against the staged color)
+Cutover         (atomically switch the edge router upstream)
+Promote         (record the new color as active)
+```
+
+The staged color is always `$context->currentState->activeColor->opposite()` — blue-green never guesses which color is idle, it reads it from `CurrentDeployState`. Nothing routes real traffic to the new version until `HealthGate` and `Smoke` both pass.
+
+## Canary
+
+`CanaryStrategy` requires `Canary`, `BlueGreen`, and `HealthGate`. It shares blue-green's setup (`ExpandMigrate`, `RollWorkers`, `StageColor`, `HealthGate`), then replaces the single `Cutover` phase with a sequence of weighted-routing steps:
+
+```
+Cutover  → route 5%  to staged color, verify SLOs
+Cutover  → route 25% to staged color, verify SLOs
+Cutover  → route 50% to staged color, verify SLOs
+Cutover  → route 100% to staged color, verify SLOs
+Promote  → record staged color as active
+```
+
+The default weight steps are `5, 25, 50, 100` — each step both shifts traffic and re-checks health before moving to the next weight. A target's edge router driver is responsible for actually implementing weighted routing; see [Caddy Cutover](/docs/deploy/caddy-cutover).
+
+## Rolling
+
+`RollingStrategy` replaces instances incrementally across a node set rather than switching an entire color at once — appropriate for targets without a blue-green-capable load balancer, where you'd rather replace capacity a few instances at a time and verify health between batches.
+
+## Recreate
+
+`RecreateStrategy` is the simplest: tear down the running version, then stand up the new one. No idle color, no traffic shifting — it accepts a downtime window in exchange for simplicity and is useful for environments where availability during the deploy isn't a requirement (staging, internal tools).
+
+## Writing a custom strategy
+
+A strategy is a plain class — no attribute needed beyond implementing the interface and registering it with `DeployStrategyRegistry`. The pattern every shipped strategy follows: emit `ExpandMigrate` first if there's a schema change pending, then the rollout-specific phases, ending in `Promote`.
+
+```php
+final class CustomRolloutStrategy implements DeployStrategyInterface
+{
+    public function key(): DeployStrategy
+    {
+        return DeployStrategy::Custom;
+    }
+
+    public function requires(): RequiredCapabilities
+    {
+        return RequiredCapabilities::of([DeployCapability::HealthGate]);
+    }
+
+    public function phases(DeployContext $context): array
+    {
+        $phases = [];
+
+        if (!$context->desiredManifest->schemaFingerprint->isEmpty()) {
+            $phases[] = new DeployPhase(PhaseKind::ExpandMigrate, [/* ... */]);
+        }
+
+        // your rollout phases here
+
+        return $phases;
+    }
+}
+```
+
+<Callout type="warn" title="PhaseOrderPolicy still applies">
+`DeployPlanner` validates every strategy's phase output with `PhaseOrderPolicy::assertValid()` — a strategy that emits phases in an order the policy considers unsafe (for instance, `Cutover` before `HealthGate`) is rejected at plan time, regardless of which strategy produced it.
+</Callout>

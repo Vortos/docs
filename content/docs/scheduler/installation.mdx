@@ -1,0 +1,206 @@
+---
+title: Installation
+description: Install the engine and optional admin UI, run the migration, configure env vars, and start the daemon.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Installation
+
+## Engine
+
+```bash
+composer require vortos/vortos-scheduler
+```
+
+Run the module migration to create the scheduler tables:
+
+```bash
+php vortos vortos:migrate
+```
+
+This creates nine tables:
+
+| Table | Purpose |
+|---|---|
+| `vortos_scheduler_schedules` | Schedule definitions (dynamic) |
+| `vortos_scheduler_runs` | Fire history and run states |
+| `vortos_scheduler_leases` | Distributed lock rows |
+| `vortos_scheduler_fire_queue` | Queued fires awaiting the fire-queue consumer (`scheduler:consume`) |
+| `vortos_scheduler_approvals` | 4-eyes approval requests |
+| `vortos_scheduler_audit_log` | Immutable, hash-chained audit log |
+| `vortos_scheduler_audit_checkpoints` | Per-epoch HMAC audit checkpoints for O(n/epochSize) chain verification (see [Audit](/docs/scheduler/audit)) |
+| `vortos_scheduler_static_overrides` | Operator force-pause/resume overrides |
+| `vortos_scheduler_run_retention_overrides` | Per-tenant run retention overrides (see [Retention](/docs/scheduler/retention)) |
+
+The package self-registers via `extra.vortos.package` in its `composer.json`. No manual service wiring is needed.
+
+## Configuration
+
+Every setting below is available two ways: environment variables (shown here, used as defaults), or a fluent, type-checked config object — matching the convention used by `vortos-cache`, `vortos-auth`, and every other package with runtime configuration.
+
+```php title="config/scheduler.php"
+use Vortos\Scheduler\DependencyInjection\VortosSchedulerConfig;
+
+return static function (VortosSchedulerConfig $config): void {
+    $config
+        ->shardCount(4)
+        ->leaseDriver('postgres-advisory')
+        ->runRetentionDays(90);
+};
+```
+
+`config/{env}/scheduler.php` (e.g. `config/prod/scheduler.php`) overrides the base file for that environment. Neither file is required — every setting has a sensible default.
+
+## Environment variables
+
+All are optional — the defaults are safe for development.
+
+```dotenv
+# Lease backend. Options: sql (default), redis, postgres-advisory, in-memory
+VORTOS_SCHEDULER_LEASE_DRIVER=sql
+
+# Redis DSN for the redis lease driver (shares vortos-cache's DSN by default)
+VORTOS_CACHE_DSN=redis://redis:6379
+
+# Shard count for horizontal scaling of the fire loop (advanced — see Production)
+SCHEDULER_SHARD_COUNT=1
+
+# Daemon poll interval when no shard has due work, in seconds
+SCHEDULER_MAX_IDLE_SEC=60
+
+# Lease TTL in seconds. Must be longer than the slowest expected tick
+SCHEDULER_LEASE_TTL_SEC=30
+
+# Maximum age of missed slots to catch up, in seconds
+# Slots older than this during misfire recovery are dropped
+SCHEDULER_MAX_CATCHUP_AGE_SECONDS=86400
+
+# Maximum concurrent fires per tenant before extras are skipped. 0 = no limit
+SCHEDULER_TENANT_MAX_CONCURRENT_FIRES=0
+
+# How long a dispatched job is assumed "done" when no completion event arrives, in seconds
+SCHEDULER_ASSUMED_DONE_TTL_SECONDS=3600
+
+# Circuit breaker: consecutive failures before the breaker opens
+SCHEDULER_CB_FAILURE_THRESHOLD=5
+
+# Circuit breaker: seconds to wait in the Open state before probing again
+SCHEDULER_CB_RECOVERY_WINDOW_SEC=30
+
+# In-process resolver cache TTL (seconds). Reduces store round-trips on CLI/admin paths
+# The daemon itself bypasses the cache for zero-overhead hot path
+SCHEDULER_RESOLVER_CACHE_TTL_SEC=5
+
+# Dead-man detector: tolerance window before a metric alert fires, in seconds
+SCHEDULER_DEADMAN_TOLERANCE_SEC=300
+
+# Cardinality guard: maximum distinct schedule_id label values in Prometheus metrics
+SCHEDULER_METRICS_MAX_CARDINALITY=200
+
+# 4-eyes approval TTL, in seconds
+SCHEDULER_APPROVAL_TTL_SECONDS=86400
+
+# HMAC signing key for the audit hash-chain. Empty disables audit projection entirely
+SCHEDULER_AUDIT_HMAC_KEY=
+
+# Entries per audit HMAC checkpoint epoch
+SCHEDULER_AUDIT_EPOCH_SIZE=1000
+
+# --- Run retention (auto-prune) — see the Retention page for the full guide ---
+
+# Days to keep completed/failed runs. 0 disables auto-prune entirely
+SCHEDULER_RUN_RETENTION_DAYS=30
+
+# Days to keep terminal (dispatched/failed) fire-queue rows. 0 disables. Pruned
+# during the same daily sweep, so it needs SCHEDULER_RUN_RETENTION_DAYS > 0
+SCHEDULER_FIRE_QUEUE_RETENTION_DAYS=7
+
+# Rows deleted per chunk by the prune sweep (applies to both runs and fire-queue)
+SCHEDULER_PRUNE_BATCH_SIZE=5000
+
+# Wall-clock budget for one prune sweep
+SCHEDULER_PRUNE_MAX_DURATION_SEC=240
+
+# --- Fire-queue consumer (scheduler:consume) ---
+
+# Rows claimed per consumer batch
+SCHEDULER_CONSUME_BATCH_SIZE=50
+
+# Sleep interval between empty polls in --loop mode
+SCHEDULER_CONSUME_POLL_INTERVAL_SEC=2
+
+# scheduler:doctor C11: how old the oldest pending fire-queue row may be before it's a Fail
+SCHEDULER_CONSUME_STALL_THRESHOLD_SEC=120
+```
+
+## Lease driver
+
+The scheduler ships with three lease drivers. Pick the one that matches your infrastructure.
+
+### SQL (default)
+
+Stores the lease in the `vortos_scheduler_leases` table using an optimistic `INSERT ... ON CONFLICT DO UPDATE WHERE expires_at < NOW()`. Works with any DBAL-supported database. No additional setup needed.
+
+```dotenv
+VORTOS_SCHEDULER_LEASE_DRIVER=sql
+```
+
+### Redis
+
+Uses `SET NX PX` — the standard Redis distributed lock primitive. Requires Vortos cache (Redis) to be configured.
+
+```dotenv
+VORTOS_SCHEDULER_LEASE_DRIVER=redis
+```
+
+### Postgres Advisory Locks
+
+Uses `pg_try_advisory_lock()` — a session-scoped advisory lock built into PostgreSQL. Zero table overhead. The lock is automatically released when the connection closes, so a crashed process never leaves a stale lock. Requires PostgreSQL.
+
+```dotenv
+VORTOS_SCHEDULER_LEASE_DRIVER=postgres-advisory
+```
+
+<Callout type="info">
+Prefer `postgres-advisory` if you are already on PostgreSQL. It has the lowest overhead and the best crash-recovery story — a dead process releases the lock the moment its connection drops, with no TTL to wait out.
+</Callout>
+
+## Admin UI (optional)
+
+```bash
+composer require vortos/vortos-scheduler-admin
+```
+
+Publish the pre-built assets into your application's `public/` directory:
+
+```bash
+php vortos vortos:assets:publish
+```
+
+This copies the admin UI assets to `public/bundles/scheduler-admin/`.
+
+The admin UI requires a CSRF middleware and a session. If you are already running the standard Vortos HTTP stack, both are already wired. See [Admin UI](/docs/scheduler/admin-ui) for the full setup guide including RBAC configuration.
+
+## Starting the daemon and the consumer
+
+The scheduler needs **two** long-lived processes, not one. `scheduler:run` scans for due schedules and enqueues them; `scheduler:consume` is what actually executes them. If you only run the first, schedules will appear to fire (the ledger and fire queue fill up) but nothing will ever run — see [Two processes, not one](/docs/scheduler/retention#two-processes-not-one) for why.
+
+```bash
+php vortos scheduler:run
+php vortos scheduler:consume --loop
+```
+
+For production, manage both with a supervisor. See [Running](/docs/scheduler/running) for supervisor and Docker Compose configuration.
+
+## Verifying the installation
+
+Once both processes are running, verify everything is healthy:
+
+```bash
+php vortos scheduler:doctor
+```
+
+This runs 11 checks (C1–C11) — cron validity, name collisions, command allowlisting, lease driver reachability, migration state, 4-eyes approval coverage, misfire policy safety, catchup bounds, shard config, auto-prune config/liveness, and fire-queue consumer liveness. All checks should show `PASS`. A `FAIL` result includes a remediation hint. See [Running](/docs/scheduler/running#scheduler-doctor) for the full check reference.
+
+If `scheduler:doctor` is green, the installation is complete.

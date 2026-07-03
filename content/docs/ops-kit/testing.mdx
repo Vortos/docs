@@ -1,0 +1,125 @@
+---
+title: Testing & the Agnosticism Lint
+description: The conformance test suite (TCK) every driver inherits, and the static check that keeps provider names out of core engine code.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Testing & the Agnosticism Lint
+
+Ops Kit ships two kinds of test machinery: a conformance suite every driver must pass, and a lint that catches provider names leaking into code that's supposed to be provider-agnostic.
+
+## The conformance test case (TCK)
+
+`ConformanceTestCase` is the universal tier. Every driver of every port, regardless of concern, inherits six tests from it:
+
+| Test | What it proves |
+|---|---|
+| `test_driver_is_a_driver_instance` | The class actually implements `DriverInterface` |
+| `test_driver_declares_a_well_formed_key` | The `#[AsDriver]` key matches `^[a-z][a-z0-9-]*$` |
+| `test_driver_reports_a_capability_descriptor` | `capabilities()` returns a `CapabilityDescriptor` |
+| `test_capabilities_are_pure` | Calling `capabilities()` twice returns identical results — no hidden state |
+| `test_capability_descriptor_round_trips_canonically` | `toArray()` → `fromArray()` → `toArray()` is byte-identical |
+| `test_supports_is_consistent_with_serialized_capabilities` | `supports()` agrees with what `toArray()` actually serialized |
+
+A driver test only needs to supply two things:
+
+```php title="src/Backup/Target/S3Glacier/Tests/S3GlacierDriverConformanceTest.php"
+use App\Backup\Testing\BackupTargetConformanceTestCase;
+
+final class S3GlacierDriverConformanceTest extends BackupTargetConformanceTestCase
+{
+    protected function createDriver(): S3GlacierDriver
+    {
+        return new S3GlacierDriver($this->fakeS3Client());
+    }
+
+    protected function expectedKey(): string
+    {
+        return 's3-glacier';
+    }
+}
+```
+
+### Concern-specific TCKs
+
+Each concern (Deploy, Backup, Health, ...) extends `ConformanceTestCase` with its own abstract base that adds port-specific assertions. A `BackupTargetConformanceTestCase` might add `test_restore_returns_a_verifiable_checksum()`. Every concrete driver inherits both tiers — the universal six plus the concern's own — automatically, just by extending the right base class.
+
+### Proving honest refusal
+
+The most important property a driver can have is refusing to lie about what it supports. Two protected helpers make this easy to assert:
+
+```php
+public function test_loud_greeting_honors_declared_capability(): void
+{
+    $driver = $this->createDriver();
+
+    if ($driver->capabilities()->supports('loud_greeting')) {
+        $this->assertStringContainsString('!!!', $driver->greet('Ada'));
+        return;
+    }
+
+    $this->assertHonestlyUnsupported($driver->capabilities(), 'loud_greeting');
+    $this->assertRejectsUnsupportedCapability(fn () => $driver->greetLoudly('Ada'));
+}
+```
+
+This pattern — branch on the declared capability, then assert either correct behavior or an honest, loud refusal — is how every TCK in the framework tests partial support. A driver that silently no-ops instead of throwing `UnsupportedCapabilityException` fails this test.
+
+<Callout type="warn" title="Never make capability checks a runtime surprise">
+`CapabilityValidator::assertSatisfies()` is meant to catch capability mismatches at configuration time, before a strategy is ever run. The TCK's job is to make sure that if a mismatch somehow reaches the driver anyway, it fails loudly instead of doing the wrong thing quietly.
+</Callout>
+
+## The agnosticism lint
+
+Ops Kit's `Driver\` namespace convention exists so that core engine code (planners, services, the parts of a concern that should work identically regardless of which provider is configured) never imports or references a specific provider's name. The agnosticism lint enforces this with two layers — a PHPUnit test for CI, and a PHPStan rule for editor-time feedback.
+
+### Default provider list
+
+`ProviderNameMatcher::DEFAULT_PROVIDERS` covers the providers that show up across the shipped packages:
+
+```
+caddy, traefik, nginx, oracle, hetzner, digitalocean, linode,
+dockerhub, ghcr, gitlab, github, prometheus, grafana, datadog,
+newrelic, sentry, glitchtip, posthog, amplitude, segment,
+pagerduty, opsgenie, telegram, slack, betterstack, uptimerobot,
+cloudflare, paddle, terraform, pulumi, kubernetes, squawk,
+vault, cosign
+```
+
+Matching is case-insensitive and AST-aware — it inspects class names, namespaces, and identifiers via `nikic/php-parser`, not raw text, so a comment or a string literal mentioning "Caddy" in a changelog doesn't trip the lint.
+
+### PHPUnit test
+
+```php title="src/Deploy/Tests/Architecture/DeployAgnosticismTest.php"
+use Vortos\OpsKit\Testing\AgnosticismLintTestCase;
+
+final class DeployAgnosticismTest extends AgnosticismLintTestCase
+{
+    protected function packagePath(): string
+    {
+        return __DIR__ . '/../..';
+    }
+}
+```
+
+This inherits `test_no_provider_name_leaks_outside_drivers()`, which scans the whole package and fails if a provider name (e.g. `Caddy`, `Kubernetes`) appears anywhere outside a `Driver\` namespace segment. Override `exemptNamespaceSegments()` or `exemptPathFragments()` (defaults: `['Driver']` and `['/Tests/', '/config/']`) if your package's layout differs.
+
+### PHPStan rule
+
+```yaml title="phpstan.neon"
+rules:
+    - Vortos\OpsKit\PHPStan\AgnosticismRule
+```
+
+Construct it with `includePathFragments` to scope the rule to just your concern's core directory if you don't want it scanning the whole codebase:
+
+```php
+new AgnosticismRule(includePathFragments: ['src/Deploy/'])
+```
+
+Violations surface as `vortos.agnosticism` errors directly in your IDE, the same run as every other PHPStan check — no separate CI step needed once it's wired into your existing `phpstan.neon`.
+
+<Callout type="info" title="Why a driver subdirectory is exempt">
+A driver's whole purpose is to speak a provider's vocabulary — `S3GlacierDriver` calling an S3 SDK is correct, not a leak. The exemption list is namespace-segment based (`Driver\`), so as long as the provider-specific code lives under that segment, the lint leaves it alone and only flags leaks into the surrounding concern.
+</Callout>

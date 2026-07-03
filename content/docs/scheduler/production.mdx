@@ -1,0 +1,179 @@
+---
+title: Production Guide
+description: Observability, performance tuning, blue-green deployments, sharding, and how to run the scheduler reliably at scale.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Production Guide
+
+## Observability
+
+### Prometheus metrics
+
+The scheduler exposes 12 Prometheus metrics through the Vortos metrics adapter. Per-schedule metrics have a `schedule_id` label (cardinality-guarded — see below).
+
+| Metric | Type | Description |
+|---|---|---|
+| `vortos_scheduler_fires_total` | Counter | Total fire attempts, labelled by `result`, `schedule_id`, `tenant_id` |
+| `vortos_scheduler_misfires_total` | Counter | Total misfire catch-up fires, labelled by `policy` applied |
+| `vortos_scheduler_dispatch_lag_ms` | Histogram | `now − scheduledFor` per fire, in milliseconds |
+| `vortos_scheduler_lease_contention_total` | Counter | Lease acquisition failures — another node already leads the shard |
+| `vortos_scheduler_leader_changes_total` | Counter | Leader transitions per shard, labelled by `direction` |
+| `vortos_scheduler_active_schedules` | Gauge | Current count of active (non-paused) schedules |
+| `vortos_scheduler_fairness_throttled_total` | Counter | Fires throttled by the per-tenant concurrency cap |
+| `vortos_scheduler_audit_failures_total` | Counter | Audit append failures (non-fatal, counted for visibility) |
+| `vortos_scheduler_consume_results_total` | Counter | Fire-queue rows executed via the CQRS bus, labelled by `result` |
+| `vortos_scheduler_runs_pruned_total` | Counter | Fire-ledger rows deleted by a prune sweep, labelled by `tenant_id` |
+| `vortos_scheduler_fire_queue_pruned_total` | Counter | Terminal fire-queue rows deleted by the retention sweep (no labels — global) |
+| `vortos_scheduler_prune_duration_seconds` | Histogram | Duration of one prune sweep, labelled by `trigger` (`auto`\|`manual`) |
+
+### Cardinality guard
+
+In multi-tenant deployments with many distinct schedules, unguarded `schedule_id` labels would create unbounded time-series growth in Prometheus. `CardinalityGuardedSchedulerMetrics` caps the number of distinct `schedule_id` values at `SCHEDULER_METRICS_MAX_CARDINALITY` (default: 200).
+
+When the cap is exceeded, further schedule IDs are reported with the sentinel label `__overflow__` and the `vortos_scheduler_metric_overflow_total` counter increments. This preserves the per-schedule breakdowns for your most active schedules while preventing OOM in Prometheus.
+
+If you need a higher cap, increase `SCHEDULER_METRICS_MAX_CARDINALITY`. If you are seeing many overflows, consider whether you actually need per-schedule granularity at scale, or whether aggregates (by tenant or by command class) are sufficient.
+
+### Recommended alerts
+
+Add these alert rules to your monitoring:
+
+```yaml title="prometheus/scheduler.yml"
+groups:
+  - name: scheduler
+    rules:
+      - alert: SchedulerMisfireSpike
+        expr: rate(vortos_scheduler_misfires_total[5m]) > 0.1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduler misfire rate is elevated — possible daemon instability"
+
+      - alert: SchedulerLeaseContention
+        expr: rate(vortos_scheduler_lease_contention_total[5m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Scheduler lease contention detected on shard {{ $labels.shard }}"
+
+      - alert: SchedulerAuditFailures
+        expr: increase(vortos_scheduler_audit_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduler audit append failures — investigate before the gap grows"
+
+      - alert: SchedulerConsumeFailureSpike
+        expr: rate(vortos_scheduler_consume_results_total{result="failure"}[5m]) > 0.1
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fire-queue consumer failure rate is elevated — check scheduler:consume logs"
+```
+
+<Callout type="info">
+`scheduler:doctor` (see [Running](/docs/scheduler/running#scheduler-doctor)) is the primary liveness signal for the daemon (implicitly, via schedules failing to progress) and for the fire-queue consumer (explicitly, via check C11). Wire `scheduler:doctor`'s exit code into your monitoring rather than trying to reconstruct daemon/consumer liveness from Prometheus counters alone — dead-man detection below raises alerts directly, not through a gauge threshold.
+</Callout>
+
+### OpenTelemetry
+
+Every fire produces an OTel span named `scheduler.fire`. The span carries these attributes:
+
+| Attribute | Value |
+|---|---|
+| `scheduler.schedule_id` | UUID of the schedule |
+| `scheduler.schedule_name` | Human-readable name |
+| `scheduler.tenant_id` | Tenant ID (null for system schedules) |
+| `scheduler.slot` | Slot key |
+| `scheduler.result` | `dispatched`, `skipped`, `already_dispatched`, `circuit_open` |
+| `scheduler.fire_duration_ms` | Time from scan to enqueue in milliseconds |
+
+These attributes make it straightforward to correlate a specific fire with the downstream command execution span in your APM tool. `RunRetentionSweeper` similarly wraps each prune sweep in a `scheduler.prune` span, and `FireQueueConsumer` wraps each batch in `scheduler.consume`.
+
+### Dead-man detector
+
+`DeadManDetector` checks each active schedule against its own resolved tolerance window (not a single daemon-wide "last tick" value) and raises an alert **directly through `vortos-alerts`' `AlertDispatcherInterface`** when a schedule should have fired but didn't — it is not exposed as a Prometheus gauge. Configure the default tolerance via `SCHEDULER_DEADMAN_TOLERANCE_SEC` (default: 300 seconds); requires `vortos/vortos-alerts` to be installed, and is silently skipped if it isn't.
+
+`scheduler:doctor` check C9 also tests the dead-man condition. If the last tick is older than `SCHEDULER_DEAD_MAN_WINDOW_SEC`, the check reports FAIL and blocks deploy preflight.
+
+## Performance tuning
+
+### Idle sleep
+
+`SCHEDULER_MAX_IDLE_SEC` controls how long the daemon sleeps between ticks when no shard has due work. Lower values mean faster response to newly-due schedules, at the cost of more database load.
+
+For most deployments, the default of 60 seconds is fine. If you have schedules that need sub-minute precision, lower it — but going far below a few seconds is rarely useful, since the overhead of lease renewal and a full scan starts to dominate at that point.
+
+### Catchup window
+
+`SCHEDULER_MAX_CATCHUP_AGE_SECONDS` (default: 86400 = 24 hours) limits how far back the misfire resolver looks. Longer windows allow longer outages to be recovered, but also mean a single restart after a long outage might enqueue a large burst of jobs.
+
+For schedules with `FireAll` misfire policy, be especially careful here. A 24-hour window with an every-5-minutes schedule means up to 288 jobs would be enqueued on recovery.
+
+### Resolver cache
+
+`SCHEDULER_RESOLVER_CACHE_TTL_SEC` controls the in-process TTL cache on `CachingScheduleResolver`. The daemon itself bypasses this cache on the hot path — it uses `ScheduleResolver` directly. The cache is only used by CLI commands and admin UI paths, where the extra round-trip to the DB is acceptable overhead.
+
+Set this to 0 to disable the cache entirely if you need mutations to be instantly visible on the CLI.
+
+### Tenant concurrency limit
+
+`SCHEDULER_TENANT_MAX_CONCURRENT_FIRES` (default: 0 = unlimited) caps how many fires can be in the "dispatched but not completed" state per tenant simultaneously. When the cap is reached, new slots for that tenant are skipped until running jobs complete.
+
+This prevents a misbehaving tenant with many schedules from flooding the job queue and starving other tenants.
+
+## Blue-green deployments
+
+The scheduler is designed to work correctly in a blue-green deployment model.
+
+On a typical deploy:
+
+1. Old (blue) daemon is running and holds the lease
+2. New (green) application container starts but the scheduler daemon has not started yet
+3. The deploy preflight (`deploy:doctor`) verifies the scheduler is healthy on the current version
+4. Traffic is cut over from blue to green
+5. The old (blue) daemon receives `SIGTERM`, completes its current tick, and exits
+6. The green daemon starts, waits a brief moment for the blue lease to expire (or be released), then acquires the lease
+7. Green daemon is now the active scheduler
+
+The gap between step 5 and step 6 is typically less than one lease TTL (default 30 seconds). Any schedules due during this window will be caught on the first green tick — the misfire resolver handles them correctly.
+
+If `VORTOS_SCHEDULER_LEASE_DRIVER=postgres-advisory`, the gap is minimal because the advisory lock is released the instant the connection closes (which happens when the blue process exits).
+
+<Callout type="info">
+Never run two daemon processes with the same shard number simultaneously. The distributed lease prevents double-dispatch, but it creates unnecessary contention. Coordinate daemon restarts so the old one exits before the new one starts.
+</Callout>
+
+## Database sizing
+
+The scheduler's tables grow over time. Plan for retention.
+
+**`vortos_scheduler_runs`**: one row per slot dispatch. For a deployment with 100 schedules running every 5 minutes, this table grows by ~28,800 rows/day. At a typical 200 bytes/row, that's ~5.5 MB/day. This is pruned automatically by default (`SCHEDULER_RUN_RETENTION_DAYS=30`) — see [Retention](/docs/scheduler/retention) for tuning batch size, per-tenant overrides, and legal holds.
+
+**`vortos_scheduler_audit_log`**: one row per event. More rows per fire than the runs table. For compliance purposes, audit rows should typically not be pruned (or pruned only after archival) — see [Audit → Retention and pruning](/docs/scheduler/audit#retention-and-pruning).
+
+**`vortos_scheduler_fire_queue`**: rows are marked `dispatched`/`failed` (not deleted) once `scheduler:consume` processes them, so this table also grows over time — retention for it is not yet automated the way `vortos_scheduler_runs` is. Monitor its size and the oldest `pending` row's age (the same signal `scheduler:doctor` check C11 uses) rather than relying on the table staying small on its own.
+
+## Multi-node deployment
+
+In a typical multi-node deployment:
+
+- Run one scheduler daemon per shard, not one per node
+- Use a process supervisor on a dedicated "worker" node, or use Kubernetes Jobs
+- Do not run the scheduler daemon on web server nodes — it is a background process and should be isolated from request traffic
+- If using Docker Compose, the `scheduler` service should have `restart: unless-stopped` and `deploy.replicas: 1` (one instance per shard, not one per node)
+
+For Kubernetes, use a Deployment with `replicas: 1` per shard (not a DaemonSet). The distributed lease prevents two pods in the same shard from double-dispatching, but it is wasteful and creates unnecessary contention.
+
+## Incident runbook
+
+See `packages/Vortos/src/Scheduler/RUNBOOK.md` in the package for a step-by-step runbook covering:
+
+- Scheduler daemon not running
+- Circuit breaker stuck open
+- Lease stuck (prior owner crashed and TTL has not expired)
+- Audit chain broken
+- High misfire rate after a long outage
+- Approval requests blocking a critical schedule change during an incident

@@ -3,6 +3,8 @@ title: Migrations
 description: Doctrine-backed Vortos migrations, module schema providers, drift detection, adoption, and production deployment rules.
 ---
 
+import { Callout } from 'fumadocs-ui/components/callout';
+
 # Migrations
 
 Vortos migrations are built on Doctrine Migrations and use the shared DBAL connection.
@@ -26,9 +28,15 @@ php vortos migrate
 php vortos migrate:adopt Version20260505114121 --verify
 php vortos migrate:rollback --steps=1
 php vortos migrate:fresh --force
+php vortos migrate:analyze            # lock-safety CI gate — see Lock-Safety Analysis
+php vortos migrate:down-verify        # prove every migration's down() actually works
 ```
 
-`migrate:fresh` is blocked in `prod`.
+`migrate:fresh` is blocked in `prod`. See [Lock-Safety Analysis & Down-Verify](/docs/migrations/safety) for what `migrate:analyze` and `migrate:down-verify` actually check.
+
+<Callout type="info" title="Publish is resilient and DB-free">
+`migrate:publish` converts module SQL stubs and schema providers into Doctrine migration classes **without a live database** — it runs against a fresh in-memory `Schema`, so no Postgres is needed in a clean CI/build step. It is also **resilient**: a single malformed stub can no longer abort the whole run and starve other packages' migrations — the offending stub is reported and the rest still publish (the command exits non-zero so CI still fails). Alter-style schema providers must guard table access with `if ($schema->hasTable($this->t('...')))` since publish introspects on an empty schema.
+</Callout>
 
 ## Tracking
 

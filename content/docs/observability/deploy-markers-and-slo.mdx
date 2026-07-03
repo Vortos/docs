@@ -1,0 +1,78 @@
+---
+title: Deploy Markers & SLO Resources
+description: Annotate dashboards with deploy/rollback events linked to the exact build, and declare SLOs as validated, version-controlled resources instead of free-floating dashboard config.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Deploy Markers & SLO Resources
+
+## Deploy markers
+
+A metric chart showing a regression is only useful if you can immediately tell *which deploy caused it*. `DeployMarker` is an annotation rendered onto your metrics/tracing backend at the moment of a deploy or rollback, carrying just enough to make that link one click instead of a cross-referencing exercise:
+
+```php
+final readonly class DeployMarker
+{
+    public function __construct(
+        public string $env,
+        public string $kind,              // 'deploy' or 'rollback' — nothing else is valid
+        public string $buildId,
+        public string $gitSha,
+        public string $imageDigest,
+        public string $schemaFingerprintId,
+        public string $title,
+        public array $tags,
+        public \DateTimeImmutable $at,
+        public array $links = [],
+    ) {}
+}
+```
+
+A marker carries **no secrets or PII** — only IDs, a git SHA, and a manifest link. It's safe to render on a dashboard anyone on the team can see, including third-party dashboard tools.
+
+```bash
+php bin/console vortos:observability:markers:drain
+```
+
+Markers are written through `OutboxMarkerEmitter` — buffered and drained asynchronously rather than emitted synchronously during the deploy itself, so a slow or unreachable annotation backend never adds latency to the deploy path. `vortos:observability:markers:drain` flushes the buffered outbox to whichever `MarkerEmitterInterface` driver is configured (`grafana-otlp` ships in-core; `null` is the default no-op).
+
+<Callout type="info" title="Deduplication matters for retried drains">
+`DedupeStore` exists because a drain that's retried after a partial failure shouldn't re-emit markers that already landed — `InMemoryDedupeStore` for tests, a persistent store for production. A marker is identified deterministically so re-running the drain command is always safe.
+</Callout>
+
+## SLO resources
+
+An SLO ("99.9% of requests succeed over a rolling 30 days") is usually either hand-maintained in a dashboard tool's UI (invisible to code review, easy to drift from what the team actually agreed to) or not tracked formally at all. `Slo` makes it a declared, validated resource instead:
+
+```php
+final readonly class Slo
+{
+    public function __construct(
+        public string $name,
+        public float $objective,      // must be in (0, 1) — enforced at construction
+        public SloWindow $window,
+        public string $indicatorRef,  // the metric/query this SLO is measured against
+    ) {}
+
+    public function errorBudget(): ErrorBudget
+    {
+        return new ErrorBudget($this);
+    }
+}
+```
+
+Illegal states are unrepresentable — an objective of `1.0` (100%, impossible to sustain) or `0` (meaningless) fails at construction, not at review time when someone notices the dashboard looks wrong. `SloRegistry` collects every declared SLO; `SloArtifactRenderer` turns the registry into actual dashboard/alerting config for your backend.
+
+```php
+$slo = new Slo(
+    name: 'checkout-availability',
+    objective: 0.999,
+    window: SloWindow::rolling(days: 30),
+    indicatorRef: 'http.requests{route="checkout",status<500}/http.requests{route="checkout"}',
+);
+
+$slo->errorBudget(); // how much "badness" is left before the objective is breached
+```
+
+This is what [Alerts' `SloBurnCondition`](/docs/alerts#rules) and [`SloBurnAlertSource`](/docs/alerts#integrations) evaluate against — an SLO declared here, in code, reviewed in a pull request, is the single source of truth both the alerting rule and the dashboard read from. There's no separate "what did we actually agree the SLO was" document that can drift from what's configured.

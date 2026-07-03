@@ -2,6 +2,10 @@
   "title": "Integrations",
   "pages": [
     "index",
+    "collector-and-sinks",
+    "audit-ledger",
+    "heartbeat",
+    "deploy-markers-and-slo",
     "local-stack",
     "sentry",
     "slack",

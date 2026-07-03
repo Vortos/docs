@@ -1,0 +1,226 @@
+---
+title: Defining Schedules
+description: Create static schedules with PHP attributes, define dynamic schedules at runtime, configure triggers and policies.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Defining Schedules
+
+## Static schedules with #[Scheduled]
+
+Static schedules live in PHP code. They are version-controlled, deployed as part of the application, and discovered automatically at container compile time. You cannot pause or delete a static schedule from the database — it will always be active as long as the class exists.
+
+Create a class that implements `StaticScheduleDefinition` and add the `#[Scheduled]` attribute:
+
+```php title="src/Infrastructure/Scheduler/PruneOldAuditLogsSchedule.php"
+use Vortos\Scheduler\Registry\StaticScheduleDefinition;
+use Vortos\Scheduler\Registry\Attribute\Scheduled;
+use Vortos\Scheduler\Schedule\Policy\MisfirePolicy;
+use Vortos\Scheduler\Schedule\Policy\OverlapPolicy;
+
+#[Scheduled(
+    id:       '01900000-dead-7000-0000-000000000001',
+    name:     'prune-audit-logs',
+    cron:     '0 3 * * *',
+    command:  'App\Command\PruneAuditLogsCommand',
+    misfire:  'skip_missed',
+    overlap:  'skip_if_running',
+    timezone: 'UTC',
+)]
+final class PruneOldAuditLogsSchedule implements StaticScheduleDefinition {}
+```
+
+`StaticSchedulePass` discovers all `StaticScheduleDefinition` implementations at container compile time and registers them with `StaticScheduleRegistry`. No manual wiring needed.
+
+### Attribute parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `id` | string (UUIDv7) | Yes | Stable UUID for this schedule. Generate once, never change. |
+| `name` | string | Yes | Slug-style name. Must match `/^[a-z0-9][a-z0-9_-]*$/`. |
+| `cron` | string | One of cron/interval | 5-field cron expression. |
+| `interval` | int | One of cron/interval | Fixed interval in seconds. |
+| `command` | string | Yes | FQCN of the command class. Must be `#[SchedulableCommand]`. |
+| `commandPayload` | array | No | Default payload to merge into the command. |
+| `misfire` | string | No | `skip_missed` (default), `fire_once`, `fire_all` |
+| `overlap` | string | No | `allow_concurrent` (default), `skip_if_running`, `queue_behind` |
+| `timezone` | string | No | IANA timezone string (default: `UTC`) |
+| `jitterSec` | int | No | Maximum random jitter in seconds, added to each fire time |
+| `sensitive` | bool | No | If true, command payload is redacted in audit log (default: false) |
+
+### Choosing a stable ID
+
+Use UUIDv7 (time-ordered). The ID must never change once a schedule is in production — the run store uses it as the primary key for slot deduplication. If you change the ID, the old run history is orphaned and new slots may re-fire.
+
+A good way to generate IDs: run `php vortos scheduler:list --generate-id` to get a fresh UUIDv7, or use `\Ramsey\Uuid\Uuid::uuid7()->toString()` in a throwaway script.
+
+## Using an interval trigger
+
+For tasks that should run every N seconds rather than at a specific time of day:
+
+```php
+#[Scheduled(
+    id:       '01900000-dead-7000-0000-000000000002',
+    name:     'sync-external-payments',
+    interval: 300,   // Every 5 minutes
+    command:  'App\Command\SyncPaymentsCommand',
+    misfire:  'fire_once',
+    overlap:  'skip_if_running',
+)]
+final class SyncPaymentsSchedule implements StaticScheduleDefinition {}
+```
+
+## Making a command schedulable
+
+Any command class that will be used with the scheduler must be tagged with `#[SchedulableCommand]`:
+
+```php title="src/Command/PruneAuditLogsCommand.php"
+use Vortos\Scheduler\Security\Attribute\SchedulableCommand;
+
+#[SchedulableCommand]
+final class PruneAuditLogsCommand
+{
+    public function __construct(
+        public readonly int $retentionDays = 90,
+    ) {}
+}
+```
+
+The `#[SchedulableCommand]` attribute registers the command with `CommandSpecValidator`. Any attempt to schedule a class without this attribute will fail with `CommandNotAllowlistedException` — even if you create the schedule directly via the service.
+
+This allowlist exists so that an attacker who gains access to the schedule management UI cannot schedule arbitrary PHP classes for execution.
+
+## Dynamic schedules via ScheduleService
+
+Dynamic schedules are stored in the database and managed at runtime. Inject `ScheduleServiceInterface` into your application code:
+
+```php
+use Vortos\Scheduler\Service\ScheduleServiceInterface;
+use Vortos\Scheduler\Schedule\Trigger\CronTrigger;
+use Vortos\Scheduler\Schedule\Trigger\IntervalTrigger;
+use Vortos\Scheduler\Schedule\Policy\MisfirePolicy;
+use Vortos\Scheduler\Schedule\Policy\OverlapPolicy;
+use Vortos\Scheduler\Fire\CommandSpec;
+
+final class TenantReportingController
+{
+    public function __construct(
+        private readonly ScheduleServiceInterface $schedules,
+    ) {}
+
+    public function enableWeeklyReport(string $tenantId): void
+    {
+        $this->schedules->create(
+            name:      'weekly-report',
+            trigger:   new CronTrigger('0 8 * * 1'),   // Monday 8am
+            command:   new CommandSpec(
+                class:   GenerateWeeklyReportCommand::class,
+                payload: ['tenantId' => $tenantId],
+            ),
+            misfire:   MisfirePolicy::fireOnce(),
+            overlap:   OverlapPolicy::SkipIfRunning,
+            timezone:  new \DateTimeZone('UTC'),
+            tenantId:  $tenantId,
+        );
+    }
+}
+```
+
+### ScheduleService methods
+
+| Method | Description |
+|---|---|
+| `create(...)` | Create a new schedule. Validates the command allowlist and RBAC policy before persisting. |
+| `pause(ScheduleId $id, UserIdentityInterface $actor)` | Pause a schedule. Fires stopped immediately — the current run (if any) is not interrupted. |
+| `resume(ScheduleId $id, UserIdentityInterface $actor)` | Resume a paused schedule. |
+| `delete(ScheduleId $id, UserIdentityInterface $actor)` | Delete a schedule and all its run history. |
+| `fireNow(ScheduleId $id, UserIdentityInterface $actor)` | Manually trigger an immediate fire, outside the normal schedule. Recorded as a manual fire in the audit log. |
+| `list(?string $tenantId)` | List all schedules, optionally scoped to a tenant. |
+| `get(ScheduleId $id)` | Fetch a single schedule by ID. |
+
+All write operations check the `SchedulePolicyInterface`. If the current user lacks permission, `ScheduleAccessDeniedException` is thrown before any mutation happens. If 4-eyes approval is required (configured on the policy), `FourEyesApprovalRequiredException` is thrown and an approval request is created.
+
+## Command payload
+
+The `CommandSpec` carries the class name and an optional payload array. The payload is serialized to JSON and stored in the run record:
+
+```php
+new CommandSpec(
+    class:   GenerateReportCommand::class,
+    payload: [
+        'tenantId' => $tenantId,
+        'format'   => 'pdf',
+        'year'     => 2026,
+    ],
+);
+```
+
+When the command is dispatched, the payload is deserialized and hydrated into the command object using the same mechanism as the CQRS bus. Named constructor arguments are matched by key.
+
+<Callout type="warn">
+Never put secrets in a command payload. The payload is stored in the run record and appears in the audit log. For sensitive operations, use a reference (a record ID, a key name) and fetch the secret inside the command handler.
+</Callout>
+
+## Marking a schedule sensitive
+
+If a schedule's payload contains data that should not appear in the audit log in plain text, mark the schedule `sensitive: true`:
+
+```php
+#[Scheduled(
+    id:        '01900000-dead-7000-0000-000000000003',
+    name:      'gdpr-purge',
+    cron:      '0 0 * * *',
+    command:   'App\Command\GdprPurgeCommand',
+    sensitive: true,
+)]
+final class GdprPurgeSchedule implements StaticScheduleDefinition {}
+```
+
+When `sensitive` is true, the payload is replaced with `[REDACTED]` in the audit log. The schedule itself still runs normally — only the log entry is scrubbed.
+
+## Timezone handling
+
+Each schedule carries a `DateTimeZone`. The daemon always stores and compares times in UTC internally. The timezone is only used to evaluate cron expressions — "run at 9am" means "run at 9am in this timezone", which might be UTC+3 or America/New_York or whatever you configure.
+
+IntervalTriggers are always UTC because they are relative (N seconds from the last run) rather than absolute.
+
+<Callout type="info">
+For customer-facing schedules where tenants are in different timezones, create separate dynamic schedules per tenant with the correct timezone, rather than trying to adjust UTC times in application code.
+</Callout>
+
+## Jitter
+
+Jitter adds a random delay to each fire time, up to a maximum of `jitterSec` seconds. This prevents thundering-herd problems when many schedules are configured to fire at exactly the same time (e.g., all at midnight).
+
+```php
+#[Scheduled(
+    id:        '01900000-dead-7000-0000-000000000004',
+    name:      'nightly-cleanup',
+    cron:      '0 0 * * *',
+    command:   'App\Command\NightlyCleanupCommand',
+    jitterSec: 600,   // Fire anywhere in the 10 minutes after midnight
+)]
+final class NightlyCleanupSchedule implements StaticScheduleDefinition {}
+```
+
+The jitter value is seeded from the schedule ID, making it deterministic for a given schedule (the same schedule always gets the same jitter offset for the same fire time) while still spreading different schedules across the window.
+
+## Metadata
+
+Schedules can carry arbitrary key-value metadata. This is useful for categorization, cost center attribution, or passing context to observability tooling:
+
+```php
+new Schedule(
+    // ...
+    metadata: [
+        'team'        => 'billing',
+        'cost-center' => 'infra',
+        'alert-team'  => 'platform-oncall',
+    ],
+);
+```
+
+Metadata values are propagated to Prometheus metric labels (cardinality-guarded) and to OTel span attributes.
+
+All keys and values must be strings. Non-string values will throw `InvalidArgumentException` at construction time.

@@ -1,0 +1,195 @@
+---
+title: Backup
+description: Streaming database backups with envelope encryption, GFS retention with hard safety floors, an append-only catalog, and 3-2-1 replication.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Backup
+
+`vortos-backup` exists because a backup you've never restored is a hope, not a backup. Every piece of this package is built around that idea: backups are streamed (never buffered to disk where they could be incomplete or tampered with), checksummed, cataloged in a way that can't be silently rewritten, retained according to rules that mathematically cannot delete your only good copy, and — critically — periodically restored for real in [restore drills](/docs/backup/restore-drills) so "can we actually recover" is a tested fact, not an assumption.
+
+<Callout type="info" title="3-2-1, enforced structurally">
+Three copies, two different media, one offsite. The catalog tracks a primary and secondary location per artifact; `backup:replicate` is the reconciliation loop that copies any artifact missing its secondary, and the catalog read model can tell you exactly which artifacts are currently under-replicated.
+</Callout>
+
+## Backup targets — what gets dumped
+
+`BackupTargetInterface` is the [Ops Kit](/docs/ops-kit) port for "knows how to produce a streamed dump of one database engine":
+
+```php
+interface BackupTargetInterface extends DriverInterface
+{
+    public function dump(BackupRequest $request): BackupStream;
+    public function engine(): DatabaseEngine;
+}
+```
+
+`dump()` carries a hard requirement in its contract: it **must not** buffer the whole dump in memory or write it to a tracked disk path first — bytes flow straight from the database engine's dump process to the consumer (the encryption stream, then the store). A multi-gigabyte database dump never sits as a temp file something could read, and a backup of a database too large for available RAM doesn't crash the host. `postgres` and `mongo` drivers ship in-core; anything else is a `make:driver` away.
+
+## Stores — where backups land
+
+`BackupStoreInterface` is the matching port for storage. `ObjectStoreBackupStore` is the shipped driver, writing to any [Object Store](/docs/object-store)-backed target (S3-compatible or otherwise) — the backup pipeline never talks to a specific cloud SDK directly.
+
+## Envelope encryption
+
+Every backup payload is encrypted before it leaves the process, using the same `EnvelopeCipher` pattern documented in [Secrets](/docs/secrets#envelope-encryption) — `EnvelopeStreamCipher` adapts it to a streaming interface so a multi-gigabyte dump is encrypted chunk-by-chunk rather than requiring the whole plaintext in memory at once. The data key is wrapped under a `KeyProviderInterface` (the same `age` off-host custody Secrets uses), so a stolen backup artifact is useless without the private identity, which never lives anywhere near the backup itself.
+
+## Retention — GFS with hard safety floors
+
+`RetentionPolicy::plan()` implements grandfather-father-son retention: keep the most recent backup in each of the N most recent hourly/daily/weekly/monthly/yearly buckets, plus an absolute age cap.
+
+```php
+$policy = new RetentionPolicy(
+    hourly: 0,
+    daily: 7,
+    weekly: 4,
+    monthly: 6,
+    yearly: 1,
+    maxAgeDays: 400,
+    minKeepFloor: 1,
+);
+
+$plan = $policy->plan($artifacts, now: new \DateTimeImmutable());
+$plan->keep;     // list<BackupArtifact> — retained
+$plan->delete;   // list<BackupArtifact> — eligible for deletion
+$plan->refused;  // entries a rule wanted to delete, but a safety floor overrode
+```
+
+Two invariants make "delete the only good copy" structurally impossible, not just unlikely:
+
+1. The most recent `minKeepFloor` artifacts are **always** kept, regardless of what the GFS buckets decide.
+2. The single most-recent artifact is **never** placed in `delete` — if a rule would select it, the engine moves it to `refused` with an explicit reason (`floor_protected_most_recent`) instead.
+
+`plan()` is pure — same artifacts, same `$now`, same plan, every time, with zero I/O. This is what lets you unit-test a retention policy's behavior against years of synthetic history without touching a real store.
+
+```bash
+# see what would be deleted, change nothing
+php bin/console backup:retention --plan-only
+
+# apply
+php bin/console backup:retention
+```
+
+### Object lock — WORM retention
+
+`ObjectLockPolicy` layers immutable, write-once-read-many storage on top of retention: an artifact under object lock cannot be deleted before its retention window expires, full stop — `compliance` mode means not even an account administrator can override it early; `governance` mode allows an explicit, audited exception.
+
+```php
+$lock = new ObjectLockPolicy(mode: 'compliance', retentionDays: 90);
+$lock->isWithinRetention($artifact->createdAt, now: new \DateTimeImmutable()); // true → cannot be deleted
+```
+
+`ImmutabilityVerifier` and `ObjectLockProbe` periodically confirm the underlying store's object lock is actually configured and active — catching a misconfiguration (lock silently disabled at the bucket level) before it matters, not after a ransomware incident proves it.
+
+## The catalog — append-only by construction
+
+`BackupCatalogRepositoryInterface::record()` records a verified artifact exactly once; a duplicate `id` throws `BackupAlreadyExistsException` rather than overwriting. Immutability is enforced at the storage layer — a database trigger, not a convention someone could forget to follow in application code. This mirrors the same write-once guarantee [Release's manifest repository](/docs/release#build-manifests) and the [audit hash chain](/docs/auth/audit-logging) use elsewhere in the framework.
+
+## Point-in-time recovery (PITR)
+
+For Postgres, `PostgresWalArchiver` archives WAL segments continuously, and `WalChain` represents the ordered, contiguous sequence of segments needed to replay forward from a base backup to any point in time:
+
+```php
+$chain = new WalChain(base: $baseBackup, segments: $walSegments);
+$chain->replayable(); // segments at or after the base — the only ones that can actually replay
+```
+
+`WalChain` is pure and detects a missing or non-contiguous segment **before** a restore is attempted, not midway through one. `backup:wal-archive` is the hook wired into Postgres's `archive_command` to push each completed segment as it's produced.
+
+```bash
+php bin/console backup:wal-archive %p
+```
+
+### Containerized PITR (Postgres in its own container)
+
+`archive_command = 'vortos backup:wal-archive %p'` only works where the Vortos CLI (PHP) runs. A stock `postgres:18-alpine` image has no PHP, so use the recipe generator:
+
+```bash
+php bin/console vortos:backup:pitr:recipe --postgres-service=postgres --backend-service=backend
+```
+
+It emits a **pure `cp` `archive_command`** (archives WAL to a shared volume — no PHP in the DB image), a **wal-shipper** worker that runs in your app image and ships segments off-host via `backup:wal-archive`, a scheduled **base-backup** worker, and a `docker-compose.pitr.yaml` fragment wiring the shared volume. Use `--dry-run` to preview.
+
+<Callout type="info" title="Restore drills are opt-in">
+`DrillRunner` and `backup:drill` register only when `VORTOS_BACKUP_DRILL_DSN` is set (an ephemeral-database endpoint). Without it, `backup:drill` stays visible and fails with remediation — installing `vortos-backup` no longer requires the DSN just to boot the console.
+</Callout>
+
+## CLI
+
+```bash
+# run a backup — dump, store, verify, catalog
+php bin/console backup:run --engine=postgres --environment=production
+
+# verify a cataloged backup's integrity without restoring it
+php bin/console backup:verify <backup-id>
+
+# list cataloged backups
+php bin/console backup:list --engine=postgres --environment=production
+
+# reconcile 3-2-1: copy any artifact missing its secondary location
+php bin/console backup:replicate
+
+# generate the host cron fragment for declared schedules
+php bin/console backup:schedule
+
+# operator-driven restore to a target database
+php bin/console backup:restore <backup-id> --target=staging
+```
+
+## Step-by-step: your first backup schedule
+
+<Steps>
+<Step>
+Declare a schedule and retention policy:
+
+```php title="config/backup.php"
+use Vortos\Backup\DependencyInjection\VortosBackupConfig;
+
+return static function (VortosBackupConfig $config): void {
+    $config->schedule('nightly-postgres')
+        ->engine('postgres')
+        ->environment('production')
+        ->cron('0 2 * * *')
+        ->retention(daily: 7, weekly: 4, monthly: 6, yearly: 1, maxAgeDays: 400);
+};
+```
+</Step>
+
+<Step>
+Generate the cron fragment and install it on the host running backups:
+
+```bash
+php bin/console backup:schedule > /etc/cron.d/vortos-backup
+```
+</Step>
+
+<Step>
+Run one manually to confirm the pipeline works end to end:
+
+```bash
+php bin/console backup:run --engine=postgres --environment=production
+```
+</Step>
+
+<Step>
+Verify it landed in the catalog and passes integrity verification:
+
+```bash
+php bin/console backup:list --engine=postgres --environment=production
+php bin/console backup:verify <backup-id>
+```
+</Step>
+
+<Step>
+Schedule a [restore drill](/docs/backup/restore-drills) — the only way to know a backup is actually restorable is to restore it, on a schedule, automatically.
+</Step>
+</Steps>
+
+<Cards>
+  <Card title="Restore Drills & DR" href="/docs/backup/restore-drills" description="Automated restore drills, invariant checks, RTO measurement, and DR runbook generation." />
+  <Card title="Secrets" href="/docs/secrets" description="The envelope encryption and key custody pattern Backup reuses for payload encryption." />
+  <Card title="Alerts" href="/docs/alerts" description="Backup failures and drill results route here automatically." />
+</Cards>

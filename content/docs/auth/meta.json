@@ -15,6 +15,9 @@
     "quotas",
     "audit-logging",
     "two-factor",
-    "api-keys"
+    "api-keys",
+    "scim",
+    "resilience",
+    "token-freshness"
   ]
 }

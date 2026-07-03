@@ -201,6 +201,46 @@ WHERE resource = 'doc-456'
 ORDER BY created_at DESC;
 ```
 
+## Tamper Detection — the Hash Chain
+
+A database `INSERT`-only permission stops your own application from updating or deleting audit rows. It does nothing about someone with direct database access editing a row in place. For deployments where that threat matters, each `AuditEntry` can be chained: every entry's content hash incorporates the previous entry's hash, and the chain head is signed with HMAC-SHA256.
+
+```php
+final class AuthAuditHashChain
+{
+    public const GENESIS_HASH = 'e3b0c4...'; // sha256('') — the first entry chains to this
+
+    public function contentHash(array $hashableFields, string $prevHash): string
+    {
+        return hash('sha256', $this->canonicalJson($hashableFields) . $prevHash);
+    }
+
+    public function sign(string $signingMessage, string $hmacKey): string
+    {
+        return hash_hmac('sha256', $signingMessage, $hmacKey);
+    }
+}
+```
+
+Editing any historical row — even just one field — changes that entry's content hash, which no longer matches what every later entry in the chain was computed against. The tamper is detectable from the chain alone, without needing a separate copy of the "real" data to compare against.
+
+```bash
+php bin/console vortos:auth:verify-audit-chain
+```
+
+```
+Walking the hash-chained audit log...
+12,403 entries verified. Chain intact — no tamper, gap, or forged signature detected.
+```
+
+`AuthAuditChainVerifier::verify()` walks entries in sequence order and fails at the **first** broken link, reporting exactly which entry and what kind of break (a hash mismatch, a sequence gap, an invalid signature) — so an incident investigation starts from a precise point, not "somewhere in 12,000 rows."
+
+<Callout type="info" title="Chain integrity is opt-in, not a default cost">
+If `audit_hmac_key` isn't configured, `vortos:auth:verify-audit-chain` reports "chain integrity is disabled — nothing to verify" rather than failing. Hash-chaining adds a real cost (every entry write now depends on reading the previous entry's hash), so it's an explicit choice for deployments that need it, not a tax on every audit write by default.
+</Callout>
+
+Like [lockout and rate limiting](/docs/auth/resilience), audit recording has an explicit `AuditFailureMode` (`FailClosed`/`FailOpen`) for what happens if the audit store itself is unreachable — choose based on whether you'd rather block the action being audited or let it through unaudited during a store outage.
+
 ## Compliance Considerations
 
 - **Never delete audit records** — they are append-only by design. Even for GDPR erasure requests, pseudonymize the `user_id` rather than deleting rows.

@@ -1,0 +1,85 @@
+---
+title: Caddy Cutover & the Edge Router
+description: The edge-router driver port, the Caddy implementation, drift detection, and generation-based compare-and-swap for release state.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Caddy Cutover & the Edge Router
+
+`EdgeRouterInterface` is the [Ops Kit](/docs/ops-kit) port for "whatever sits in front of your app and decides which color receives traffic." The shipped driver targets Caddy's admin API; the port itself doesn't care what's underneath.
+
+```php
+interface EdgeRouterInterface extends DriverInterface
+{
+    public function cutover(DesiredRoute $desired): CutoverResult;
+    public function liveRoute(): ?LiveRoute;
+    public function reconcile(DesiredRoute $desired): ReconcileResult;
+}
+```
+
+## Cutting over
+
+`CutoverCoordinator` is the orchestration layer above the raw driver call. It does three things a raw `$edgeRouter->cutover()` call alone wouldn't:
+
+1. **Verifies the new upstream is actually live** after the switch — `CutoverResult::$verifiedLiveUpstream` must be true, or the coordinator treats the cutover as failed.
+2. **Reverts automatically on verification failure** — if there was a previous color, it switches back to it and records why via `CutoverEventRecorderInterface::recordRevert()`, then throws `CutoverRevertedException`.
+3. **Records the new release with a generation number** — only after a verified cutover.
+
+```php
+$result = $cutoverCoordinator->cutover(
+    desired: $desiredRoute,
+    imageDigest: $digest,
+    buildId: $buildId,
+    planHash: $planHash,
+    previousEndpoint: $blueEndpoint,
+);
+```
+
+A cutover never leaves you pointed at an unverified upstream silently — it either confirms success or reverts and tells you exactly what it reverted to.
+
+## Generations and compare-and-swap
+
+Every `CurrentRelease` carries a `generation` integer that increments by exactly one on each successful cutover:
+
+```php
+$newGeneration = ($prev !== null ? $prev->generation : 0) + 1;
+```
+
+This is what makes the release store safe against a stale reconciler: if two processes race to reconcile state, the one operating on an older generation can be detected and rejected rather than silently overwriting a newer release with stale desired state.
+
+## Drift detection and reconciliation
+
+`EdgeReconciler` is what `deploy:reconcile` runs. It compares what's actually live (`$edgeRouter->liveRoute()`) against what *should* be live (derived from the recorded `CurrentRelease`):
+
+```
+desired = endpoint for currentRelease.activeColor
+live    = edgeRouter->liveRoute()
+
+if live matches desired → in sync, nothing to do
+if live differs         → drift detected
+    if rate-limited      → record drift, skip correction this cycle
+    else                 → cutover to desired, record correction
+```
+
+```bash
+php bin/console deploy:reconcile --env=production
+```
+
+`ReconcileRateLimiter` exists so a flapping or misbehaving edge router doesn't get hammered with repeated correction attempts — drift is still recorded via `CutoverEventRecorderInterface::recordDrift()` every cycle, even when a correction is skipped, so you can see drift happening in your event log even during a rate-limited window.
+
+<Callout type="info" title="Why reconciliation is a separate command from cutover">
+A cutover is a deliberate action tied to a specific deploy. Reconciliation is a background safety net — run it on a schedule (cron, a sidecar loop) so that if the edge router's config drifts from the desired state for any reason (a manual edit, a crash mid-write, an out-of-band change), it self-heals rather than staying wrong until the next deploy.
+</Callout>
+
+## Scaffolding the Caddy config
+
+```bash
+php bin/console deploy:edge:init
+```
+
+Scaffolds the Caddy configuration files for a blue/green edge setup — two upstream blocks and the admin API wiring the `CaddyEdgeRouter` driver needs to issue cutover commands at runtime.
+
+## Worker drain during cutover
+
+The Caddy driver's `DrainObserver` coordinates the brief overlap window during cutover — workers behind the color being retired get a deadline to finish in-flight requests (`drain_deadline_seconds` in the strategy's `SwitchUpstream` step) before the old upstream is removed from rotation entirely. `DrainResult` reports whether every worker drained cleanly within the deadline or had to be force-stopped.

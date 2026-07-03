@@ -36,6 +36,17 @@ The tools below consume one or more of these pillars. Some (Grafana, Datadog) co
 | [Datadog](/docs/observability/datadog) | All three | Fully managed APM platform |
 | [Alertmanager](/docs/observability/alertmanager) | Metrics | Route Prometheus alerts to Slack, email, PagerDuty |
 
+## Framework-level observability capabilities
+
+The guides above cover connecting *external* tools. These pages cover capabilities the framework itself adds on top of the open-standards output — generated collector configuration, tamper-evident deploy audit history, dead-man monitoring, and declared SLO resources:
+
+<Cards>
+  <Card title="Collector & Sinks" href="/docs/observability/collector-and-sinks" description="Config-only backend switching — a sink renders the collector exporter fragment; your app never touches a vendor SDK." />
+  <Card title="Deploy Audit Ledger" href="/docs/observability/audit-ledger" description="A hash-chained, signed, append-only record of every deploy and rollback." />
+  <Card title="Dead-Man Heartbeat" href="/docs/observability/heartbeat" description="A scheduled off-host check-in, detected by absence." />
+  <Card title="Deploy Markers & SLO Resources" href="/docs/observability/deploy-markers-and-slo" description="Dashboard annotations linked to a build, and SLOs declared as validated, version-controlled resources." />
+</Cards>
+
 ## Start here — local development stack
 
 If you want everything wired up locally in one command, start with the local stack guide. It runs Prometheus, Grafana, Loki, and Tempo together with all data sources pre-configured:
@@ -51,6 +62,24 @@ Integration guides in this section focus on the external tool side — installat
 - [Logger configuration](/docs/logger) — alerting handlers (Sentry, Slack, email), channels, log format
 - [Metrics configuration](/docs/metrics) — adapter selection, Prometheus endpoint security, StatsD host, OTLP metrics push
 - [Tracing configuration](/docs/tracing) — OpenTelemetry wiring, sampling, module disable
+
+### Error sink selection
+
+The error sink is selectable with `OBSERVABILITY_ERROR_SINK` (`null` default, `glitchtip`, or `sentry`). A first-class **Sentry** driver ships alongside GlitchTip — same envelope ingest protocol — reading `OBSERVABILITY_SENTRY_DSN`. The configured sink is aliased to `ErrorSinkInterface`, so consumers inject "whatever the operator selected".
+
+```bash
+OBSERVABILITY_ERROR_SINK=sentry
+OBSERVABILITY_SENTRY_DSN=https://<key>@o0.ingest.sentry.io/0
+```
+
+### Collector receiver bind (multi-container)
+
+The generated OTLP collector binds loopback (`127.0.0.1`) by default — correct for a sidecar sharing the app's network namespace, and the tracing stub now defaults its exporter to `127.0.0.1:4318` to match. When a separate worker container must emit to a **shared** collector on a private Docker network, bind the receiver wider:
+
+```bash
+php bin/console vortos:observability:collector --bind=0.0.0.0
+# or set OBSERVABILITY_COLLECTOR_BIND=0.0.0.0
+```
 
 <Callout type="info" title="No lock-in">
 Vortos uses open standards throughout. Switching from Jaeger to Tempo, or from self-hosted Prometheus to Datadog, requires only a config change — no application code changes.

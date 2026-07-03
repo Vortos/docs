@@ -68,7 +68,8 @@ docker/
 ├── frankenphp/
 │   └── Caddyfile                 ← HTTP/HTTPS routing config
 ├── php/
-│   └── Dockerfile                ← PHP + extensions + app
+│   ├── Dockerfile                ← PHP + extensions + app
+│   └── entrypoint.sh             ← boot preflight — runs cache:warmup before the server starts
 ├── postgres/
 │   └── init/
 │       ├── 001_create_database.sql
@@ -117,7 +118,8 @@ docker/
 │   ├── Dockerfile
 │   └── default.conf              ← Nginx virtual host config
 ├── php/
-│   └── Dockerfile                ← PHP-FPM + extensions
+│   ├── Dockerfile                ← PHP-FPM + extensions
+│   └── entrypoint.sh             ← boot preflight — runs cache:warmup before the server starts
 ├── postgres/
 │   └── init/
 │       ├── 001_create_database.sql
@@ -160,6 +162,27 @@ docker compose logs -f worker
 ```
 
 The generated `.env` contains agnostic Vortos variables such as `VORTOS_WRITE_DB_PASSWORD` and `VORTOS_READ_DB_USER`. Compose maps those values to service-specific variables like `POSTGRES_PASSWORD` and `MONGO_INITDB_ROOT_USERNAME`.
+
+## Boot Preflight
+
+Every published Dockerfile includes a custom `entrypoint.sh` that runs `php bin/console cache:warmup` before the server or worker process starts.
+
+If the Symfony container fails to compile — bad DI config, a broken compiler pass, a misconfigured `#[OverrideImpl]` or `#[AsDecorator]` attribute — the error is printed directly to the terminal during `docker compose up` and the container exits cleanly with code 1. No `docker logs` required.
+
+```
+backend  | 2 container configuration error(s) found:
+backend  |
+backend  |   [1] #[AsDecorator] on "App\Resolver\LoggingResolver" (src/Resolver/LoggingResolver.php:14)
+backend  |       → No constructor parameter typed to "FlagContextResolverInterface" found.
+backend  |
+backend  |   [2] #[OverrideImpl] on "App\Cache\MyCache" (src/Cache/MyCache.php:8)
+backend  |       → Class does not implement "CacheInterface".
+backend exited with code 1
+```
+
+<Callout type="info" title="What the preflight catches">
+Any error thrown during Symfony container compilation: missing services, invalid aliases, compiler pass failures, and Vortos DI attribute errors (`#[DefaultImpl]`, `#[OverrideImpl]`, `#[AsDecorator]`). Runtime errors — database connection failures, logic errors in request handlers, missing env vars read at request time — are not caught by this preflight.
+</Callout>
 
 ## Package Workers
 

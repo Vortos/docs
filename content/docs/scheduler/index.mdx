@@ -1,0 +1,134 @@
+---
+title: Scheduler
+description: Distributed, multi-tenant, enterprise-grade job scheduler for Vortos. Cron and interval triggers, lease-based single-execution guarantees, full audit trail, and an optional browser UI.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Scheduler
+
+`vortos/vortos-scheduler` is the Vortos job scheduling engine. It handles the problem that most background-job libraries ignore: making absolutely sure a periodic task fires exactly once, even when you are running multiple application processes across many servers, and even when processes crash mid-flight.
+
+It also handles the enterprise concerns that come up once you're at scale — who is allowed to schedule what, does this job need a second person's approval before it can be created, is there an immutable record of every fire and its outcome, what happens when the background task queue goes down — all of it.
+
+The optional `vortos/vortos-scheduler-admin` package adds a browser-based management interface for non-developer operators.
+
+## What it does
+
+At its core, the scheduler answers two questions on a loop:
+
+1. **Which schedules are due right now?** — using cron expressions or fixed intervals
+2. **Has this slot already been dispatched?** — using a content-addressed slot key to guarantee idempotency
+
+Every eligible slot is atomically claimed and enqueued exactly once. If your process crashes between claiming and enqueuing, the slot stays claimable and the next tick picks it up. You never get double-fires.
+
+The daemon runs as a long-lived process (via `scheduler:run`) and holds a distributed lease — a mutex that ensures only one instance is doing the scanning at any given moment.
+
+<Callout type="warn">
+`scheduler:run` only scans, claims, and enqueues — it does not execute anything. A second long-lived process, `scheduler:consume`, drains the queue and actually dispatches each command. Both are required. See [Retention → Two processes, not one](/docs/scheduler/retention#two-processes-not-one).
+</Callout>
+
+## Two packages
+
+| Package | Purpose | Required |
+|---|---|---|
+| `vortos/vortos-scheduler` | Engine: daemon, triggers, leases, audit, CLI, security | Yes |
+| `vortos/vortos-scheduler-admin` | Browser-based management UI | No — optional |
+
+The engine is fully usable without the admin UI. You can manage schedules through the CLI or the `ScheduleService` API.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Management layer                           │
+│   CLI commands · ScheduleService API · Admin UI · Approvals  │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Security layer                             │
+│   CommandSpecValidator · SchedulePolicy · FourEyesGate       │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Registry layer                             │
+│   StaticScheduleRegistry (PHP attrs) · DbalScheduleStore     │
+│   ScheduleResolver · CachingScheduleResolver (in-process)    │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Engine layer                               │
+│   SchedulerDaemon → DueScan → MisfireResolver → SlotCalc    │
+│   FireDispatcher (atomic claim) → DispatchCircuitBreaker     │
+│   LeaseHeartbeatGuard                                        │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Execution layer (scheduler:consume)         │
+│   FireQueueConsumer (claim fire_queue rows) → CommandHydrator│
+│   → CQRS CommandBus::dispatch() → ledger Completed/Failed    │
+│   RunRetentionSweeper (auto-prune, same CQRS path)            │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Infrastructure layer                       │
+│   LeasePort (SQL/Redis/Postgres Advisory) · Enqueuer (DBAL)  │
+│   ScheduleStore · RunStore · RunRetentionOverrideStore       │
+│   AuditRepository                                             │
+└──────────────────────────┬───────────────────────────────────┘
+                           │
+                           ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    Observability layer                        │
+│   11 Prometheus metrics · OTel spans · DeadManDetector        │
+│   Hash-chain HMAC audit · SchedulerAuditCheckpoint           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Everything writes through well-defined ports. The engine itself has no infrastructure dependency — it only knows about `LeasePort`, `ScheduleStoreInterface`, `ScheduleRunStoreInterface`, and `SchedulerEnqueuerPort`. You can swap any of these without touching the engine.
+
+## Quick orientation
+
+New to the package? Read in this order:
+
+1. [Installation](/docs/scheduler/installation) — composer, migration, env vars, daemon setup
+2. [Concepts](/docs/scheduler/concepts) — triggers, misfire, overlap, slots, leases — the mental model
+3. [Schedules](/docs/scheduler/schedules) — defining schedules with PHP attributes or dynamically via API
+4. [Running](/docs/scheduler/running) — starting the daemon, CLI commands, supervisor config
+5. [Security](/docs/scheduler/security) — who can do what, 4-eyes approvals, command allowlist
+6. [Retention](/docs/scheduler/retention) — automatic run-ledger pruning, per-tenant overrides, and the fire-queue consumer that actually executes commands
+7. [Audit](/docs/scheduler/audit) — the hash-chain audit trail and how to verify it
+8. [Admin UI](/docs/scheduler/admin-ui) — the optional browser interface
+9. [Extending](/docs/scheduler/extending) — custom lease drivers, enqueue backends, schedule policies
+10. [Testing](/docs/scheduler/testing) — testing utilities, conformance test cases, fuzz/chaos suites
+11. [Production](/docs/scheduler/production) — observability, tuning, blue-green deployments
+12. [Troubleshooting](/docs/scheduler/troubleshooting) — common problems and how to diagnose them
+
+## Feature summary
+
+- **Cron and interval triggers** — standard 5-field cron expressions via the dragonmantank/cron-expression library, and simple fixed-interval triggers in seconds
+- **Distributed single-execution** — distributed lease (SQL row, Redis key, or Postgres advisory lock) ensures the daemon runs on exactly one node at a time; slot-level atomic enqueue prevents double-fire even under race conditions
+- **Misfire handling** — when the daemon was down, configurable per-schedule: skip all missed slots, fire once to catch up, or fire every missed slot
+- **Overlap protection** — per-schedule policy: allow concurrent runs, skip if already running, or queue behind the previous run
+- **Multi-tenancy** — schedules carry an optional `tenantId`; the engine partitions all queries and audits by tenant
+- **Static schedules** — define schedules in PHP using `#[Scheduled]` on a `StaticScheduleDefinition` class; no database row needed; registered at compile time
+- **Dynamic schedules** — create, pause, resume, and delete schedules at runtime via `ScheduleService` or the CLI
+- **Security** — command allowlist (`#[SchedulableCommand]`), RBAC (`SchedulePolicy` + Vortos auth engine), 4-eyes approval gate for sensitive operations
+- **Audit trail** — every schedule mutation and every fire is written to an append-only log with HMAC-signed hash-chain integrity; O(n/epoch) checkpoint verification
+- **Prometheus metrics** — 8 gauges and counters tracking fires, misses, durations, queue depth, and dead-man liveness
+- **OpenTelemetry** — one span per fire with schedule_id, tenant, result, and duration attributes
+- **Dead-man detection** — raises a metric alert if no tick has been processed within a configurable window
+- **Circuit breaker** — if the dispatch backend fails N consecutive times, the circuit opens and no further dispatches are attempted until the recovery window elapses
+- **Lease heartbeat guard** — tracks per-shard lease renewal health; skips dispatch if the renewal has been silent for >90% of the TTL
+- **Cardinality guard** — caps Prometheus label cardinality to prevent unbounded time-series growth in multi-tenant deployments
+- **Static override store** — operator can force-pause or force-resume any schedule without touching the database, useful during incidents
+- **Doctor / preflight** — `scheduler:doctor` runs 11 health checks (C1–C11); integrates with `deploy:doctor` as a preflight gate so a broken scheduler blocks deploys
+- **Node-seeded jitter** — lease acquisition jitter uses `crc32(hostname:pid)` rather than random, making it deterministic and testable while still spreading nodes across the acquisition window
+- **Fire-queue consumer** — `scheduler:consume` drains the fire queue and dispatches each command through the CQRS `CommandBus`; required alongside `scheduler:run` for anything scheduled to actually execute
+- **Automatic run-ledger pruning** — `vortos_scheduler_runs` is pruned on a schedule by default, with per-tenant retention overrides and permanent legal-hold exemptions — see [Retention](/docs/scheduler/retention)
+- **Fluent, typed configuration** — every setting is available via `config/scheduler.php` with IDE autocomplete, in addition to environment variables

@@ -1,0 +1,106 @@
+---
+title: Lock-Safety Analysis & Down-Verify
+description: A CI gate that statically catches lock-blocking migrations before they run, plus a command that proves every migration is actually reversible.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Lock-Safety Analysis & Down-Verify
+
+A migration that looks correct can still take your production database offline for the duration it runs — `ALTER TABLE` rewriting a multi-million-row table under an exclusive lock, `CREATE INDEX` without `CONCURRENTLY`, a `NOT NULL` column added without a default forcing a full table rewrite. None of these are syntax errors. They're operational hazards that only show up when the migration actually runs against production-sized data. `vortos:migrate:analyze` catches them statically, in CI, before that happens.
+
+## Lock-safety rules
+
+`MigrationSafetyAnalyzerInterface` is an [Ops Kit](/docs/ops-kit) port — `PgNativeSafetyAnalyzer` is the shipped pure-PHP driver, parsing migration SQL and checking it against a rule set, with no database connection required for the static checks. A second `SquawkSafetyAnalyzer` driver wraps the external `squawk` linter for teams that want its broader rule coverage.
+
+Nine rules ship with the PG-native driver:
+
+| Rule | Catches |
+|---|---|
+| `pg.alter.blocking` | An `ALTER TABLE` that requires an exclusive lock for its duration |
+| `pg.index.non-concurrent` | `CREATE INDEX` without `CONCURRENTLY` |
+| `pg.index.concurrent-in-transaction` | `CREATE INDEX CONCURRENTLY` inside a transactional migration (PostgreSQL forbids this — it would fail at runtime, not just be slow) |
+| `pg.backfill.full-rewrite` | An operation that forces a full table rewrite (changing a column type, adding a column with a volatile default) |
+| `pg.lock-timeout.missing` | A migration with no `lock_timeout` set — a long-running lock wait blocks indefinitely instead of failing fast |
+| `pg.column.not-null-no-default` | Adding `NOT NULL` without a default — forces a full table scan to validate on older PostgreSQL versions |
+| `pg.column.volatile-default` | A column default using a volatile expression (forces a rewrite rather than a fast metadata-only change) |
+| `pg.phase.mismatch` | A migration declared as expand-phase that actually contains a contract-shaped (destructive) operation |
+| `pg.phase.undeclared` | A migration with no declared phase at all |
+
+```php
+final class NonConcurrentIndexRule implements SafetyRuleInterface
+{
+    public function evaluate(MigrationArtifact $artifact, ?TargetSchemaSnapshot $target, ParsedStatement $statement): iterable
+    {
+        if (!$statement->matches('\bCREATE\s+(?:UNIQUE\s+)?INDEX\b')) return;
+        if ($statement->matches('\bCONCURRENTLY\b')) return;
+
+        yield new SafetyDiagnostic(
+            ruleId: $this->id(),
+            severity: Severity::Error,
+            message: 'CREATE INDEX without CONCURRENTLY acquires an exclusive lock on the table.',
+            remediation: 'Use CREATE INDEX CONCURRENTLY. Requires the migration to be non-transactional.',
+        );
+    }
+}
+```
+
+Every diagnostic carries a concrete remediation, not just a complaint — the point is to fix the migration in the same review cycle the problem was caught, not to send someone hunting for the right pattern.
+
+## Severity and the CI gate
+
+```php
+enum Severity: string
+{
+    case Error = 'error';
+    case Warning = 'warning';
+    case Info = 'info';
+
+    public function blocksCI(): bool { return $this === self::Error; }
+}
+```
+
+```bash
+php bin/console vortos:migrate:analyze
+```
+
+```
+[ERROR] pg.index.non-concurrent   20260620_add_email_index.php
+        CREATE INDEX without CONCURRENTLY acquires an exclusive lock on the table.
+        Fix: Use CREATE INDEX CONCURRENTLY. Requires withTransaction(false).
+
+1 error, 0 warnings
+```
+
+Only `Error`-severity findings block CI; `Warning` and `Info` surface for visibility without failing the build. Pass `--target=<dsn>` to read real table statistics from a target database — this enables data-driven checks (a full-table-rewrite warning that only fires above a configured row-count threshold, say), distinguishing "this operation is risky on a 50-row table" (fine) from "this operation is risky on your 50-million-row production table" (not fine).
+
+```bash
+# analyze every migration, not just pending ones
+php bin/console vortos:migrate:analyze --all
+
+# machine-readable output for a CI pipeline
+php bin/console vortos:migrate:analyze --json
+```
+
+## Down-verify — proving reversibility, not assuming it
+
+A migration's `down()` method is usually written once and never actually executed until the day you desperately need a rollback to work — by which point discovering it's broken is the worst possible time to find out.
+
+```bash
+php bin/console vortos:migrate:down-verify
+```
+
+`MigrateDownVerifyCommand` provisions a disposable database, runs every migration **up**, then **down**, then **up** again, and reports any step that fails. This is the only way to actually know `down()` is correct rather than assuming it because nobody's needed it yet.
+
+```bash
+# verify only the last 5 migrations, rather than the whole history
+php bin/console vortos:migrate:down-verify --count=5
+```
+
+<Callout type="warn" title="Run this in CI, not just locally before a release">
+A migration's `down()` rotting unnoticed is a slow process — each new migration added without re-verifying older ones increases the chance some interaction breaks an old rollback path. Wiring `vortos:migrate:down-verify` into CI on every PR that touches migrations catches this the same run it's introduced, the same principle [Pipeline's `pipeline:verify`](/docs/pipeline#cli) and [IaC's `--check`](/docs/iac#deterministic-rendering--the-drift-guard) apply to their own drift.
+</Callout>
+
+## How this connects to Deploy
+
+[Deploy's preflight](/docs/deploy/doctor) includes `MigrationDriftCheck`, which consults the same safety analyzer to confirm pending migrations are reflected in the schema fingerprint before a deploy proceeds. Lock-safety analysis and the [phase gate](/docs/deploy/phase-gate)'s expand/contract enforcement are complementary, not redundant: the phase gate stops a destructive migration from running in the same deploy as code that still needs the old schema; lock-safety analysis stops a migration — expand or contract — from taking the database offline while it runs.

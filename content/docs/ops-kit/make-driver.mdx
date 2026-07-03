@@ -1,0 +1,110 @@
+---
+title: make:driver
+description: Scaffold a driver, its conformance test, and an optional installable split package with vortos:make:driver.
+---
+
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# make:driver
+
+Writing a driver by hand means remembering the attribute, the capability descriptor skeleton, and the conformance test boilerplate every time. `vortos:make:driver` generates all of it from two arguments: the concern and the driver's key.
+
+```bash
+php bin/console vortos:make:driver deploy k8s \
+  --port="App\Deploy\Target\DeployTargetInterface" \
+  --tck="App\Deploy\Testing\DeployTargetConformanceTestCase"
+```
+
+This creates:
+
+```
+src/Deploy/Target/K8s/
+├── K8sDriver.php
+└── Tests/
+    └── K8sDriverConformanceTest.php
+```
+
+## Options
+
+| Option | Default | Purpose |
+|---|---|---|
+| `--port` | `Vortos\OpsKit\Driver\DriverInterface` | FQCN of the port interface the driver implements |
+| `--namespace` | `App\<Concern>\Driver` | Parent namespace for the generated class |
+| `--tck` | `Vortos\OpsKit\Testing\ConformanceTestCase` | FQCN of the conformance base class the test extends |
+| `--tag` | `vortos.<concern>.driver` | DI tag used by the concern's compiler pass |
+| `--dir` | derived from namespace | Output directory |
+| `--order` | `150` | `extra.vortos.order` written into a split package's `composer.json` |
+| `--split` | off | Also scaffold a full installable Composer package |
+
+## Step-by-step
+
+<Steps>
+<Step>
+Generate the driver against your concern's actual port and TCK:
+
+```bash
+php bin/console vortos:make:driver backup s3-glacier \
+  --port="App\Backup\Target\BackupTargetInterface" \
+  --tck="App\Backup\Testing\BackupTargetConformanceTestCase"
+```
+</Step>
+
+<Step>
+Fill in `capabilities()` with what the driver honestly supports:
+
+```php title="src/Backup/Target/S3Glacier/S3GlacierDriver.php"
+public function capabilities(): CapabilityDescriptor
+{
+    return CapabilityDescriptor::create(capabilities: [
+        'point_in_time_restore' => false,
+        'object_lock' => true,
+    ]);
+}
+```
+</Step>
+
+<Step>
+Implement the port's actual methods (`deploy()`, `store()`, `notify()` — whatever your port declares).
+</Step>
+
+<Step>
+Wire `registerForAutoconfiguration()` in your concern's DI extension if this is the first driver for that port — the scaffolder prints the exact line to add:
+
+```php
+$container->registerForAutoconfiguration(BackupTargetInterface::class)
+    ->addTag('vortos.backup.target');
+```
+</Step>
+
+<Step>
+Run the generated conformance test. It already inherits the full TCK for that port — no test code to write beyond `createDriver()` and `expectedKey()`, which the scaffolder fills in for you:
+
+```bash
+./vendor/bin/phpunit src/Backup/Target/S3Glacier/Tests/S3GlacierDriverConformanceTest.php
+```
+</Step>
+</Steps>
+
+## Shipping a driver as its own package
+
+Pass `--split` to scaffold a complete installable Composer package alongside the driver — useful when a driver depends on a provider SDK you don't want as a hard dependency of the core concern.
+
+```bash
+php bin/console vortos:make:driver analytics mixpanel --split
+```
+
+```
+packages/Vortos/src/AnalyticsMixpanel/
+├── composer.json
+├── DependencyInjection/
+│   ├── AnalyticsMixpanelPackage.php
+│   └── AnalyticsMixpanelExtension.php
+└── MixpanelDriver.php
+```
+
+The generated `Extension` calls `setAutoconfigured(true)` so the core concern's `registerForAutoconfiguration()` rule picks up the driver the moment the package is installed — there's no manual registration step on the consuming application's side. This is exactly the pattern [AnalyticsPosthog](/docs/analytics/posthog) and [DeployK8s](/docs/deploy/k8s) use.
+
+<Callout type="info" title="Existing files are never overwritten">
+`DriverScaffolder::write()` skips any file that already exists rather than overwriting it. Re-running `make:driver` after hand-editing the generated class is safe.
+</Callout>

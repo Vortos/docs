@@ -1,0 +1,188 @@
+---
+title: Infrastructure as Code
+description: Export real infrastructure into deterministic Terraform JSON, then plan, apply, and destroy through a policy-gated, audited lifecycle.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+# Infrastructure as Code
+
+`vortos-iac` answers a question most teams answer badly: does your Terraform actually match what your application thinks its infrastructure looks like? Rather than hand-writing `.tf` files that drift from reality the moment someone clicks a change into a cloud console, IaC **exports** Terraform configuration from your application's own declared infrastructure needs (queues, databases, networks, IAM) and then governs the plan/apply/destroy lifecycle with policy gates and an audit trail.
+
+<Callout type="info" title="Export, don't author">
+You don't write `.tf.json` by hand. You declare what your application needs (a queue, a database, a DNS record) using the same module config you'd write anyway, and an exporter renders the Terraform. The generated file is the build artifact; your application config is the source of truth.
+</Callout>
+
+## Exporters — declaring infrastructure once
+
+Ten exporter families translate application-level declarations into Terraform resources:
+
+| Family | Produces |
+|---|---|
+| Compute | VMs, instance groups |
+| ComputeService | Managed compute (App Runner-style services) |
+| Database | Managed database instances |
+| Network | VPCs, subnets, security groups |
+| Queue | Managed queue infrastructure |
+| Kafka | Kafka cluster/topic infrastructure |
+| Cache | Managed Redis/cache instances |
+| ObjectStore | Buckets and lifecycle policies |
+| Dns | DNS zones and records |
+| Iam | Roles, policies, service accounts |
+
+Each exporter pairs an `*ExporterDefinition` (what your application declares) with an `*Exporter` (the Terraform-rendering logic) and a provider-specific `*Provider` driver — following the same [Ops Kit](/docs/ops-kit) port/driver split everywhere else in the framework, so a Network exporter targeting a different cloud provider is a new driver, not a rewrite of the exporter itself.
+
+## Deterministic rendering — the drift guard
+
+`TerraformDocument` is the single place every exporter writes through, and it renders **deterministically**: sorted keys, stable formatting, a trailing newline. The same application declarations always produce byte-identical `.tf.json` output.
+
+```bash
+# regenerate and check whether the committed file matches
+php bin/console vortos:iac:export --check
+```
+
+Because output is byte-identical for the same input, `--check` is an exact CI gate — not a fuzzy diff, not "close enough." If someone hand-edited the generated Terraform file, or your application's declared infrastructure changed without regenerating, this fails the build with a real diff, the same run the drift was introduced.
+
+### The secret gate lives in the renderer, not the exporters
+
+```
+exporter declares an attribute
+    │
+    ▼ TerraformDocument
+    └── attribute name looks secret-shaped + value is a literal string?
+            │
+            ├── on an explicit allow-list  → render it (loud, greppable, reviewable)
+            └── not allow-listed            → SecretLiteralException — export fails
+```
+
+This check is centralized in `TerraformDocument` specifically so **no exporter can bypass it** by being written carelessly. A database exporter that accidentally inlines a literal password instead of a reference to [Secrets](/docs/secrets) fails the export outright, rather than producing a `.tf.json` file with a plaintext credential in version control.
+
+## The lifecycle: plan → policy → apply
+
+`IacLifecycleService` is the orchestration layer above the raw engine (`IacEngineInterface`, with Terraform as the shipped driver). Three guards run before `apply()` is allowed to touch anything:
+
+```php
+public function apply(IacWorkspace $ws, IacPlan $plan, IacExecutionContext $ctx): IacApplyResult
+{
+    $this->guardPlanFile($plan);                                          // ← plan hasn't gone stale
+    $this->guardBlastRadius($plan, $ws->environment, $ctx->allowDestructive); // ← destructive count under the limit
+    $this->guardPolicy($plan);                                            // ← custom policy rules pass
+
+    return $this->engine->apply($ws, $plan, $ctx);
+}
+```
+
+### Stale-plan protection
+
+A Terraform plan file represents a point-in-time snapshot. If the underlying state changes between `plan` and `apply` — someone else applied a change, or the plan file was edited — applying the stale plan could do something nobody actually reviewed. `guardPlanFile()` re-hashes the plan file and compares against the digest recorded at plan time; any mismatch throws `PlanStaleException` rather than silently applying against now-incorrect assumptions.
+
+### Blast radius limits
+
+```php
+private readonly int $maxDestructiveProd = 0;
+private readonly int $maxDestructiveNonProd = 5,
+```
+
+By default, **zero** destructive changes are allowed to apply in production without an explicit `allowDestructive` override. A plan that would destroy more resources than the configured limit throws `DestructiveChangeRefusedException`, naming every resource address that would be destroyed. This is a deliberate brake on the most dangerous failure mode for infrastructure-as-code: a plan that looks like a small change but actually destroys and recreates half your database tier because of an unnoticed attribute change.
+
+### Custom policy
+
+```php
+interface PlanPolicyInterface extends DriverInterface
+{
+    public function evaluate(IacPlan $plan): PolicyResult;
+}
+```
+
+Write your own `PlanPolicyInterface` driver for organization-specific rules — "no resource in `us-east-1`," "every S3 bucket must declare versioning," whatever your compliance posture requires. `PolicyViolationException` carries the full `PolicyResult` so a failed apply tells you exactly which rule failed and on which resource.
+
+## Every lifecycle action is audited
+
+```php
+$this->auditSink->record(new LifecycleEvent(
+    $phase,            // Plan | Apply | Destroy
+    $ws->environment,
+    $planDigest,
+    get_current_user(),
+    $summary,
+    $binaryVersion,
+    $timestamp,
+));
+```
+
+`LedgerIacAuditSink` is the production sink — wired into the framework's append-only audit ledger, the same write-once guarantee documented in [Observability's audit ledger](/docs/observability/audit-ledger) and [Release's manifests](/docs/release#build-manifests). Every plan, apply, and destroy is recorded with who ran it, what the plan digest was, and how long it took — independent of whether the action succeeded.
+
+## Drift detection feeds the doctor, not just a report
+
+```bash
+php bin/console vortos:iac:drift --env=production
+```
+
+`IacDriftAuditor::audit()` runs `terraform show` against the current state and compares it to what's declared — if there's a difference, it's drift: someone or something changed real infrastructure outside the IaC pipeline. This isn't just a standalone report — [Deploy's doctor checks](/docs/deploy/doctor) include `IacDriftCheck`, so a deploy to an environment with undetected infrastructure drift fails preflight before the deploy even starts, rather than deploying application code onto infrastructure that no longer matches what was planned for it.
+
+## CLI
+
+```bash
+# export application declarations to Terraform JSON
+php bin/console vortos:iac:export
+php bin/console vortos:iac:export --check     # CI drift gate — exits non-zero on mismatch
+
+# plan, apply, destroy
+php bin/console vortos:iac:plan --env=production
+php bin/console vortos:iac:apply --env=production
+php bin/console vortos:iac:destroy --env=staging
+
+# detect drift between declared and actual infrastructure
+php bin/console vortos:iac:drift --env=production
+```
+
+<Callout type="warn" title="apply requires a plan, always">
+There's no direct "apply this config" shortcut — `apply()` takes an `IacPlan` produced by `plan()`, and `guardPlanFile()` verifies that exact plan file hasn't changed since it was generated. You always review a plan before anything is applied; the lifecycle service makes skipping that step structurally unavailable, not just discouraged.
+</Callout>
+
+## Step-by-step: your first export
+
+<Steps>
+<Step>
+Declare infrastructure your application needs, e.g. an object store bucket:
+
+```php title="config/object-store.php"
+$config->bucket('uploads')->versioning(true)->lifecycleDays(90);
+```
+</Step>
+
+<Step>
+Export it:
+
+```bash
+php bin/console vortos:iac:export
+```
+</Step>
+
+<Step>
+Review the generated `.tf.json`, then plan against a real environment:
+
+```bash
+php bin/console vortos:iac:plan --env=staging
+```
+</Step>
+
+<Step>
+Apply:
+
+```bash
+php bin/console vortos:iac:apply --env=staging
+```
+</Step>
+
+<Step>
+Wire `vortos:iac:export --check` into CI so a declaration change without a regenerated, committed `.tf.json` fails the build immediately.
+</Step>
+</Steps>
+
+<Cards>
+  <Card title="Deploy" href="/docs/deploy" description="deploy:doctor's IacDriftCheck consults this package's drift auditor before every deploy." />
+  <Card title="Secrets" href="/docs/secrets" description="What the TerraformDocument secret gate expects you to reference instead of a literal value." />
+</Cards>

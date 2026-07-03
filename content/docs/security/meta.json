@@ -12,6 +12,7 @@
     "secrets",
     "data-masking",
     "event-bus",
+    "supply-chain",
     "testing"
   ]
 }

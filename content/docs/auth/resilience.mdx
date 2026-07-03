@@ -1,0 +1,75 @@
+---
+title: Resilience — Circuit Breakers & Failure Modes
+description: What happens to login lockout and rate limiting when Redis goes away — explicit fail-open/fail-closed modes and circuit breakers that stop hammering a dead store.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Resilience — Circuit Breakers & Failure Modes
+
+Lockout and rate limiting both depend on Redis being reachable. The interesting design question isn't "what happens when Redis works" — it's "what happens to login attempts and API requests in the seconds after Redis stops responding." Both subsystems answer this explicitly rather than leaving it to whatever an uncaught exception happens to do.
+
+## Two failure modes, chosen deliberately per use case
+
+```php
+enum RateLimitFailureMode: string
+{
+    case FailClosed = 'fail_closed';
+    case FailOpen = 'fail_open';
+}
+```
+
+The same enum shape exists for `LockoutFailureMode`. Neither system has a single hardcoded answer — you choose per deployment, because the right answer depends on what you're protecting:
+
+| Mode | Behavior when the store is unreachable | When to use it |
+|---|---|---|
+| `FailClosed` | Requests are rejected as if the limit were exceeded | Protecting against credential-stuffing or brute-force login attempts — better to briefly block legitimate users than let an attacker through during a Redis outage |
+| `FailOpen` | Requests are allowed through, unchecked | Protecting API throughput, not security — better to briefly allow extra load than take your whole API down because the rate limiter's backing store had a blip |
+
+There's no single correct default — `LockoutManager` defaults toward `FailClosed` (lockout exists specifically to stop attackers; failing open during an outage defeats the point), while general-purpose `RateLimitMiddleware` more commonly runs `FailOpen` (a rate limiter's job is fairness and cost control, not security, so taking down the API because Redis hiccuped is the wrong trade).
+
+## Circuit breakers — stop hammering a dead store
+
+A failure mode alone doesn't protect Redis from being hammered with connection attempts once it's down. `RateLimitCircuitBreaker` and `LockoutCircuitBreaker` track consecutive failures and trip open after a threshold:
+
+```php
+final class RateLimitCircuitBreaker
+{
+    public function __construct(
+        private readonly int $failureThreshold = 5,
+        private readonly int $resetTimeoutSeconds = 30,
+    ) {}
+
+    public function isAvailable(): bool { /* Closed → true; Open → false until reset timeout; then HalfOpen → true */ }
+    public function recordSuccess(): void { /* resets to Closed */ }
+    public function recordFailure(): void { /* increments; trips Open at threshold */ }
+}
+```
+
+```
+Closed (normal)
+    │ 5 consecutive failures
+    ▼
+Open — isAvailable() returns false immediately, no connection attempt is made
+    │ 30 seconds elapse
+    ▼
+HalfOpen — isAvailable() returns true once, to test if the store recovered
+    │
+    ├── success → Closed
+    └── failure → Open again, timer restarts
+```
+
+While the circuit is `Open`, `isAvailable()` returns `false` without attempting a connection at all — the configured failure mode (`FailOpen`/`FailClosed`) then decides what happens to the actual request, but the store itself isn't being hit with five more doomed connection attempts per second while it's down. This is what keeps a Redis outage from becoming a thundering-herd reconnect storm the moment it comes back up.
+
+<Callout type="info" title="Two independent decisions, not one">
+The circuit breaker state (is the store currently considered reachable) and the failure mode (what to do about a request when it isn't) are deliberately separate. You could run `FailOpen` with a circuit breaker — allow requests through, but stop trying to reach a store you already know is down — which is exactly the combination most deployments want for rate limiting.
+</Callout>
+
+## What this looks like operationally
+
+```bash
+# RedisLockoutStoreResilienceTest / RedisRateLimitStoreTest exercise this directly —
+# the resilience behavior is tested the same way the happy path is, not bolted on after.
+```
+
+A Redis outage with `FailClosed` + a tripped circuit breaker means: every protected login attempt is rejected immediately (no slow timeout per request, because the breaker already knows not to bother connecting), for up to 30 seconds, after which one request is allowed through to test recovery. Without the circuit breaker, every single request during the outage would instead wait out a full Redis connection timeout before falling back — multiplying an outage's user-facing latency by however many concurrent requests are in flight.

@@ -1,0 +1,57 @@
+---
+title: Kubernetes Target
+description: vortos-deploy-k8s — a second DeployTargetInterface implementation, shipped as an installable package on top of kubectl.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Kubernetes Target
+
+`vortos-deploy-k8s` is a separate, optional package that implements the same `DeployTargetInterface` port [Deploy](/docs/deploy) defines — it exists to prove the [Ops Kit](/docs/ops-kit) driver pattern actually works for an out-of-tree target, and to give clusters a real alternative to `ssh-compose`.
+
+```bash
+composer require vortos/vortos-deploy-k8s
+```
+
+No manual wiring is needed beyond installing it — `KubernetesTarget` is registered with `#[AsDriver('k8s')]` and `setAutoconfigured(true)`, so Deploy's compiler pass picks it up automatically the moment the package is present.
+
+```php title="config/deploy.php"
+$config->environment('production')
+    ->target('k8s')
+    ->strategy('rolling');
+```
+
+## What ships in this package
+
+| Class | Purpose |
+|---|---|
+| `KubernetesTarget` | The `DeployTargetInterface` driver — delegates planning to the shared `DeployPlanner`, execution to `KubernetesStepExecutor` |
+| `KubernetesStepExecutor` | Turns a `DeployStep` into actual `kubectl` operations |
+| `KubeApiInterface` / `KubectlKubeApi` | A thin port wrapping shell-out `kubectl` calls, so the target itself never shells out directly |
+| `KubernetesManifestRenderer` | Renders Kubernetes manifests (Deployments, Services) from a `DeploymentDefinition` |
+| `RbacRenderer` / `PodSecurityProfile` | Generate the RBAC and pod security policy manifests alongside the workload manifest |
+| `KubernetesEdgeRouter` | Implements `EdgeRouterInterface` against a Kubernetes Service/Ingress instead of Caddy |
+| `KubernetesWorkerController` | Implements the worker-control port for draining and restarting background workers running as pods |
+
+## Why a separate package, not a `match` in core
+
+This is the same reasoning [Ops Kit](/docs/ops-kit) documents generally, made concrete: `vortos-deploy` has zero dependency on a Kubernetes client library. If you never deploy to Kubernetes, you never install this package, and none of its code or dependencies are part of your application. If you do, `composer require` is the entire integration step.
+
+```php title="DeployK8sExtension::load() — abbreviated"
+$container->register(KubernetesTarget::class, KubernetesTarget::class)
+    ->setArgument('$planner', new Reference(DeployPlanner::class))
+    ->setArgument('$kubeApi', new Reference(KubeApiInterface::class))
+    ->setArgument('$rollbackGuard', new Reference(RollbackGuard::class, ContainerBuilder::NULL_ON_INVALID_REFERENCE))
+    ->setAutoconfigured(true)
+    ->setPublic(false);
+```
+
+`KubernetesTarget` takes the *same* `DeployPlanner` and `RollbackGuard` that `ssh-compose` does — planning, phase ordering, and rollback legality are target-agnostic. Only the execution step (turning a planned `DeployStep` into a real action) differs by target.
+
+## Testing without a real cluster
+
+`KubeApiInterface` exists specifically so tests don't need a real cluster. A `FakeKubeApi` test double implements the same interface and records what would have been sent to `kubectl`, letting the full target conformance suite — the same [TCK](/docs/ops-kit/testing) every Deploy target inherits — run without any cluster connectivity.
+
+<Callout type="info" title="Conformance, not a Kubernetes-specific test suite">
+`KubernetesTarget`'s tests extend `DeployTargetConformanceTestCase`, the exact same base class `ssh-compose`'s driver test extends. There's no special-cased "Kubernetes test suite" — both drivers prove they satisfy the same port the same way.
+</Callout>

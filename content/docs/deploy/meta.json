@@ -1,0 +1,12 @@
+{
+  "title": "Deploy",
+  "pages": [
+    "index",
+    "strategies",
+    "phase-gate",
+    "caddy-cutover",
+    "credentials",
+    "doctor",
+    "k8s"
+  ]
+}

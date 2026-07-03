@@ -1,0 +1,157 @@
+---
+title: Audit Trail
+description: How the hash-chain audit log works, what gets recorded, and how to verify integrity.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Audit Trail
+
+Every action that touches a schedule or causes a fire is recorded in an immutable audit log. The log uses a hash-chain with HMAC signatures — each entry is cryptographically linked to the previous one, making it impossible to insert, delete, or modify a row without the chain breaking.
+
+This is not just a nice-to-have. For many industries, an immutable audit log is a compliance requirement. For security investigations, it is the only way to answer "what happened and when, and can we prove it wasn't tampered with?"
+
+## What gets recorded
+
+Every audit entry captures:
+
+- `eventId` — UUID of this audit event
+- `occurredAt` — UTC timestamp
+- `event` — the type of event (see below)
+- `scheduleId` — the affected schedule
+- `tenantId` — the tenant (null for system schedules)
+- `actorId` — who performed the action (user ID or `system` for daemon fires)
+- `actorRole` — the role of the actor at the time of the action
+- `payload` — event-specific details (redacted for sensitive schedules)
+- `previousHash` — HMAC of the previous entry's content
+- `hash` — HMAC of this entry's content, keyed with the per-tenant chain key
+
+### Event types
+
+`SchedulerAuditEvent` (`schedule.*`, `fire.*`, `leader.*`, `retention.*`):
+
+| Event | When it fires |
+|---|---|
+| `ScheduleCreated` (`schedule.created`) | A new dynamic schedule was created |
+| `ScheduleUpdated` (`schedule.updated`) | A schedule's definition was updated |
+| `SchedulePaused` (`schedule.paused`) | A schedule was paused |
+| `ScheduleResumed` (`schedule.resumed`) | A schedule was resumed |
+| `ScheduleDeleted` (`schedule.deleted`) | A schedule was deleted |
+| `ScheduleApproved` (`schedule.approved`) | A 4-eyes approval request was approved |
+| `FireDispatched` (`fire.dispatched`) | A slot was atomically claimed and enqueued |
+| `FireSkippedOverlap` (`fire.skipped_overlap`) | A fire was skipped due to the schedule's overlap policy |
+| `FireMisfired` (`fire.misfired`) | A missed slot was caught up per the misfire policy |
+| `FireDropped` (`fire.dropped`) | A missed slot was dropped — beyond `SCHEDULER_MAX_CATCHUP_AGE_SECONDS` |
+| `FireManual` (`fire.manual`) | A schedule was manually fired via `scheduler:run-now` |
+| `LeaderAcquired` (`leader.acquired`) | This node acquired the shard lease |
+| `LeaderLost` (`leader.lost`) | This node lost or released the shard lease |
+| `RunsPruned` (`runs.pruned`) | A prune sweep completed (automatic or manual) — see [Retention](/docs/scheduler/retention#audit-trail) |
+| `RetentionOverrideSet` (`retention.override_set`) | An operator set a per-tenant retention override |
+| `RetentionOverrideRemoved` (`retention.override_removed`) | An operator removed a per-tenant retention override |
+
+<Callout type="info">
+`RunsPruned` uses "never fail an already-completed prune over an audit hiccup" semantics — an audit write failure is counted (`vortos_scheduler_audit_failures_total`), not thrown, since the delete already happened and can't be undone. Every other event in this table throws on audit failure, same as any other operator mutation.
+</Callout>
+
+## The hash chain
+
+Each audit entry contains a `hash` field — an HMAC-SHA256 signature of the entry's content, including the `previousHash` field. The chain looks like this:
+
+```
+Entry 1:  previousHash=NULL  hash=HMAC(content₁)
+Entry 2:  previousHash=hash₁ hash=HMAC(content₂ + hash₁)
+Entry 3:  previousHash=hash₂ hash=HMAC(content₃ + hash₂)
+...
+```
+
+If you try to delete Entry 2, Entry 3's `previousHash` no longer matches the hash of the actual previous entry. The chain is broken and the tampering is detectable.
+
+If you try to modify Entry 2's content, its `hash` will be wrong because the HMAC is computed over the original content. The chain is again broken.
+
+The HMAC is keyed per-tenant. Each tenant has its own chain key, stored separately from the audit log. This means:
+- Tenants' audit chains are isolated from each other
+- Compromising one chain key does not compromise others
+- An attacker with database access alone cannot forge valid HMAC values without the chain key
+
+## Checkpoints
+
+Verifying a long chain from the beginning is O(n) — expensive for logs with millions of entries. To make verification efficient, `SchedulerAuditCheckpointProjector` writes periodic checkpoints to the `vortos_scheduler_audit_checkpoints` table.
+
+A checkpoint is an HMAC-signed summary of all entries since the last checkpoint. To verify integrity from a known-good checkpoint, you only need to walk forward from that checkpoint, not from the beginning of the log. Checkpoint rows are immutable and unique per `(chain_key, epoch)` — one per tenant chain per epoch — and are written only when `SCHEDULER_AUDIT_HMAC_KEY` is configured (the table itself is always created by the migration).
+
+The checkpoint epoch is configurable. The default writes a checkpoint every 1000 entries.
+
+This gives O(n/epochSize) verification cost — for a log with 1 million entries and epoch size 1000, full verification requires checking 1000 checkpoints plus at most 999 entries in the final epoch.
+
+## Verifying the chain
+
+Chain integrity is not currently one of `scheduler:doctor`'s 11 checks (C1–C11) — use `SchedulerAuditChainVerifier` directly:
+
+```php
+use Vortos\Scheduler\Audit\SchedulerAuditChainVerifier;
+
+final class VerifyAuditCommand
+{
+    public function __construct(
+        private readonly SchedulerAuditChainVerifier $verifier,
+    ) {}
+
+    public function __invoke(): void
+    {
+        $result = $this->verifier->verify(tenantId: null);
+
+        if ($result->isValid()) {
+            echo "Chain valid. Verified {$result->entryCount} entries.\n";
+        } else {
+            echo "Chain BROKEN at entry {$result->brokenAtEntryId}.\n";
+            echo "Expected hash: {$result->expectedHash}\n";
+            echo "Actual hash:   {$result->actualHash}\n";
+        }
+    }
+}
+```
+
+For multi-tenant deployments, verify each tenant's chain separately by passing the `tenantId`.
+
+## Reading the audit log
+
+Inject `SchedulerAuditRepositoryInterface` to query audit entries:
+
+```php
+use Vortos\Scheduler\Audit\SchedulerAuditRepositoryInterface;
+use Vortos\Scheduler\Audit\SchedulerAuditEvent;
+
+$entries = $auditRepository->findBySchedule(
+    scheduleId: $scheduleId,
+    limit:      100,
+    offset:     0,
+);
+
+foreach ($entries as $entry) {
+    echo "[{$entry->occurredAt->format('Y-m-d H:i:s')}] "
+       . "{$entry->event->value} by {$entry->actorId}\n";
+}
+```
+
+The admin UI provides a per-schedule audit timeline view. See [Admin UI](/docs/scheduler/admin-ui) for the interface.
+
+## Retention and pruning
+
+Audit entries are intentionally not pruned by default. For compliance purposes, you should keep them as long as your retention policy requires (often 7 years for financial systems).
+
+If you need to prune old entries, do so through the `DbalSchedulerAuditRepository` with an explicit `before` timestamp. The chain verifier will warn if the chain start (entry 1) is missing and the gap cannot be bridged by a checkpoint. Always prune from the oldest entries forward, and update the checkpoint index accordingly.
+
+<Callout type="warn">
+Pruning audit entries is a destructive operation. Once entries are deleted, the portion of the chain they formed cannot be reconstructed. Only prune if your compliance policy explicitly permits it and you have exported the entries to long-term storage first.
+</Callout>
+
+## Compliance notes
+
+The audit system is designed to satisfy common regulatory requirements:
+
+- **SOC 2 Type II** — immutable, timestamped record of all privileged actions
+- **ISO 27001** — access control and change management logging
+- **PCI DSS** — secure, tamper-evident log of job execution for cardholder data environments
+- **GDPR** — audit trail for data processing activities (who ran what and when)
+
+The HMAC chain provides cryptographic non-repudiation: it is not enough to say "I didn't do that" — the chain proves the action happened in sequence, and forging it requires the chain key.

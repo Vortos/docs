@@ -1,0 +1,77 @@
+---
+title: Collector & Sinks
+description: A config-only swap point for your telemetry backend — sink drivers render a collector exporter fragment, never transport data themselves, with a crash-safe disk spool behind error delivery.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Collector & Sinks
+
+The [integration guides](/docs/observability) in this section cover connecting to an external tool directly. `MetricsSinkInterface` and `ErrorSinkInterface` exist for a different goal: making the choice of *which* backend you send telemetry to a one-line config change, with zero application code touching a vendor SDK.
+
+## Sinks render config, they don't transport
+
+```php
+interface MetricsSinkInterface extends DriverInterface
+{
+    public function name(): string;
+    public function signals(): array;          // which of metrics/traces/logs this sink carries
+    public function endpoint(): SinkEndpoint;   // the off-host endpoint the collector exports to
+    public function exporterConfig(): ExporterConfig; // the collector exporter fragment for this backend
+}
+```
+
+A sink driver is deliberately thin — it never sends telemetry itself. Your application emits OTLP to a **loopback** collector; the collector is the thing that actually forwards to Grafana, Datadog, or wherever. The sink's only job is declaring its capabilities for config-time validation and rendering the exporter fragment the collector needs to talk to that specific backend.
+
+```bash
+php bin/console vortos:observability:collector
+```
+
+This generates the actual collector configuration file from whichever sink is selected. Switching `grafana` → `datadog` changes one config value — the generated collector exporter changes; your application code never does, because it was never aware of either backend to begin with.
+
+## Safety invariants baked into every generated config
+
+`CollectorConfigBuilder` enforces several things as structural defaults rather than leaving them to whoever configures the collector by hand:
+
+- **The OTLP receiver binds loopback-only** (`127.0.0.1`). The app emits locally; the receiver is never exposed on a public interface, regardless of backend.
+- **`memory_limiter` and `batch` are always present** — the collector can't OOM the host it runs on, and exports are always bounded into batches.
+- **Disk-buffered retry on the exporter** — every sink's exporter gets `retry_on_failure` backed by a `file_storage` extension, so a backend blip doesn't drop telemetry; it queues to disk and retries.
+- **High-cardinality attributes are stripped before export** — a label that would explode your backend's cardinality (and your bill) never reaches it.
+
+No backend name appears in the builder itself — only the selected sink's own `exporterConfig()` carries that, which is what keeps the generator genuinely backend-agnostic rather than secretly coupled to whichever vendor was implemented first.
+
+## Error delivery — crash-safe, never blocking
+
+Sending an error to a tracking service synchronously on the request path is a liability: a slow or down error backend shouldn't make your actual request slower or fail it. `BoundedSpool` is the durability layer underneath `ErrorSinkInterface` that makes async, durable delivery safe:
+
+```
+emit(error)
+    │
+    ▼ BoundedSpool::push()      — never blocks, never throws
+    └── byte-capped FIFO on disk
+            full?  → drop the OLDEST record, increment droppedTotal, admit the new one
+    │
+    ▼ (separately) drain to the real backend, with retry
+```
+
+The spool is **byte-capped**, not unbounded — during a long backend outage it drops the oldest queued errors rather than filling the disk and taking the host down with it. Every record is length-prefixed and CRC32-checked, so a process crash mid-write leaves a detectable, truncatable torn tail instead of corrupting the whole queue on the next read. Every mutating operation holds an exclusive `flock`, making the spool safe across multiple worker processes writing to the same file.
+
+## Message scrubbing — closing the most common real leak
+
+```php
+final class MessageScrubber
+{
+    // patterns ordered most-specific → most-general, so a JWT isn't
+    // eaten by a generic long-token rule before the JWT-specific one runs
+}
+```
+
+The single most common way PII or secrets end up in a third-party error tracker is shipping a stack trace or log message verbatim — a bearer token, an email address, a JWT, a card number embedded in an exception message. `MessageScrubber` redacts these patterns before a `CapturedError` ever leaves the process. The patterns are deliberately conservative in one direction: false positives (over-redaction) are an acceptable cost; false negatives (an actual leak) are not.
+
+<Callout type="info" title="Same philosophy as Secrets and Analytics">
+This is the same defense-in-depth posture as [Secrets' `PiiRedactor`](/docs/analytics#pii-redaction--independent-of-the-allowlist) and [Analytics' privacy filtering](/docs/analytics#privacy-layered) — redact independently of whatever upstream configuration exists, so a misconfiguration elsewhere doesn't translate directly into a leak.
+</Callout>
+
+## Driver-kit pattern
+
+Both ports follow [Ops Kit](/docs/ops-kit) exactly — `#[AsDriver]`, a registry, a TCK. Implementing a sink for a backend that isn't shipped yet means implementing the port and rendering that backend's OTLP exporter config; there's no other integration surface to touch.

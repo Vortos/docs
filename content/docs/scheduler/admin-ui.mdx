@@ -1,0 +1,200 @@
+---
+title: Admin UI
+description: The optional browser-based management interface for non-developer operators.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Admin UI
+
+`vortos/vortos-scheduler-admin` is an optional package that provides a full browser-based management interface for the scheduler. It is built with HTMX + Twig and requires no JavaScript framework. All interactions are server-side-rendered fragments.
+
+## Installation
+
+```bash
+composer require vortos/vortos-scheduler-admin
+```
+
+Publish the static assets:
+
+```bash
+php vortos vortos:assets:publish
+```
+
+This copies the admin UI assets to `public/bundles/scheduler-admin/`. Add the route prefix to your router:
+
+```php title="config/routes.php"
+$routes->import('@SchedulerAdminBundle/Resources/config/routes.yaml', prefix: '/admin/scheduler');
+```
+
+## Screens
+
+The admin UI has 8 screens:
+
+### Dashboard
+
+URL: `/admin/scheduler`
+
+Overview of the scheduler's current state:
+
+- Active schedule count, paused count, total fires today
+- Recent fires table with status (Dispatched, Skipped, Failed, CircuitOpen)
+- Dead-man detector status — green if last tick was within the window, red if not
+- Circuit breaker state indicator
+- Pending approval requests badge
+
+### Schedule List
+
+URL: `/admin/scheduler/schedules`
+
+A searchable, filterable table of all schedules. Columns: name, trigger, status, last run, next due, tenant (in multi-tenant mode).
+
+Actions available per row (subject to RBAC):
+- Pause / Resume
+- Fire Now
+- View details
+- Delete (requires 4-eyes approval if configured)
+
+You can filter by status (Active, Paused), trigger type (Cron, Interval), and tenant.
+
+### Schedule Detail
+
+URL: `/admin/scheduler/schedules/{id}`
+
+Full view of a single schedule:
+
+- Schedule metadata (name, trigger, command, policies, timezone, jitter)
+- Recent run history table with slot, fire time, result, and duration
+- Audit timeline — every event that has touched this schedule, with actor and timestamp
+- Action buttons (pause, resume, fire now, delete)
+
+### Create Schedule
+
+URL: `/admin/scheduler/schedules/create`
+
+Form to create a new dynamic schedule. Fields:
+
+- Name (validated against slug pattern)
+- Trigger type (Cron or Interval) with live preview of next fire times
+- Command class picker (only shows `#[SchedulableCommand]` classes)
+- Payload editor (JSON)
+- Misfire policy selector
+- Overlap policy selector
+- Timezone picker
+- Jitter (seconds)
+- Sensitive flag
+- Tenant selector (in multi-tenant mode)
+
+The form validates the command allowlist client-side (preventing selection of non-schedulable classes) and server-side (before any write).
+
+### Audit Log
+
+URL: `/admin/scheduler/audit`
+
+Full audit log with filters:
+
+- Date range picker
+- Schedule name filter
+- Event type filter
+- Actor filter
+- Tenant filter (in multi-tenant mode)
+
+Each row shows the event type, schedule, actor, timestamp, and a detail expansion with the full payload (redacted for sensitive schedules).
+
+At the top, the chain integrity status is shown (Valid / Broken / Not verified yet).
+
+### Approvals
+
+URL: `/admin/scheduler/approvals`
+
+List of pending, approved, and rejected 4-eyes approval requests.
+
+Pending requests show:
+- What operation was requested
+- Who requested it (cannot be the approver)
+- Schedule name and ID
+- Request timestamp
+
+Approve or reject buttons are shown only if the current user is not the requester. Approving a request shows a confirmation modal with the full details of the operation.
+
+### Doctor
+
+URL: `/admin/scheduler/doctor`
+
+Runs `scheduler:doctor` checks in the browser and shows the results as a live-updating table. Each check shows:
+
+- Check ID and description
+- PASS / FAIL / SKIP badge
+- Remediation hint (on FAIL)
+
+Useful for operators who want to verify the system is healthy without SSH access.
+
+### Overrides
+
+URL: `/admin/scheduler/overrides`
+
+View and manage operator force-overrides:
+
+- See which schedules have active overrides (force-pause or force-resume)
+- Set a force-pause override (immediately stops a schedule from firing, even if Active in DB)
+- Set a force-resume override (fires a schedule even if Paused in DB)
+- Clear an override
+
+Overrides are stored in a separate table and take priority over the schedule's own status. They are intended for emergency use during incidents, not for routine management.
+
+## Security configuration
+
+The admin UI enforces RBAC on every request. No route is accessible without authentication.
+
+The UI reads the current user's permissions from `SchedulePolicyInterface`. You need to configure this appropriately for your application's auth stack.
+
+### CSRF protection
+
+All state-changing requests (pause, resume, delete, approve, etc.) go through HTMX POST requests that include a CSRF token. The token is embedded in the page by a Twig helper and validated by `CsrfMiddleware` before any handler runs.
+
+### Content Security Policy
+
+The admin UI sets a strict CSP header:
+
+```
+Content-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self'; img-src 'self' data:; connect-src 'self';
+```
+
+HTMX is served from `public/bundles/scheduler-admin/` (same-origin), so no external script CDN is needed.
+
+### Step-up 2FA
+
+For particularly sensitive operations (delete, fire-now, approve 4-eyes), the admin UI can require step-up multi-factor authentication. When enabled, the user is prompted to confirm their MFA credentials before the action is executed, even if they are already authenticated.
+
+Enable step-up in the policy:
+
+```php
+public function requiresStepUpForDelete(Schedule $schedule): bool
+{
+    return true;
+}
+```
+
+## HTMX fragment architecture
+
+The admin UI uses HTMX for partial page updates. When you click "Pause" on a schedule, the button sends an HTMX `hx-post` request. The server returns just the updated row fragment, which HTMX swaps into the table in place. The full page does not reload.
+
+This keeps the UI fast without requiring a JavaScript framework. There is no React or Vue — just server-rendered Twig templates and HTMX attributes.
+
+All fragment endpoints are under `/admin/scheduler/_fragments/` and return `HX-Trigger` response headers that signal the dashboard badge counts to update.
+
+## Customising the look
+
+The Twig templates can be overridden in your application by creating templates in `templates/bundles/SchedulerAdmin/`. The template hierarchy follows Symfony bundle override conventions.
+
+The CSS uses CSS custom properties (variables) for colours and spacing, so you can adjust the look by overriding a small set of variables in your own stylesheet:
+
+```css
+:root {
+    --sa-color-primary: #0070f3;
+    --sa-color-success: #00b37d;
+    --sa-color-danger:  #e93c3c;
+    --sa-color-bg:      #0a0a0a;
+    --sa-color-surface: #111111;
+}
+```
