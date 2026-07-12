@@ -1,0 +1,49 @@
+---
+title: Retention
+description: The archive-then-purge sweep — cold-archive an aged, already-verified prefix to object storage, advance a checkpoint, then drop it, so the remainder still verifies.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Retention
+
+A hash chain that only ever grows is a storage problem. Retention keeps the hot `audit_events` table bounded **without** breaking verifiability.
+
+## Archive-then-purge
+
+The `AuditRetentionSweeper` processes each chain past its retention window:
+
+1. **Archive** a contiguous prefix of aged records to object storage as NDJSON.
+2. **Checkpoint** — write the prefix's tail hash to `audit_checkpoints`, so verification of the remaining chain resumes from the checkpoint instead of re-reading purged rows.
+3. **Purge** the archived, checkpointed prefix from the hot table.
+
+Because it always archives a *contiguous already-verified* prefix and advances the checkpoint, the shortened chain still verifies end-to-end, and the cold NDJSON reads back in order.
+
+<Callout type="warn">
+The sweep **refuses to run** when no durable archive target is configured — it never purges un-archived data. `vortos:audit:doctor` reports whether an archive target is wired.
+</Callout>
+
+## Cold storage
+
+The archive writer targets `vortos-object-store` via `->coldArchive(bucket:, prefix:)`. It uses the **immediate** object-store interface (a direct provider write), not the transactional/outbox one — the sweep runs as a scheduled CLI command with no active database transaction. Object keys are deterministic and sortable (`{prefix}/{chainKeyPath}/{fromSeq}-{toSeq}.ndjson`) so a chain's cold history reads back in sequence.
+
+## Windows
+
+Set defaults and per-tenant overrides in config:
+
+```php
+$config
+    ->retention(platform: 730, tenant: 365)   // days; 0 = never purge
+    ->retentionOverride('org-under-legal-hold', 0);
+```
+
+## Running it
+
+Run the sweep on a schedule (via `vortos-scheduler`) — daily is typical. It's idempotent and checkpoint-driven, so a missed day catches up cleanly.
+
+```bash
+php bin/console vortos:audit:retention --dry-run   # report what would be archived + purged
+php bin/console vortos:audit:retention             # do it
+```
+
+Dry-run reports the archive-and-purge math per chain without touching anything.

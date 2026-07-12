@@ -1,0 +1,60 @@
+---
+title: Querying
+description: Keyset query with action-prefix + free-text search + facet counts, saved views, and the vortos-audit-admin HTTP console API.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Querying
+
+## AuditQuery
+
+Reads go through `AuditQueryInterface::page(AuditQuery)` — keyset-paginated (ordered `occurred_at DESC, id DESC`, constant cost at any depth). An `AuditQuery` is always scope-bound: a tenant query carries its `tenantId`, so a caller can never widen scope.
+
+```php
+new AuditQuery(
+    scope:          Scope::Tenant,
+    tenantId:       $orgId,
+    action:         'member.role_granted',   // exact
+    actionPrefix:   'payment.',              // namespace: payment.captured, payment.refunded, …
+    search:         'grace hopper',          // free-text (driver-dependent)
+    minSensitivity: Sensitivity::High,
+    outcome:        Outcome::Denied,
+    from:           $from, to: $to,
+    cursor:         $cursor, limit: 50,
+);
+```
+
+## Facets
+
+`facets(AuditQuery)` returns counts by action / sensitivity / outcome over the **whole filtered set** (pagination dropped) — the data behind a faceted filter rail. Counts don't shift as you scroll.
+
+## Search
+
+Free-text search is a pluggable port (`AuditSearchIndexInterface`) that contributes a `WHERE` fragment to the single keyset query — no id-materialisation round-trip, so it composes with every other filter and with pagination.
+
+- **`PostgresFtsSearchIndex`** (default on Postgres) — `to_tsvector(…) @@ plainto_tsquery(…)` over actor label + action + target + context, using the `simple` config so identifier-like tokens (action keys, ids) match verbatim. The matching expression GIN index is installed out-of-band by `vortos:audit:pg:install`.
+- **`LikeSearchIndex`** — portable `LIKE` across the same columns; correct off Postgres.
+- **`External`** — supply your own impl (OpenSearch, Elastic, …) via `->search(AuditSearchDriver::External)`.
+
+## Saved views
+
+`AuditSavedViewStoreInterface` persists named, scope- and owner-bound filter sets (`audit_saved_views`). Reads are ownership-filtered in SQL, so one org can't enumerate another's views.
+
+## The console HTTP API (vortos-audit-admin)
+
+Installing `vortos/vortos-audit-admin` mounts these endpoints (no app controllers required):
+
+| Method + path | Permission | Notes |
+|---|---|---|
+| `GET /api/platform/audit` | `audit.read.any` | Cross-tenant. `?scope=tenant&tenantId=…` for one tenant. `?withFacets=1` adds facet counts. |
+| `POST /api/platform/audit/verify` | `audit.verify.any` | Body `{ "chainKey": "platform" \| "tenant:{id}" }` → `{ valid, verifiedCount, brokenSequence, reason }`. |
+| `GET /api/platform/audit/export` | `audit.export.any` | Signed NDJSON + manifest. **2FA step-up required.** |
+| `GET /api/org/audit` | `audit.read.own` | The caller's own org trail (tenant forced from `TenantContext`). `?withFacets=1` supported. |
+| `GET /api/org/audit/export` | `audit.export.own` | Signed export of the org trail. **2FA step-up required.** |
+
+Records serialise camelCase with the impersonation chain emitted recursively as `onBehalfOf`.
+
+<Callout type="info">
+The boundary rule: anything expressible in framework primitives (scope, `TenantContext` tenantId, actor/target ids, filters, permission) lives in the framework module. Only app-specific identity semantics stay in the app.
+</Callout>

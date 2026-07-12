@@ -1,0 +1,109 @@
+---
+title: Installation
+description: Install vortos-audit (+ vortos-audit-admin), wire config/audit.php, declare the async consumer + worker, and run the Postgres extras installer.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Installation
+
+## 1. Require the packages
+
+```bash
+composer require vortos/vortos-audit
+# optional: the HTTP console API (platform + org read/verify/export endpoints)
+composer require vortos/vortos-audit-admin
+```
+
+`vortos-audit` self-registers its DI extension. It works with just a Doctrine DBAL connection; `vortos-messaging`, `vortos-cache` (Redis), `vortos-object-store`, `vortos-authorization`, and `vortos-tenant` unlock async ingestion, cross-process idempotency, cold archive, permission gating, and RLS respectively.
+
+## 2. Declare the vocabulary
+
+Actions are a controlled vocabulary. Ship a backed enum and a provider:
+
+```php
+enum AuditAction: string {
+    case MemberInvited   = 'member.invited';
+    case PaymentCaptured = 'payment.captured';
+    // …
+}
+
+final class AppAuditActionProvider implements AuditActionProviderInterface {
+    public function actions(): array {
+        return array_map(
+            fn (AuditAction $a) => new RegisteredAction($a->value, $a->description(), $a->sensitivity(), $a->scope()),
+            AuditAction::cases(),
+        );
+    }
+}
+```
+
+The provider is auto-discovered. With `->strict(false)` an unknown action is still recorded (at Normal sensitivity) rather than rejected.
+
+## 3. Configure
+
+`config/audit.php` returns a **closure** taking the fluent config object (same convention as scheduler/messaging):
+
+```php
+use Vortos\Audit\DependencyInjection\VortosAuditConfig;
+
+return static function (VortosAuditConfig $config): void {
+    $config
+        ->async(true)
+        ->authEvents(unify: true)
+        ->hmacKeyFromSecret('VORTOS_AUDIT_HMAC_KEY')
+        ->rowLevelSecurity(true)
+        ->retention(platform: 730, tenant: 365)
+        ->coldArchive(bucket: 'my-audit-archive', prefix: 'audit-archive');
+};
+```
+
+See [Configuration](/docs/audit/configuration) for every method.
+
+## 4. Turn on the async pipeline
+
+`->async(true)` only takes effect when the app declares the consumer and runs a worker.
+
+```php
+#[MessagingConfig]
+final class AuditMessagingConfig {
+    #[RegisterTransport]
+    public function transport(): KafkaTransportDefinition {
+        return KafkaTransportDefinition::create('vortos.audit')->topic('vortos.audit')->partitions(6);
+    }
+    #[RegisterProducer]
+    public function producer(): KafkaProducerDefinition {
+        return KafkaProducerDefinition::create('vortos.audit')->transport('vortos.audit')
+            ->publish(\Vortos\Audit\Ingestion\AuditEventRecorded::class, as: 'vortos.audit.event_recorded')->outbox(true);
+    }
+    #[RegisterConsumer]
+    public function consumer(): KafkaConsumerDefinition {
+        return KafkaConsumerDefinition::create('vortos.audit')->groupId('my-audit-svc')->offsetReset('earliest');
+    }
+}
+```
+
+Then run a long-lived worker (e.g. a supervisor program): `php bin/console vortos:consume vortos.audit`.
+
+<Callout type="info">
+The framework's `AsyncAuditRecorder` dispatches through the **standalone** event bus, because audit is recorded from places with no active business transaction (auth middleware after-hooks, read paths). You don't have to do anything — just be aware that's why it works outside a `CommandBus` transaction.
+</Callout>
+
+## 5. Migrations + Postgres extras
+
+Run the module migrations (`vortos:migrate:publish` + `vortos:migrate`) to create `audit_events`, `audit_checkpoints`, `audit_chain_heads`, and `audit_saved_views`.
+
+The full-text GIN index and row-level security can't be expressed by the portable Schema-diff migration seam, so they ship as an **idempotent installer** — run it on every deploy:
+
+```bash
+php bin/console vortos:audit:pg:install          # FTS GIN index (+ RLS if ->rowLevelSecurity() is on)
+php bin/console vortos:audit:pg:install --no-rls # FTS only
+```
+
+## 6. Verify
+
+```bash
+php bin/console vortos:audit:doctor
+```
+
+Reports whether the store, HMAC signing, archive target, async ingestion, RLS, and search driver are wired. It only fails outright when no store is configured.

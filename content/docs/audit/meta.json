@@ -1,0 +1,11 @@
+{
+  "title": "Audit",
+  "pages": [
+    "index",
+    "installation",
+    "configuration",
+    "querying",
+    "security",
+    "retention"
+  ]
+}
