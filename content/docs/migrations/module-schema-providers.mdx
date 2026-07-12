@@ -85,7 +85,27 @@ Publishing generates Doctrine migration classes under:
 migrations/
 ```
 
-For DBAL providers, generated `CREATE TABLE` and `CREATE INDEX` statements are made idempotent with `IF NOT EXISTS`. Preflight still checks for schema drift before execution.
+For DBAL providers, generated `CREATE TABLE`, `CREATE INDEX` and `ADD COLUMN` statements are made idempotent with `IF NOT EXISTS`. Preflight still checks for schema drift before execution.
+
+### Alter-style providers
+
+A provider may add columns or indexes to a table created by an **earlier** provider — including one
+owned by another module — by guarding the change with `hasTable()`:
+
+```php
+public function define(Schema $schema): void
+{
+    if ($schema->hasTable($this->t('backup_catalog'))) {
+        $catalog = $schema->getTable($this->t('backup_catalog'));
+        $catalog->addColumn('encryption_provider', 'string', ['length' => 32, 'notnull' => false]);
+    }
+}
+```
+
+Publishing evaluates every provider against the **cumulative** schema of all providers that ran before
+it (in migration-filename order), then diffs before → after — so an alter-style provider sees the base
+table and emits a correct `ALTER TABLE … ADD COLUMN`. A provider's base table must itself be defined by
+another schema provider (not a raw `.sql` stub), since raw stubs carry no schema model to diff against.
 
 ## Legacy SQL Stubs
 

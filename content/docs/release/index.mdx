@@ -95,7 +95,7 @@ Don't reach for a `BuildManifest` to store deploy configuration — that's [Depl
 
 ## Recording a build
 
-A `BuildManifest` has to be recorded before [Deploy](/docs/deploy) can act on a build — `deploy` reads the latest manifest for the environment, so with no manifest it refuses (there is nothing to deploy). `vortos:release:record-manifest` writes that record. It runs in the deploy job, **after** the image is built and pushed and **before** `deploy`, and derives the schema fingerprint from the build's available migrations (not the applied set — the migrations have not run yet at this point).
+A `BuildManifest` has to be recorded before [Deploy](/docs/deploy) can act on a build — `deploy` reads the latest manifest for the environment, so with no manifest it refuses (there is nothing to deploy). `vortos:release:record-manifest` writes that record. It runs in the deploy job, **after** the image is built and pushed and **after** provisioning (whose `vortos:migrate` step creates the release-ledger schema this record is written into), then **before** `deploy`. The schema fingerprint is derived from the build's **available** migrations — the desired schema the image carries — independent of what has been applied, so it identifies the build regardless of apply order. Recording against a database that has no ledger schema yet fails closed with guidance to run `vortos:migrate`.
 
 ```bash
 php bin/console vortos:release:record-manifest \

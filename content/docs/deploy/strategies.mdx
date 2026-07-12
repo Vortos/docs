@@ -28,7 +28,7 @@ interface DeployStrategyInterface
 
 ```
 ExpandMigrate   (if the desired build has pending expand-phase migrations)
-RollWorkers     (drain and restart background workers)
+RollWorkers     (only when workerTopology is ExternalSupervisor — see below)
 StageColor      (pull the image, start the idle color's container)
 HealthGate      (wait for the staged color's /health/ready)
 Smoke           (run smoke tests against the staged color)
@@ -38,9 +38,18 @@ Promote         (record the new color as active)
 
 The staged color is always `$context->currentState->activeColor->opposite()` — blue-green never guesses which color is idle, it reads it from `CurrentDeployState`. Nothing routes real traffic to the new version until `HealthGate` and `Smoke` both pass.
 
+### Worker topology
+
+Every strategy emits its worker rollout through a single shared factory, gated on the deployment's `WorkerTopology`:
+
+- **`RideColor`** (default) — background workers are compose-managed `worker-<color>` services that come up with the color and are torn down with it. **No `RollWorkers` phase is emitted** — the workers ride the color. This is correct for the ssh-compose / deploy-in-image path, where the deploy runs in a throwaway container that has no `supervisord` to talk to.
+- **`ExternalSupervisor`** — a persistent `supervisord`, reachable from where the deploy runs, owns the worker processes; the strategy emits the `RollWorkers` phase (drain + restart via `supervisorctl`).
+
+Set it in `config/deploy.php` with `->workerTopology(WorkerTopology::RideColor)` (or `ExternalSupervisor`). `deploy:doctor` fails closed if you declare `ExternalSupervisor` on a deploy-in-image host that has no reachable `supervisord`.
+
 ## Canary
 
-`CanaryStrategy` requires `Canary`, `BlueGreen`, and `HealthGate`. It shares blue-green's setup (`ExpandMigrate`, `RollWorkers`, `StageColor`, `HealthGate`), then replaces the single `Cutover` phase with a sequence of weighted-routing steps:
+`CanaryStrategy` requires `Canary`, `BlueGreen`, and `HealthGate`. It shares blue-green's setup (`ExpandMigrate`, the topology-gated worker rollout, `StageColor`, `HealthGate`), then replaces the single `Cutover` phase with a sequence of weighted-routing steps:
 
 ```
 Cutover  → route 5%  to staged color, verify SLOs

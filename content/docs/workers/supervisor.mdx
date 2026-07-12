@@ -102,3 +102,13 @@ supervisorctl update
 supervisorctl status
 ```
 
+## Rootless supervisor in the deploy-in-image model
+
+In the deploy-in-image (`RideColor`) model one image serves every role and runs as the image's **non-root** user. `supervisord` must therefore be configured rootless — a `[supervisord] user=root` directive, or a pidfile/socket/log under a root-owned directory (`/var/run`, `/var/log/supervisor`), makes it try to drop privileges as a non-root user and crash-loop with `Error: Can't drop privilege as nonroot user`.
+
+A rootless config has no `user=`, keeps its pidfile and admin socket under `/tmp`, and logs to stdout. A canonical template ships with vortos-deploy at `Resources/worker/supervisord.rootless.conf` — copy it into your image or base your own on it.
+
+<Callout type="warn" title="Caught before the box">
+`RootlessWorkerCheck` fails [`deploy:doctor`](/docs/deploy/doctor) closed if the active worker config is rootful in the single-image model, so a misconfigured supervisord is caught during preflight rather than crash-looping the worker color at cutover.
+</Callout>
+

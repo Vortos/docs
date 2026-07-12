@@ -156,9 +156,11 @@ redis://:password@redis:6379/2   # rate limiting
 
 Key prefixes are usually sufficient for separation within one application. Use different databases for complete isolation between unrelated applications on the same Redis host.
 
-## Redis Connection is Not Lazy
+## Redis Connection is Lazy
 
-Unlike DBAL, the Redis connection is established immediately on container construction. If Redis is unreachable at boot time, the application fails to start. Use health checks in your deployment pipeline:
+The Redis-holding services (`RedisAdapter`, `RedisHealthCheck`) are registered as **lazy** services (PHP native lazy objects). `RedisConnectionFactory::fromDsn()` still connects eagerly *when it runs*, but it only runs on the first cache/health call — not at container construction. A process that never touches the cache (a control-plane or deploy console command run in the image with no infra reachable) boots and exits without ever opening a Redis socket.
+
+When Redis *is* used, the first cache operation establishes the connection and fails closed if Redis is unreachable. Gate readiness on Redis health in your deployment pipeline:
 
 ```yaml
 # docker-compose.yml

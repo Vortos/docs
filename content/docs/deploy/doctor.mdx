@@ -40,7 +40,15 @@ php bin/console deploy:doctor --env=production --strict
 | `CapabilityDescriptorCheck` | The configured strategy's required capabilities are satisfied by the configured target |
 | `SchemaCompatibilityCheck` | The desired build's schema fingerprint is compatible with what's currently applied |
 | `MigrationDriftCheck` | No pending migrations exist that aren't reflected in the manifest's schema fingerprint |
+| `PendingMigrationPhaseCheck` | No pending migration is destructive-but-un-annotated — fails closed on a `DROP`/`RENAME`/`TYPE`/`TRUNCATE` without `#[DeployPhase]`, so it's caught before a deploy is attempted (see [Phase Gate](/docs/deploy/phase-gate)) |
+| `UnpublishedStubCheck` | No installed `vortos/*` module migration stub is un-published — fails closed when `vortos:migrate:publish` would emit something, turning "a framework bump ships schema-dependent code without the schema → `SQLSTATE 42703` at runtime" into a preflight refusal. Publish (or `deploy --auto-publish`) to clear it |
+| `BackupToolchainCheck` | *(only when [vortos-backup](/docs/backup) is installed)* If `VORTOS_BACKUP_ENGINE` is set, the DB client toolchain is present — unless `VORTOS_BACKUP_TOOLCHAIN_EXTERNAL=true` (or `config/deploy.php ->backupToolchainExternal()`), in which case it passes informationally because the toolchain lives on the backup role image, not the lean deploy image |
 | `TargetArchCheck` | A build exists for the architecture the target actually runs ([Pipeline](/docs/pipeline) ARM64/AMD64 awareness) |
+| `WorkerTopologyCheck` | The declared [`workerTopology`](/docs/deploy/strategies#worker-topology) is reachable — fails closed if `ExternalSupervisor` is set on a deploy-in-image host that has no `supervisord` |
+| `RootlessWorkerCheck` | In the single-image `RideColor` model, the worker's `supervisord` config is rootless — fails closed on `user=root` or a pidfile/socket/log under a root-owned dir, which would crash-loop the non-root worker with "Can't drop privilege as nonroot user" |
+| `EnvFileReadabilityCheck` | Every declared runtime env file is readable by the deploy one-shot uid — fails closed on a `0600` env file the nested cutover `docker compose up` (running as the image uid) would hit "permission denied" on |
+| `DeployStateDurabilityCheck` | The [deploy-state store](/docs/deploy#cutover-and-the-edge-router) is durable for the topology — fails closed on `DEPLOY_STATE_STORE=file` in the `docker run --rm` one-shot (its `var/deploy-state` is destroyed each run, breaking color alternation + rollback), or on `redis` selected with no `REDIS_*` connection configured |
+| `FileSecretsCheck` | Every declared [file-shaped secret](/docs/deploy#file-shaped-secrets) is present in the store before the deploy tries to materialize it |
 | `CanaryAnalyzerReadyCheck` | If using the canary strategy, the configured analyzer can actually evaluate SLOs |
 | `IacDriftCheck` | The infrastructure [IaC](/docs/iac) expects to exist hasn't drifted from what's actually provisioned |
 

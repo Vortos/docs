@@ -28,10 +28,10 @@ DrillReport (outcome, RTO in milliseconds, per-invariant results)
 
 ```bash
 # full drill — provision, restore, check invariants, teardown
-php bin/console backup:drill --engine=postgres --environment=production
+php bin/console backup:drill --engine=postgres --env=production
 
 # shallow drill — faster, lighter invariant set, for frequent scheduling
-php bin/console backup:drill --engine=postgres --environment=production --shallow
+php bin/console backup:drill --engine=postgres --env=production --shallow
 ```
 
 ## Invariant checks

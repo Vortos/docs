@@ -54,7 +54,7 @@ interface DeployTargetInterface extends DriverInterface
 }
 ```
 
-There is no `push()`: the CI build job is the only thing that pushes an image. Before mutating anything, a target instead calls `assertImageAvailable()` — a fail-closed, daemonless check that the pinned `repo@digest` really exists in its registry — so a missing or mistyped digest fails loudly up front rather than as a broken pull on the target. The repository a target deploys is read from the plan (threaded from the build manifest), never hardcoded.
+There is no `push()`: the CI build job is the only thing that pushes an image. Before mutating anything, a target instead calls `assertImageAvailable()` — a fail-closed check that the pinned `repo@digest` really exists — so a missing or mistyped digest fails loudly up front rather than as a broken pull on the target. In the deploy-in-image posture the image was already pulled onto the host, so the digest is resolved **daemon-first** (`docker image inspect`, over the least-privilege socket-proxy — no registry tool or credentials needed), falling back to registry-direct resolution (crane/skopeo/`buildx imagetools`) only when the image isn't local. For the same reason `pull()` short-circuits when the digest is already present locally rather than re-authenticating against the registry. The repository a target deploys is read from the plan (threaded from the build manifest), never hardcoded.
 
 Two targets ship today:
 
@@ -97,6 +97,10 @@ $result = $cutoverCoordinator->cutover($desiredRoute, $imageDigest, $buildId, $p
 ```
 
 Every recorded release carries a monotonically increasing `generation` number, providing compare-and-swap semantics for the edge router state — a stale reconciler can never overwrite a newer release by accident. See [Caddy Cutover](/docs/deploy/caddy-cutover) for the edge-router driver and the reconciler that keeps Caddy's running config converged with the desired route.
+
+<Callout type="warn" title="The deploy-state store must be durable (DEPLOY_STATE_STORE)">
+The active color, `generation`, image digest, contract-soak ledger, pull-agent freshness, and reconcile rate-limit all live in the **deploy-state store** — one store, selected by `DEPLOY_STATE_STORE`: `redis` (**default**, symmetric with `EDGE_STATE_STORE`, uses the shared `\Redis`), `file`, or `mongo`. This matters because the deploy runs as a `docker run --rm` one-shot: a `file` store lives at `%kernel.project_dir%/var/deploy-state` *inside* that container and is destroyed after every run, so the current-release record is lost — blue-green never alternates color and `deploy:rollback` cannot see the live release. Keep the default (`redis`) for the deploy-in-image topology; `file` is only safe on a single-node box with a persistent `var/deploy-state`. [`deploy:doctor`](/docs/deploy/doctor) fails closed (via `DeployStateDurabilityCheck`) on a `file` store in the one-shot topology, or on `redis` selected with no `REDIS_*` connection configured.
+</Callout>
 
 ## Container registry authentication
 
@@ -148,8 +152,34 @@ return static fn (DeploymentDefinitionBuilder $b) => $b
     ->host('ssh-compose')
     ->registry('ghcr')
     ->strategy('blue-green')
+    ->pruneImages(keep: 2)                 // reclaim superseded release images after cutover
+    ->backupToolchainExternal(true)        // the DB client lives on the backup role, not this image
     ->forEnvironment('production', static fn (DeploymentDefinitionBuilder $b) => $b->autoRollback(true));
 ```
+
+A few more builder options worth knowing:
+
+- **`->pruneImages(enabled = true, keep = 2, builderCacheMaxAge = '168h')`** — after a successful cutover the target reclaims superseded release images and old build cache, keeping the active release and the previous-for-rollback (by recency) so disk doesn't creep to the capacity-probe warn line. Best-effort — it is not part of the plan hash or the dry-run preview, and a prune failure never fails a green deploy. `->pruneImages(false)` disables it.
+- **`->backupToolchainExternal(bool)`** — tells `deploy:doctor`'s `backup.toolchain` check that the DB client toolchain runs on the [backup role image](/docs/backup), not this lean deploy image (see [doctor checks](/docs/deploy/doctor#built-in-checks)).
+- **`->autoPublishMigrations(bool)`** — opt-in: a live `deploy` publishes any un-published module migration stubs before the doctor gate (equivalent to the `deploy --auto-publish` flag). Off by default — the default posture is the fail-closed `UnpublishedStubCheck` refusing the deploy so you publish and commit deliberately.
+
+### Runtime service shape
+
+The blue/green app and worker containers the cutover brings up are described by a **runtime service spec** — how the app actually runs. The defaults match the shipped FrankenPHP stub; override them when your image differs:
+
+```php title="config/deploy.php"
+return static fn (DeploymentDefinitionBuilder $b) => $b
+    ->appCommand(['frankenphp', 'run', '--config', '/etc/frankenphp/Caddyfile', '--adapter', 'caddyfile'])
+    ->workerCommand(['/usr/bin/supervisord', '-c', '/etc/supervisord.conf'])
+    ->workerTopology(WorkerTopology::RideColor)    // workers ride the compose color (default)
+    ->containerPort(8080)                          // internal HTTP port; the edge dials app-<color>:8080
+    ->envFiles(['/opt/vortos/.env.prod'])          // absolute paths mounted into each color
+    ->appEnvironment(['SERVER_NAME' => ':8080']);  // extra app-service env (e.g. bind FrankenPHP to :8080)
+```
+
+The colors are **internal-only** — they publish no host ports and only `expose` `containerPort` so the standalone [edge](/docs/deploy/caddy-cutover) reverse-proxies to `app-<color>:<containerPort>` over the external `vortos-net`. This spec is the single source of truth for both the readiness gate and the edge upstream (the Caddy dial port comes from `containerPort`, never a hardcoded value), so a color that comes up healthy is the exact one the edge routes to. The image must ship a real server command (a bare `frankenphp run …`, not a placeholder) and be reachable at `containerPort`. See [strategies](/docs/deploy/strategies#worker-topology) for `workerTopology`.
+
+The **worker** service always gets an explicit Docker healthcheck so it never inherits the app image's HTTP `HEALTHCHECK` (the FrankenPHP base image probes `curl :2019/metrics`, which the worker — running `supervisord`, serving no HTTP — can never pass, leaving it perpetually `unhealthy`). When `workerCommand` runs supervisord (the default), the framework emits a real `supervisorctl status` check that is healthy only when every managed program is `RUNNING`; a custom worker command gets an explicit `disable` instead. Override it with `->workerHealthcheck(WorkerHealthcheck::command([...]))` when you have a bespoke liveness check.
 
 <Callout type="info" title="Works out of the box on a stock container">
 A stock install now compiles and runs without app-side glue: `deploy`, `deploy:doctor`, and `deploy:rollback` always register (they print remediation and return failure if `vortos-release`/`vortos-migration` are missing, rather than silently vanishing); a Guzzle PSR-18/PSR-17 client is bound by default for the Caddy/OIDC/SSH-CA/registry clients if you haven't provided one; and the SSH-CA / registry-exchange endpoint parameters are set from env with safe empty defaults.
@@ -168,6 +198,27 @@ VORTOS_DEPLOY_PULL_RELEASE_PUBLIC_KEY=age1...
 
 Only in `pull` mode are the OCI manifest source, release-key verifier, and reconciler registered. `deploy:agent` stays visible in push mode and fails loudly if invoked.
 
+### Config & secret delivery
+
+The runtime files that live outside the image — `.env.prod`, `docker-compose.prod.yaml`, the mounted config trees (`docker/**`, `observability/**`) and the age-encrypted secrets store `vortos-secrets.age` — are shipped to the remote deploy dir by `ArtifactDelivery` over the SSH transport. A `DeliveryManifest` declares the file set (with a sane `DeliveryManifest::default()`), required artifacts fail closed before anything is sent, and the whole set is staged then swapped into place atomically so a partial transfer never leaves the box running against half-written config. Remote paths are traversal-guarded.
+
+`.env.prod` ships owner-only `0600` (the docker CLI reads it as the deploy user via `--env-file`). The age store ships `0640` — the deploy-in-image one-shots read it as the image's runtime uid, which differs from the delivering user's, so an owner-only file would be unreadable; the remote `docker run` grants the container the store's group with `--group-add` so only that group, never the world, can read it. The store is age **ciphertext** (the KEK arrives via env, never on disk), so group-read leaks no plaintext.
+
+### File-shaped secrets
+
+The immutable-image posture prefers **env-content** secrets (e.g. base64-PEM keys via `vortos:auth:keys:generate --emit=env`), so nothing is ever written to disk. When a secret genuinely must be a *file* (a tool that only reads an RS256 key from a path), declare a **file secret** instead of dropping the zero-plaintext-to-disk rule:
+
+```php title="config/deploy.php"
+$b->fileSecret('jwt_private_key', '/run/secrets/jwt_private_key.pem');
+// name in the age store → in-container mount path (tmpfs host path defaults to /run/vortos-secrets/<name>)
+```
+
+Before cutover the deploy one-shot decrypts each declared file secret from the age store to a **tmpfs (RAM) path** (`vortos:deploy:materialize-file-secrets`, written `0400` via an atomic temp+rename), and the cutover compose bind-mounts it **read-only** into the color at the declared path. Plaintext never touches persistent storage; host paths must be under `/run` or `/dev/shm`. `deploy:doctor` fails closed if a declared file secret is missing from the store.
+
+### First-deploy provisioning
+
+`vortos:deploy:provision` idempotently prepares a fresh box before `deploy:doctor` runs: it generates RS256 JWT signing keys **only when absent**, applies pending migrations with `vortos:migrate --force`, then runs the fail-closed secrets preflight. Key presence mirrors `config/auth.php`'s precedence — keys count as present when **either** the env-content keys (`JWT_PRIVATE_KEY` / `JWT_PUBLIC_KEY`, base64 PEM — the immutable-image posture) **or** the file paths (`JWT_PRIVATE_KEY_PATH` / `JWT_PUBLIC_KEY_PATH`) are set, so an env-content deploy is never wrongly told to generate file keys into a non-writable dir. It is safe to run on every deploy, and the generated [deploy-on-target pipeline](/docs/pipeline#the-generated-deploy-job) invokes it inside the image on the VPS **first** in the sequence, so its migration creates the release-ledger schema before `record-manifest` writes to it.
+
 ## CLI
 
 `deploy` reads the latest recorded [build manifest](/docs/release#recording-a-build) for the environment, so `vortos:release:record-manifest` must have run for that build first (the generated [pipeline](/docs/pipeline) does this for you). `--image-repository` / `--image-digest` override the manifest's image when you need to pin or promote a specific one by hand.
@@ -179,12 +230,18 @@ php bin/console deploy --env=production --dry-run
 # deploy for real
 php bin/console deploy --env=production --actor=alice
 
+# publish any un-published module migration stubs before the doctor gate (live only; opt-in)
+php bin/console deploy --env=production --auto-publish --actor=alice
+
 # promote a specific image by hand (overrides the recorded manifest)
 php bin/console deploy --env=production \
     --image-repository=ghcr.io/acme/app --image-digest=sha256:... --actor=alice
 
 # resume an interrupted run — verifies the plan hash matches before continuing
 php bin/console deploy --env=production --resume
+
+# idempotent first-deploy provisioning: RS256 JWT keys (if absent) → migrate → secrets preflight
+php bin/console vortos:deploy:provision --env=production --json
 
 # fail-closed preflight — the same checks deploy runs first, on their own
 php bin/console deploy:doctor --env=production --json
@@ -200,6 +257,8 @@ php bin/console deploy:reconcile --env=production
 <Callout type="warn" title="deploy:doctor runs automatically">
 `deploy` runs the same fail-closed preflight as `deploy:doctor` before touching infrastructure, every time — including on `--resume`. There is no way to skip preflight by accident; if you need to see what it checks without deploying, run `deploy:doctor` directly.
 </Callout>
+
+In `--json` mode, `deploy` keeps **stdout** pure machine JSON, and additionally writes the failing gate(s) and reason (or the rollback reason) to **stderr** when a deploy is refused or rolled back — so a CI log shows *why* without a manual non-JSON re-run.
 
 ## Step-by-step: your first deploy
 

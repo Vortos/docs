@@ -54,7 +54,7 @@ Every capacity probe declares `ProbeKind::Readiness` — never liveness. High di
 
 ## Certificate expiry probe
 
-`CertExpiryProbe` inspects a live TLS connection's certificate and reports based on days remaining until expiry:
+`CertExpiryProbe` inspects a live TLS connection's certificate and reports based on days remaining until expiry. It declares `ProbeKind::Monitoring`, so it runs only on `/health/monitor` — **never** on `/health/ready`:
 
 ```php
 new CertExpiryProbe(
@@ -81,6 +81,6 @@ The thresholds are graduated deliberately: a 14-day warning is meant to be the f
 
 `StreamCertInspector` performs the actual TLS handshake and certificate read; `InMemoryCertInspector` is the test double for exercising threshold logic without a real socket.
 
-<Callout type="warn" title="A cert probe is readiness, not a substitute for renewal automation">
-This probe tells you a certificate is about to expire — it doesn't renew it. Pair it with automated renewal (ACME/Let's Encrypt, your CA's API) and treat the warning state as a backstop that fires only if automated renewal has already failed.
+<Callout type="warn" title="Cert expiry is monitoring, not readiness — and never a substitute for renewal automation">
+Cert expiry is a `Monitoring` probe: it is surfaced at `/health/monitor` (and by the off-host monitor tick), and it never gates `/health/ready`. This is deliberate — in an edge-router blue-green deploy the staged color runs on an internal network and often cannot reach the *public* TLS endpoint at all (NAT hairpin), so gating readiness on a cert probe would fail closed and roll back a perfectly healthy color. Probe the public certificate from the edge / off-host, not from inside the app color. And note this probe only tells you a certificate is about to expire — it doesn't renew it. Pair it with automated renewal (ACME/Let's Encrypt, your CA's API) and treat the warning state as a backstop that fires only if automated renewal has already failed.
 </Callout>

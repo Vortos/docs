@@ -32,6 +32,14 @@ public function plan(DeployContext $context): DeployPlan
 
 If `CurrentDeployState::$pendingContractMigrations` is non-empty, planning throws `ContractInSameDeployException` immediately. In practice this means: if your last deploy ran an expand migration and the matching contract migration hasn't shipped yet, the *next* deploy that tries to bundle a new expand phase with that lingering contract is refused — you have to ship the contract on its own first.
 
+## How a migration's phase is determined
+
+A migration is `Contract` when its class carries `#[DeployPhase(MigrationPhase::Contract)]`. A migration with **no** attribute is not blindly treated as safe: its up-SQL is scanned for destructive DDL (`DROP TABLE/COLUMN/INDEX/CONSTRAINT`, `ALTER … TYPE`, `SET NOT NULL`, `RENAME`, `DROP DEFAULT`, `TRUNCATE`), and if any is found it is classified **Contract** — fail-closed. Only an additive, un-annotated migration defaults to `Expand`. To ship an intentional rewrite in the expand phase, annotate it `#[DeployPhase(MigrationPhase::Expand)]` with `#[AllowFullTableRewrite]`.
+
+At deploy-runtime, an un-annotated destructive migration is refused with a precise `DestructiveMigrationUnannotatedException` (distinct from the generic contract error) telling you to annotate it. The phase reader is a total function — it never throws on an unrecognised migration id (a hand-written `App\Migrations\*` migration is classified by the same rules), so a deploy is never aborted merely because it can't name a migration.
+
+`deploy:doctor` runs the same analysis ahead of time (`schema.pending-phase` check): it **fails** if any pending migration is destructive and un-annotated, so you catch it before a deploy is attempted rather than at cutover. This complements the CI [`vortos:migrate:analyze`](/docs/migrations/safety) gate.
+
 ## Phase ordering
 
 `PhaseOrderPolicy::assertValid()` checks the phase sequence a strategy produced, regardless of which strategy produced it. Two rules are enforced today:

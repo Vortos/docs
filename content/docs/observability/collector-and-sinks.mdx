@@ -35,7 +35,7 @@ This generates the actual collector configuration file from whichever sink is se
 
 - **The OTLP receiver binds loopback-only** (`127.0.0.1`). The app emits locally; the receiver is never exposed on a public interface, regardless of backend.
 - **`memory_limiter` and `batch` are always present** — the collector can't OOM the host it runs on, and exports are always bounded into batches.
-- **Disk-buffered retry on the exporter** — every sink's exporter gets `retry_on_failure` backed by a `file_storage` extension, so a backend blip doesn't drop telemetry; it queues to disk and retries.
+- **Disk-buffered retry on the exporter** — every sink's exporter gets `retry_on_failure` backed by a `file_storage` extension, so a backend blip doesn't drop telemetry; it queues to disk and retries. The generated `docker-compose.collector.yaml` mounts a named volume for that queue and ships an init sidecar that `chown`s it to the collector's non-root uid before the collector starts (a fresh named volume is root-owned, which would otherwise crash-loop the non-root collector on `permission denied`); the collector waits for the init to complete.
 - **High-cardinality attributes are stripped before export** — a label that would explode your backend's cardinality (and your bill) never reaches it.
 
 No backend name appears in the builder itself — only the selected sink's own `exporterConfig()` carries that, which is what keeps the generator genuinely backend-agnostic rather than secretly coupled to whichever vendor was implemented first.

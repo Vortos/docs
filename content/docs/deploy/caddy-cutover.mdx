@@ -38,6 +38,40 @@ $result = $cutoverCoordinator->cutover(
 
 A cutover never leaves you pointed at an unverified upstream silently — it either confirms success or reverts and tells you exactly what it reverted to.
 
+## Domain and TLS preservation
+
+A Caddy `POST /load` replaces the **entire** active config document — any field the posted config omits reverts to Caddy's built-in default. `EdgeConfigGenerator` is the single source of truth for the config shape, and every config it builds for a domain-bearing route carries both a host matcher and a `tls.automation` policy for that domain:
+
+```php
+$desired = new DesiredRoute(
+    env: 'production',
+    activeColor: ActiveColor::Blue,
+    upstream: $blueEndpoint,
+    domain: 'api.example.com', // ← threaded through to the host matcher + tls.automation
+);
+```
+
+Because the generated config always echoes the domain's `tls.automation`, a cutover **preserves** the domain's Let's Encrypt certificate (cached in `caddy_data`) instead of clobbering it to Caddy's internal default. The driver fails the cutover closed if the generated config is ever missing the domain's TLS policy, so a TLS-dropping config can never reach the live edge. Set the domain from your deploy config; leave it null only for an internal, non-TLS edge.
+
+<Callout type="info" title="Admin bind vs. connect">
+The admin **bind** address written into the pushed config (`CADDY_ADMIN_LISTEN`, default `localhost:2019`) is separate from the admin **connect** URL the deploy dials (`CADDY_ADMIN_URL`, default `http://<listen>`). In the deploy-in-image topology the edge is its own container, so set e.g. `CADDY_ADMIN_LISTEN=:2019` and `CADDY_ADMIN_URL=http://edge:2019`.
+</Callout>
+
+## Durable edge state and boot reconstruction
+
+The live switch happens over the admin API, but a restarted, replaced, or newly scaled edge node must be able to reconstruct which color is live — otherwise an edge restart would drop the active route. Every cutover persists the routing **intent** (active color, domain, upstream, weight) to an `EdgeStateStore`:
+
+- **`redis` (default)** — a control-plane store backed by the shared framework Redis, so a fleet of stateless edge nodes all agree on the active color from one central key.
+- **`file`** — a single-node fallback under `EDGE_STATE_DIR` (default `/opt/vortos/edge`), selected with `EDGE_STATE_STORE=file`.
+
+Because the Caddy edge image has no PHP, it can't query the store itself. The generated edge compose runs an `edge-init` step (the app image) that renders the config from the store before Caddy starts:
+
+```bash
+php bin/console deploy:edge:hydrate-config --env=production --out=/config/caddy.json
+```
+
+On first boot — before any cutover has recorded state — it falls back to the scaffolded bootstrap config (`--fallback`) so the edge can still serve HTTPS and accept the first cutover; otherwise it fails closed rather than serving an empty config.
+
 ## Generations and compare-and-swap
 
 Every `CurrentRelease` carries a `generation` integer that increments by exactly one on each successful cutover:
@@ -75,10 +109,10 @@ A cutover is a deliberate action tied to a specific deploy. Reconciliation is a 
 ## Scaffolding the Caddy config
 
 ```bash
-php bin/console deploy:edge:init
+php bin/console deploy:edge:init api.example.com
 ```
 
-Scaffolds the Caddy configuration files for a blue/green edge setup — two upstream blocks and the admin API wiring the `CaddyEdgeRouter` driver needs to issue cutover commands at runtime.
+Scaffolds the edge files for a blue/green setup: a bootstrap `caddy-config.json` (domain + TLS, ready to serve HTTPS before the first cutover) and a `docker-compose.edge.yaml` that wires the admin API plus the `edge-init` hydrate step the edge uses to reconstruct its route on boot.
 
 ## Worker drain during cutover
 

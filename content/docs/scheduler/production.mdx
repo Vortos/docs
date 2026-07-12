@@ -11,7 +11,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 ### Prometheus metrics
 
-The scheduler exposes 12 Prometheus metrics through the Vortos metrics adapter. Per-schedule metrics have a `schedule_id` label (cardinality-guarded — see below).
+The scheduler exposes 14 Prometheus metrics through the Vortos metrics adapter. Per-schedule metrics have a `schedule_id` label (cardinality-guarded — see below).
 
 | Metric | Type | Description |
 |---|---|---|
@@ -24,6 +24,8 @@ The scheduler exposes 12 Prometheus metrics through the Vortos metrics adapter. 
 | `vortos_scheduler_fairness_throttled_total` | Counter | Fires throttled by the per-tenant concurrency cap |
 | `vortos_scheduler_audit_failures_total` | Counter | Audit append failures (non-fatal, counted for visibility) |
 | `vortos_scheduler_consume_results_total` | Counter | Fire-queue rows executed via the CQRS bus, labelled by `result` |
+| `vortos_scheduler_fire_requeued_total` | Counter | Fires requeued because the consumer could not run the command class, labelled by `reason` (`unknown_class`\|`not_capable`) |
+| `vortos_scheduler_fire_dead_lettered_total` | Counter | Fires dead-lettered after exhausting requeue attempts, labelled by `reason` |
 | `vortos_scheduler_runs_pruned_total` | Counter | Fire-ledger rows deleted by a prune sweep, labelled by `tenant_id` |
 | `vortos_scheduler_fire_queue_pruned_total` | Counter | Terminal fire-queue rows deleted by the retention sweep (no labels — global) |
 | `vortos_scheduler_prune_duration_seconds` | Histogram | Duration of one prune sweep, labelled by `trigger` (`auto`\|`manual`) |

@@ -65,6 +65,8 @@ Two invariants make "delete the only good copy" structurally impossible, not jus
 
 `plan()` is pure — same artifacts, same `$now`, same plan, every time, with zero I/O. This is what lets you unit-test a retention policy's behavior against years of synthetic history without touching a real store.
 
+You declare the policy in [`config/backup.php`](#declaring-the-lifecycle--configbackupphp) (`->retention(fn ($r) => $r->hourly(8)->daily(7)...)`) — the constructor shown above is the underlying value object. Note the `hourly` default of `0`: leave `->hourly(...)` unset and the framework **derives** an hourly bucket from your declared backup cadence when it is sub-daily, so a 6-hourly schedule keeps its intra-day restore points instead of collapsing to one per day.
+
 ```bash
 # see what would be deleted, change nothing
 php bin/console backup:retention --plan-only
@@ -117,49 +119,92 @@ It emits a **pure `cp` `archive_command`** (archives WAL to a shared volume — 
 `DrillRunner` and `backup:drill` register only when `VORTOS_BACKUP_DRILL_DSN` is set (an ephemeral-database endpoint). Without it, `backup:drill` stays visible and fails with remediation — installing `vortos-backup` no longer requires the DSN just to boot the console.
 </Callout>
 
+<Callout type="info" title="Default engine">
+Set `VORTOS_BACKUP_ENGINE` (`postgres` or `mongo`) to make `--engine` optional on `backup:run` / `backup:doctor` and in the scheduled job. Resolution is **fail-closed**: if neither `--engine` nor `VORTOS_BACKUP_ENGINE` is set, the command refuses rather than guessing which database to dump.
+</Callout>
+
 ## CLI
 
+Every environment-scoped backup command takes `--env`, and it defaults to `production` — the same
+canonical label the deploy and release manifests use. Backups are cataloged under this label, so
+`backup:list` / `backup:retention` / `backup:drill` only see what `backup:run` wrote under the **same**
+`--env`. Keep them consistent (the default already lines them up); only pass `--env` for a non-production
+environment.
+
 ```bash
+# preflight the backup toolchain before the first real backup (fail-closed)
+php bin/console backup:doctor --engine=postgres --env=production
+
 # run a backup — dump, store, verify, catalog
-php bin/console backup:run --engine=postgres --environment=production
+php bin/console backup:run --engine=postgres --env=production
 
 # verify a cataloged backup's integrity without restoring it
-php bin/console backup:verify <backup-id>
+php bin/console backup:verify <backup-id> --env=production
 
 # list cataloged backups
-php bin/console backup:list --engine=postgres --environment=production
+php bin/console backup:list --engine=postgres --env=production
 
 # reconcile 3-2-1: copy any artifact missing its secondary location
 php bin/console backup:replicate
 
-# generate the host cron fragment for declared schedules
+# run the containerized backup lifecycle (backup/retention/drill) on their crons
+php bin/console vortos:backup:worker
+
+# generate a host cron fragment instead (non-containerized hosts)
 php bin/console backup:schedule
 
 # operator-driven restore to a target database
 php bin/console backup:restore <backup-id> --target=staging
 ```
 
+## Declaring the lifecycle — `config/backup.php`
+
+Everything — engine, store, **when** each verb runs (backup / retention / drill), the retention policy,
+and alerting — is declared as configuration. The framework owns the runtime; you own only this file.
+It is loaded like `config/scheduler.php` (base, then `config/{env}/backup.php` overrides it), and simply
+returns a `BackupConfig`:
+
+```php title="config/backup.php"
+use Vortos\Backup\Config\BackupConfig;
+
+return BackupConfig::create()
+    ->engine('postgres')
+    ->store('object-store')->keyPrefix('backups')
+    ->schedule(fn ($s) => $s
+        ->backup('0 */6 * * *', kind: 'logical_full')   // every 6h
+        ->retention('0 3 * * *')                          // prune daily at 03:00
+        ->drill('0 4 * * 0'))                             // restore drill weekly
+    ->retention(fn ($r) => $r
+        ->hourly(8)->daily(7)->weekly(4)->monthly(6)->maxAgeDays(90))
+    ->alerts(fn ($a) => $a->onFailure()->channel('slack'));
+```
+
+No `#[Scheduled]` class, no `CommandSpec`, no DI override — all three cadences and the retention policy
+are plain config. If you **omit** `->hourly(...)` while declaring a sub-daily backup cadence, the hourly
+bucket is **derived from that cadence** (about two days of restore points) so sub-daily backups are never
+silently collapsed to one per day the moment retention runs.
+
 ## Step-by-step: your first backup schedule
 
 <Steps>
 <Step>
-Declare a schedule and retention policy:
-
-```php title="config/backup.php"
-use Vortos\Backup\DependencyInjection\VortosBackupConfig;
-
-return static function (VortosBackupConfig $config): void {
-    $config->schedule('nightly-postgres')
-        ->engine('postgres')
-        ->environment('production')
-        ->cron('0 2 * * *')
-        ->retention(daily: 7, weekly: 4, monthly: 6, yearly: 1, maxAgeDays: 400);
-};
-```
+Declare the lifecycle in `config/backup.php` (see above).
 </Step>
 
 <Step>
-Generate the cron fragment and install it on the host running backups:
+Run it. On a lean, containerized deploy the framework provides the whole runtime — a single
+long-running worker that fires the declared lifecycle on its crons (the containerized replacement for
+host cron). It is single-flight, keeps a durable watermark so a restart never double-fires, backs off
+and dead-man-alerts on repeated failure, and shuts down cleanly on `SIGTERM`:
+
+```bash
+php bin/console vortos:backup:worker
+```
+
+Run it on a **backup-role image** that carries the DB client (`pg_dump`/`pg_restore`), not the lean app
+color. Set `VORTOS_BACKUP_WORKER_SUPERVISED=true` on that image to have `vortos-docker` emit it as a
+supervisord program. For a non-containerized host you can instead install a cron fragment — it now emits
+the correct verb per schedule type (`backup:run` / `backup:retention --apply` / `backup:drill`):
 
 ```bash
 php bin/console backup:schedule > /etc/cron.d/vortos-backup
@@ -167,10 +212,20 @@ php bin/console backup:schedule > /etc/cron.d/vortos-backup
 </Step>
 
 <Step>
+Preflight the toolchain — this fails closed if the engine's client binaries (`pg_dump`, `pg_restore`, `pg_basebackup`) are missing from PATH or older than the server major, turning a first-backup crash into an actionable check. In the reference stack backups run from a dedicated sidecar image that ships the matching PostgreSQL client, so run this there:
+
+```bash
+php bin/console backup:doctor --engine=postgres
+```
+
+The same toolchain probe also gates `deploy:doctor` (as `backup.toolchain`) whenever `VORTOS_BACKUP_ENGINE` is set, so a broken backup toolchain is caught before cutover rather than at the first real backup. Because backups run from a dedicated role image and **not** the lean deploy image, set `VORTOS_BACKUP_TOOLCHAIN_EXTERNAL=true` (or `config/deploy.php` `->backupToolchainExternal()`) so that check passes informationally instead of demanding `pg_dump` inside the deploy image — the toolchain is still verified, by `backup:doctor` on the backup role's own image.
+</Step>
+
+<Step>
 Run one manually to confirm the pipeline works end to end:
 
 ```bash
-php bin/console backup:run --engine=postgres --environment=production
+php bin/console backup:run --engine=postgres --env=production
 ```
 </Step>
 
@@ -178,7 +233,7 @@ php bin/console backup:run --engine=postgres --environment=production
 Verify it landed in the catalog and passes integrity verification:
 
 ```bash
-php bin/console backup:list --engine=postgres --environment=production
+php bin/console backup:list --engine=postgres --env=production
 php bin/console backup:verify <backup-id>
 ```
 </Step>

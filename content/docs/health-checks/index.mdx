@@ -21,15 +21,39 @@ Every probe reports `pass`, `warn`, or `fail` — not just healthy/unhealthy. `w
 | `GET /health/live` | `ProbeKind::Liveness` | Process liveness — container platform restarts on failure |
 | `GET /health/ready` | `ProbeKind::Readiness` | Traffic readiness — load balancer / k8s readiness gate |
 | `GET /health/startup` | `ProbeKind::Startup` | Has the process finished its startup sequence |
+| `GET /health/monitor` | `ProbeKind::Monitoring` | Informational observability (cert expiry, …) — **always HTTP 200**, never a gate |
+| `GET /health/detail` | `ProbeKind::Readiness` | **Authenticated** full per-check breakdown (see below) |
 | `GET /health` | — | Operational summary — runs every probe, for dashboards and humans |
 
 ```bash
 curl -i http://localhost:8000/health/ready
 ```
 
+By default the **anonymous** readiness body is minimal — status, mode, timestamp — and, when it is not
+passing, the **names** of the non-passing checks (never their messages, values, or errors), so an
+operator can see *which* check degraded over HTTP without shelling into the box:
+
+```json
+{ "status": "warn", "mode": "ready", "timestamp": "…", "degraded": ["disk-capacity"] }
+```
+
+Set `VORTOS_HEALTH_PUBLIC_DEGRADED_NAMES=false` to suppress even the names.
+
+### Authenticated detail — `/health/detail`
+
+For the full per-check breakdown over HTTP, `GET /health/detail` requires a valid `X-Health-Token`
+**regardless** of the anonymous `HEALTH_DETAILS` policy — so you can always diagnose a `warn`/`fail`
+during an incident, even with `HEALTH_DETAILS=never`. A missing or wrong token returns **401** (an
+authorization failure, deliberately distinct from a health status, so a scraper never mistakes it for
+unreadiness):
+
+```bash
+curl -s -H "X-Health-Token: $HEALTH_TOKEN" http://localhost:8000/health/detail
+```
+
 ```json
 {
-  "status": "ok",
+  "status": "warn",
   "checks": {
     "database": { "status": "pass" },
     "redis": { "status": "pass" },
@@ -37,6 +61,13 @@ curl -i http://localhost:8000/health/ready
   }
 }
 ```
+
+| Env | Effect |
+|---|---|
+| `HEALTH_TOKEN` | The secret compared (constant-time) against `X-Health-Token`; also unlocks `/health/detail` regardless of policy |
+| `HEALTH_DETAILS` | Anonymous detail policy: `never` (default) / `token` / `debug` / `always` |
+| `HEALTH_EXPOSE_ERRORS` | Include raw probe error strings in detailed output (default off; on in a debug env) |
+| `VORTOS_HEALTH_PUBLIC_DEGRADED_NAMES` | Anonymous readiness lists non-passing check names when degraded (default on) |
 
 ## The probe contract
 
@@ -49,7 +80,7 @@ interface HealthProbeInterface extends DriverInterface
 }
 ```
 
-`ProbeKind` is `Liveness`, `Readiness`, or `Startup` — a probe declares which question it answers, and the aggregator only runs the probes relevant to the endpoint that was hit. A probe that talks to the database has no business running on `/health/live`, which exists specifically so a database outage doesn't make your container platform think the *process* is dead and start restarting it.
+`ProbeKind` is `Liveness`, `Readiness`, `Startup`, or `Monitoring` — a probe declares which question it answers, and the aggregator only runs the probes relevant to the endpoint that was hit. A probe that talks to the database has no business running on `/health/live`, which exists specifically so a database outage doesn't make your container platform think the *process* is dead and start restarting it. `Monitoring` probes are the inverse case: they answer an observability question (is a certificate about to expire?), so they run **only** on `/health/monitor` — never on `/health/ready` — and that endpoint always returns HTTP 200 so a monitoring breach can never be mistaken for unreadiness and roll back a healthy instance.
 
 ```php
 enum ProbeStatus: string

@@ -175,4 +175,4 @@ The payload is replaced with `[REDACTED]` in the audit log. The schedule still r
 - [ ] Approval store is protected — `scheduler.approval.approve` is not in the default user role
 - [ ] `scheduler.retention.manage` is admin-only — a tenant should never be able to shorten its own audit retention
 - [ ] `deploy:doctor` is in your CI/CD pipeline so a broken scheduler blocks deploys
-- [ ] Audit chain verification (`SchedulerAuditChainVerifier`) runs periodically outside `scheduler:doctor` — it is not currently one of the doctor's 11 checks
+- [ ] Audit chain verification (`SchedulerAuditChainVerifier`) runs periodically outside `scheduler:doctor` — it is not currently one of the doctor's 12 checks

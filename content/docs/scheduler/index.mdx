@@ -127,7 +127,7 @@ New to the package? Read in this order:
 - **Lease heartbeat guard** — tracks per-shard lease renewal health; skips dispatch if the renewal has been silent for >90% of the TTL
 - **Cardinality guard** — caps Prometheus label cardinality to prevent unbounded time-series growth in multi-tenant deployments
 - **Static override store** — operator can force-pause or force-resume any schedule without touching the database, useful during incidents
-- **Doctor / preflight** — `scheduler:doctor` runs 11 health checks (C1–C11); integrates with `deploy:doctor` as a preflight gate so a broken scheduler blocks deploys
+- **Doctor / preflight** — `scheduler:doctor` runs 12 health checks (C1–C12); integrates with `deploy:doctor` as a preflight gate so a broken scheduler blocks deploys
 - **Node-seeded jitter** — lease acquisition jitter uses `crc32(hostname:pid)` rather than random, making it deterministic and testable while still spreading nodes across the acquisition window
 - **Fire-queue consumer** — `scheduler:consume` drains the fire queue and dispatches each command through the CQRS `CommandBus`; required alongside `scheduler:run` for anything scheduled to actually execute
 - **Automatic run-ledger pruning** — `vortos_scheduler_runs` is pruned on a schedule by default, with per-tenant retention overrides and permanent legal-hold exemptions — see [Retention](/docs/scheduler/retention)

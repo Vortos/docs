@@ -69,7 +69,7 @@ docker/
 │   └── Caddyfile                 ← HTTP/HTTPS routing config
 ├── php/
 │   ├── Dockerfile                ← PHP + extensions + app
-│   └── entrypoint.sh             ← boot preflight — runs cache:warmup before the server starts
+│   └── entrypoint.sh             ← boot preflight — runs vortos:cache:warmup before the server starts
 ├── postgres/
 │   └── init/
 │       ├── 001_create_database.sql
@@ -119,7 +119,7 @@ docker/
 │   └── default.conf              ← Nginx virtual host config
 ├── php/
 │   ├── Dockerfile                ← PHP-FPM + extensions
-│   └── entrypoint.sh             ← boot preflight — runs cache:warmup before the server starts
+│   └── entrypoint.sh             ← boot preflight — runs vortos:cache:warmup before the server starts
 ├── postgres/
 │   └── init/
 │       ├── 001_create_database.sql
@@ -165,7 +165,7 @@ The generated `.env` contains agnostic Vortos variables such as `VORTOS_WRITE_DB
 
 ## Boot Preflight
 
-Every published Dockerfile includes a custom `entrypoint.sh` that runs `php bin/console cache:warmup` before the server or worker process starts.
+Every published Dockerfile includes a custom `entrypoint.sh` that runs `php bin/console vortos:cache:warmup` before the server or worker process starts.
 
 If the Symfony container fails to compile — bad DI config, a broken compiler pass, a misconfigured `#[OverrideImpl]` or `#[AsDecorator]` attribute — the error is printed directly to the terminal during `docker compose up` and the container exits cleanly with code 1. No `docker logs` required.
 
@@ -206,12 +206,21 @@ See [Workers](/docs/workers) for supervisor management, package-discovered worke
 
 ## Production
 
-The `docker-compose.prod.yaml` extends the base compose file with production-specific overrides — resource limits, restart policies, no volume mounts for source code.
+For the FrankenPHP runtime `docker-compose.prod.yaml` is the **durable baseline** of the box — it brings up infrastructure plus the edge and the deploy's Docker gateway, and it deliberately does **not** run the application:
+
+- **`edge`** — a standalone Caddy that owns ports 80/443 and reverse-proxies to the active blue/green color. The [deploy](/docs/deploy) repoints its upstream at cutover through the admin API.
+- **`docker-socket-proxy`** — a least-privilege Docker API (a narrow endpoint allowlist) the on-box deploy talks to. The raw `/var/run/docker.sock` is mounted **only** here, read-only, and never into the application image.
+- **infrastructure** — `write_db` / `read_db` / `read_pg` / `redis` / `kafka`, each carrying its `POSTGRES_*` / `MONGO_INITDB_*` `environment:` mappings (sourced from the agnostic `VORTOS_*` values in `.env.prod`) so the images initialise correctly.
+
+The application itself runs as **internal-only blue/green colors** (`app-blue` / `app-green`, project `vortos-app-<color>`) that the deploy creates and cuts over — they publish no host ports and are not part of this file. Publishing 80/443 from an app service here would collide with the edge and defeat zero-downtime cutover, so the app is intentionally absent. The self-contained image (baked code + `composer install --no-dev` from the Dockerfile's `app` stage, pinned by `<repo>@<digest>`) is pulled and run by the deploy, never built on the box.
 
 ```bash
-# Production deployment
-docker compose -f docker-compose.yaml -f docker-compose.prod.yaml up -d
+# Bring up the durable baseline once (infra + edge + socket-proxy):
+docker network create vortos-net   # external, shared with the colors + edge (first-deploy provisioning also ensures it)
+docker compose -f docker-compose.prod.yaml up -d
 ```
+
+`vortos-net` is **external** to match the deploy tooling and the color projects. The PHP-FPM+Nginx runtime carries the same DB env mappings and the socket-proxy, but keeps its `nginx`+`backend` structure — the edge-router blue-green topology is FrankenPHP-specific (PHP-FPM serves FastCGI, not HTTP, so it cannot be a direct color).
 
 ## PostgreSQL Init Scripts
 

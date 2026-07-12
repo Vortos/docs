@@ -132,6 +132,13 @@ SCHEDULER_CONSUME_POLL_INTERVAL_SEC=2
 
 # scheduler:doctor C11: how old the oldest pending fire-queue row may be before it's a Fail
 SCHEDULER_CONSUME_STALL_THRESHOLD_SEC=120
+
+# Requeue an unrunnable fire (unknown/incapable command class) this many times before dead-lettering it
+SCHEDULER_FIRE_MAX_ATTEMPTS=10
+
+# Exponential backoff base and cap (seconds) between fire requeues
+SCHEDULER_FIRE_BACKOFF_BASE_SEC=2
+SCHEDULER_FIRE_BACKOFF_CAP_SEC=300
 ```
 
 ## Lease driver
@@ -201,6 +208,6 @@ Once both processes are running, verify everything is healthy:
 php vortos scheduler:doctor
 ```
 
-This runs 11 checks (C1–C11) — cron validity, name collisions, command allowlisting, lease driver reachability, migration state, 4-eyes approval coverage, misfire policy safety, catchup bounds, shard config, auto-prune config/liveness, and fire-queue consumer liveness. All checks should show `PASS`. A `FAIL` result includes a remediation hint. See [Running](/docs/scheduler/running#scheduler-doctor) for the full check reference.
+This runs 12 checks (C1–C12) — cron validity, name collisions, command allowlisting, lease driver reachability, migration state, 4-eyes approval coverage, misfire policy safety, catchup bounds, shard config, auto-prune config/liveness, fire-queue consumer liveness, and fire-queue dead-letters. All checks should show `PASS`. A `FAIL` result includes a remediation hint. See [Running](/docs/scheduler/running#scheduler-doctor) for the full check reference.
 
 If `scheduler:doctor` is green, the installation is complete.

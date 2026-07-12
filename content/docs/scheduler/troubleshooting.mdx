@@ -7,7 +7,7 @@ import { Callout } from 'fumadocs-ui/components/callout';
 
 # Troubleshooting
 
-Start with `php vortos scheduler:doctor`. It runs 11 health checks (C1–C11) and reports exactly what is wrong, with a remediation hint for each failure. Most common problems are immediately visible there.
+Start with `php vortos scheduler:doctor`. It runs 12 health checks (C1–C12) and reports exactly what is wrong, with a remediation hint for each failure. Most common problems are immediately visible there.
 
 ## Schedules "fire" but nothing ever happens
 
@@ -31,6 +31,24 @@ See [Two processes, not one](/docs/scheduler/retention#two-processes-not-one) fo
 <Callout type="warn">
 If you're upgrading an existing installation and never ran `scheduler:consume` before, check C11 will fail immediately once you upgrade — this is expected. It means the check is working, not that the upgrade broke something.
 </Callout>
+
+## A scheduled command fails with "class does not exist"
+
+If a fire targets a command class that a running consumer node doesn't have — most commonly during a
+blue/green rollout, where the idle standby color runs an older image without a newly-added command —
+the consumer does **not** hard-fail the fire. It requeues it with an exponential backoff so a capable
+node can pick it up, and only **dead-letters** it after `SCHEDULER_FIRE_MAX_ATTEMPTS` (default 10)
+requeues. The claim is capability-aware, so a stale node normally never grabs an incompatible fire in
+the first place — it leaves it (SKIP LOCKED) for a node whose image contains the class.
+
+```bash
+php vortos scheduler:doctor   # check C12 — dead-lettered fires
+```
+
+A `C12` failure means **no** consumer on the fleet could run the command after all its requeues — a
+capability gap. Deploy the command class to a consumer node (or add it to `#[SchedulableCommand]`) and
+re-enqueue; the dead-letter naming (`vortos_scheduler_fire_dead_lettered_total`, labelled by `reason`)
+tells you which command class and why (`unknown_class` vs `not_capable`).
 
 ## Schedules are not firing
 

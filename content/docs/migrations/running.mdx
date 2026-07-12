@@ -107,7 +107,7 @@ Another migration process is already running.
 
 `vortos:migrate` runs all pending migrations in a single command, regardless of their source:
 
-- **Framework module tables** come from SQL stubs published via `vortos:migrate:publish`
+- **Framework module tables** come from SQL stubs published via `vortos:migrate:publish` — the generated classes now carry a `#[DeployPhase(MigrationPhase::Expand)]` attribute (or `Contract` when the SQL is destructive), so they pass `vortos:migrate:analyze` out of the box
 - **ORM entity tables** come from diffs generated via `vortos:orm:diff`
 
 Both land in the same `migrations/` directory and are run together by `vortos:migrate`. There is no separate ORM migration runner — one command covers everything.

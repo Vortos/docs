@@ -574,14 +574,14 @@ All errors are collected before the exception is thrown — you see every miscon
 
 ## ConsoleCommandPass
 
-`ConsoleCommandPass` is added by `Runner` automatically. It discovers all services tagged `console.command` and registers them with Symfony's `Application`:
+`ConsoleCommandPass` is added by `Runner` automatically. It discovers all services tagged `console.command` and wires them into Symfony's `Application` through a **lazy `ContainerCommandLoader`** — it never eagerly instantiates every command:
 
 ```php
 // This happens automatically — you never call this directly
 $container->addCompilerPass(new ConsoleCommandPass());
 ```
 
-Any command registered as a service with `->addTag('console.command')` is available in `bin/console` — Vortos packages use this automatically via `#[AsCommand]`.
+Any command registered as a service with `->addTag('console.command')` is available in `bin/console` — Vortos packages use this automatically via `#[AsCommand]`. Because the loader is lazy, **only the invoked command is instantiated**; a sibling command whose dependency graph reaches Redis/Postgres/Kafka is never constructed. This is what lets an operator or deploy command (`vortos:release:record-manifest`, `deploy:doctor`, `deploy`) boot inside the image on a host with no infrastructure reachable. The pass still fails closed at compile time if the `Application` service is missing or private, since the loader hangs off it.
 
 ## CLI Context
 

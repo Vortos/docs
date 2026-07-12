@@ -37,10 +37,10 @@ The daemon will:
 5. Repeat
 
 The consumer will:
-1. Claim a batch of `pending` fire-queue rows (`FOR UPDATE SKIP LOCKED` on Postgres — safe to run multiple replicas; single-writer only on SQLite)
+1. Claim a batch of `pending` fire-queue rows (`FOR UPDATE SKIP LOCKED` on Postgres — safe to run multiple replicas; single-writer only on SQLite). The claim is **capability-aware**: a node only claims fires whose command class it can actually run (its `#[SchedulableCommand]` allowlist intersected with the classes loadable in its image), so a stale node during a blue/green rollout never grabs a command it lacks — it leaves it for a capable node.
 2. Hydrate each row's payload into the referenced `CommandInterface` DTO
 3. Dispatch it through `CommandBusInterface`
-4. Mark the ledger row `Completed` or `Failed` and the fire-queue row accordingly
+4. Mark the ledger row `Completed` or `Failed` and the fire-queue row accordingly. If a claimed command class turns out to be unrunnable (unknown/removed since claim), the row is **requeued** with an exponential backoff (`available_at`, bounded `attempts`) rather than failed, so a capable consumer retries; after `SCHEDULER_FIRE_MAX_ATTEMPTS` it is **dead-lettered** (surfaced by `scheduler:doctor` C12). A genuine command failure stays terminal — a poison pill is not retried.
 5. Sleep `SCHEDULER_CONSUME_POLL_INTERVAL_SEC` after an empty batch (in `--loop` mode), then repeat
 
 Both processes exit cleanly on `SIGTERM` and `SIGINT`, completing in-flight work before shutting down.
@@ -167,14 +167,14 @@ php vortos scheduler:resume --id=01900000-dead-7000-0000-000000000001
 
 ### scheduler:run-now
 
-Manually fire a schedule immediately, outside its normal trigger. The fire is recorded in the audit log as a manual fire with the actor identity of the CLI user.
+Manually fire a schedule immediately, outside its normal trigger. The fire is recorded in the audit log as a manual fire with the actor identity of the CLI user. The argument is either the schedule **name** (as shown by `scheduler:list`) or its UUID:
 
 ```bash
-php vortos scheduler:run-now prune-audit-logs
-php vortos scheduler:run-now --id=01900000-dead-7000-0000-000000000001
+php vortos scheduler:run-now prune-audit-logs --actor=alice
+php vortos scheduler:run-now 01900000-dead-7000-0000-000000000001 --actor=alice
 ```
 
-This is useful for testing a new schedule without waiting for its next scheduled time, or for re-running a failed job manually.
+A name that matches more than one schedule (across tenants) is rejected with the candidate UUIDs — disambiguate with `--tenant` or pass the UUID. This is useful for testing a new schedule without waiting for its next scheduled time, or for re-running a failed job manually.
 
 ### scheduler:approve
 
@@ -234,6 +234,7 @@ Checks performed:
 | `C9` | Shard count is valid and a probe lease succeeds for each shard |
 | `C10` | Auto-prune config + liveness — see [Retention](/docs/scheduler/retention#doctor-checks) |
 | `C11` | Fire-queue consumer liveness — catches a dead `scheduler:consume` process |
+| `C12` | Fire-queue dead-letters — a fire no consumer could run (a capability gap: the command class was never deployed to any consumer node) |
 
 Exit code is 0 if all non-SKIP checks pass, 1 if any FAIL. This makes it suitable for use in CI and deploy preflight scripts.
 

@@ -60,12 +60,49 @@ return [
 
     'image_repository'  => 'ghcr.io/acme/app',
     'registry_provider' => 'ghcr',
+
+    // Trigger + deploy-gate branch (defaults to 'main')
+    'deployment_branch' => 'main',
+
+    // Deploy-on-target coordinates (where the image runs on the VPS)
+    'remote_deploy_dir' => '/opt/vortos',
+    'app_network'       => 'vortos-net',
+
+    // Runtime files the cutover compose (run inside the one-shot) needs mounted:
+    'runtime_env_files'       => ['/opt/vortos/.env.prod'],  // must match config/deploy.php envFiles
+    'runtime_file_secret_dirs' => [],                        // tmpfs dirs for file-shaped secrets (G8)
+
+    // Setup steps injected into EVERY container-booting job (test, static-analysis,
+    // agnosticism) — e.g. provide an env file so the DI container can compile %env()% refs
+    'bootstrap_steps' => [
+        ['name' => 'Prepare env', 'run' => 'cp .env.example .env'],
+    ],
+
+    // Turn off quality stages an app doesn't have (both default true)
+    'emit_static_analysis' => true,
+    'emit_agnosticism'     => true,
 ];
 ```
 
 <Callout type="info" title="Config wins over env">
 Scalars can also be set via env (`PIPELINE_WORKFLOW_FILENAME`, `PIPELINE_TEST_COMMAND`, `PIPELINE_IMAGE_REPOSITORY`, …) for CI overrides. Structured settings (service containers, test steps) come from `config/pipeline.php`, which takes precedence. Service containers render as GitHub Actions `services:` on the test job; `test_steps` run after `composer install` and before the test command.
 </Callout>
+
+### Quality-stage modes
+
+A quality stage (static analysis, agnosticism lint) is declarative — beyond on/off it has three behaviours, set on the builder form of `config/pipeline.php`:
+
+```php
+use Vortos\Pipeline\Definition\QualityMode;
+
+return static fn ($pipeline) => $pipeline
+    ->staticAnalysisMode(QualityMode::Warn)   // run if the tool is installed; surface issues as
+                                              // GitHub warnings; never fail the build; skip cleanly
+                                              // if the tool is absent
+    ->agnosticismMode(QualityMode::Enforce);  // default: run it and fail the build on issues
+```
+
+`QualityMode::Off` omits the stage entirely (equivalent to `emit_* => false`), and a job that would have depended on it drops the dependency so the workflow still runs. Use `Warn` while an app is adopting a tool it doesn't have installed yet, rather than shipping a red pipeline.
 
 ## Pinned actions — no floating tags
 
@@ -89,7 +126,7 @@ final readonly class PinnedAction
 
 ```yaml
 # generated output — the SHA is what actually runs; the comment is for humans
-- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+- uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 ```
 
 A tag like `@v4` can be force-moved by the action's maintainer (or an attacker who compromises their account) to point at different code without you ever seeing a diff. A pinned SHA cannot change without you noticing — `pipeline:verify` would immediately flag it.
@@ -122,6 +159,16 @@ fi
 ```
 
 This closes a specific failure mode: a buildx configuration mistake that silently produces an amd64 image tagged as the arm64 variant. Without this check, that image runs (badly, or not at all) only once it's pulled onto real ARM64 hardware — by which point you're debugging in production. With it, the build fails in CI, immediately, with the exact mismatch named.
+
+## Reproducible base image
+
+If `PipelineDefinition::baseImageDigest` is set, it's passed to the build as the `BASE_IMAGE_DIGEST`
+build-arg verbatim. If it's left null, the pipeline no longer just warns — it emits a **Resolve base
+image digest** step that reads the final `FROM` from your Dockerfile, resolves its current digest with
+`docker buildx imagetools inspect`, and exports `BASE_IMAGE_DIGEST` into the build environment, so the
+build is pinned to an immutable digest without you hand-maintaining a `sha256:` in config. The step is
+non-fatal: if the base image can't be resolved (offline, no resolvable `FROM`), it emits a `::warning::`
+and the build proceeds unpinned. An explicit `baseImageDigest` always wins.
 
 ## Multi-registry support
 
@@ -171,11 +218,19 @@ permissions:
 
 The workflow exchanges a short-lived OIDC token for registry access at build time — there's no `REGISTRY_PASSWORD` secret sitting in the repository's settings for anyone (or any compromised dependency with access to secrets) to exfiltrate. This is the same zero-standing-secrets principle [Deploy's credential providers](/docs/deploy/credentials) apply to deploy-time access, applied to the build pipeline itself.
 
+<Callout type="info" title="The OIDC default derives from your deploy posture">
+When you don't set `oidc` explicitly, it defaults from the deploy credential posture — `posture: DeployPosture::SshCaOidc` (or `deploy_posture: 'ssh-ca-oidc'` / `PIPELINE_DEPLOY_POSTURE`) is the only posture that turns keyless OIDC on. The `ssh-key` (age-KEK deploy-in-image) and `pull-agent` postures default to `oidc: false`, and an unknown/custom credential also defaults off. Keep `posture` aligned with your [`config/deploy.php`](/docs/deploy) `credential`. This prevents the footgun where merely setting an `imageRepository` used to emit a keyless deploy job that an `ssh-key` deploy could never satisfy. An explicit `oidc()` always wins.
+</Callout>
+
 ## The generated deploy job
 
-When a build stage is emitted, the deploy job is **deploy-in-image**: it runs [`vortos:release:record-manifest`](/docs/release#recording-a-build) → `deploy:doctor` → `deploy` via `docker run <repo>@<digest> php bin/console …`, so the application's own config and keys are present by construction — no PHP, Composer, or key files on the runner. The deploy step requests `id-token: write` only when `oidc: true`.
+When a build stage is emitted, the deploy job is **deploy-on-target**: the runner opens SSH to the VPS and runs [`vortos:deploy:provision`](/docs/deploy) → [`vortos:release:record-manifest`](/docs/release#recording-a-build) → `deploy:doctor` → `deploy` **inside the pulled image, on the VPS**, attached to the app's Docker network (`app_network`). Provisioning runs **first** so its `vortos:migrate` step creates the release-ledger schema before `record-manifest` writes to it — on a fresh production database the reverse order died with `relation … does not exist`. Two problems dissolve at once: the control-plane commands reach the production release-ledger DB by construction (it is a service on that network), and the arm64-native image runs on the arm64 host — the runner only runs an ssh client and never `docker run`s the image, so there is no runner/image architecture mismatch. The one-shots reach Docker only through the box's [`docker-socket-proxy`](/docs/docker#production) (`DOCKER_HOST`), never a raw socket. The deploy job runs on `ubuntu-latest` and requests `id-token: write` only when `oidc: true`.
 
-The generated secrets follow your credential posture. On the OIDC path the deploy job references **no** standing secret (only the built-in `GITHUB_TOKEN`); an architecture test fails the build if anything else leaks in. On the [`ssh-key`](/docs/deploy/credentials#ssh-key) path (`oidc: false`) the job exposes exactly one secret — the age KEK `VORTOS_AGE_IDENTITY` — and mounts your committed, age-encrypted secrets store into the container. Nothing else.
+Because the cutover runs `docker compose up` for the color **from inside** the one-shot, the generated `docker run` also bind-mounts each `runtime_env_files` path read-only at its absolute path — the compose it generates references those as `env_file:`, so they must exist inside the container. When [file-shaped secrets](/docs/deploy#file-shaped-secrets) are declared (`runtime_file_secret_dirs`), the job creates the tmpfs dirs, mounts them, and runs `vortos:deploy:materialize-file-secrets` just before cutover.
+
+The generated secrets follow your credential posture. On the OIDC path the deploy job references **no** standing secret other than the built-in `GITHUB_TOKEN` (used for the VPS registry pull); the SSH credential is a short-lived certificate federated from the runner's id-token against a CA you configure via non-secret `vars.*` — an architecture test fails the build if any other secret leaks in. On the [`ssh-key`](/docs/deploy/credentials#ssh-key) path (`oidc: false`) the runner authenticates with `secrets.VORTOS_DEPLOY_SSH_KEY` and forwards the age KEK `VORTOS_AGE_IDENTITY` over the encrypted channel; the age-encrypted store is [delivered](/docs/deploy) to the deploy dir (mode `0640`) and mounted read-only into the container, which is granted the store's group via `--group-add` so the image's runtime user can read the ciphertext. Connection coordinates (`vars.VORTOS_DEPLOY_HOST` / `_USER` / `_PORT`) and `vars.VORTOS_DEPLOY_KNOWN_HOSTS` are non-secret.
+
+**Registry authentication on the box is provider-driven.** Before pulling, the remote script emits a real `docker login` for the configured `registry_provider` — GHCR (via `GITHUB_TOKEN`), Docker Hub (via `secrets.DOCKER_USERNAME` / `secrets.DOCKER_TOKEN`), or GCP Artifact Registry — so a private image is never pulled unauthenticated.
 
 ## Permissions are explicit and minimal
 
@@ -207,9 +262,14 @@ php bin/console pipeline:generate --emitter=github --force
 
 # detect drift between the model and what's actually committed
 php bin/console pipeline:verify --emitter=github
+
+# verify every pinned action SHA exists upstream AND runs on a supported runtime (fail-closed; needs network)
+php bin/console pipeline:actions:verify --json
 ```
 
 `pipeline:verify` regenerates the workflow in memory and diffs it against the committed file — run it in CI on every PR so a manually edited workflow file is caught the same run it's introduced, not discovered weeks later when the build matrix and the model have drifted apart.
+
+`pipeline:actions:verify` resolves each pinned action SHA against the GitHub API and fails closed if any pin no longer exists — the check that catches a stale or wrong pin before it breaks a run. It also reads each action's `runs.using` runtime and fails closed if any pin runs on a runtime GitHub has **removed** (`node16`/`node12`); a merely **deprecated** runtime (`node20`) is reported as an advisory rather than a failure (for actions whose latest major is still `node20` with no `node24` release). The shipped pins all run on `node24`. It is network-dependent, so wire it into CI (it honours `GITHUB_TOKEN`); an offline structural check runs in the package's own test suite regardless.
 
 ## Emitters
 
