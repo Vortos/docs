@@ -1,0 +1,44 @@
+---
+title: Audit
+description: One append-only, hash-chained, per-tenant audit spine for the whole platform — controlled vocabulary, async ingestion, HMAC-signed tamper-evidence, RLS isolation, search, retention, and a signed export.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Audit
+
+`vortos/vortos-audit` is the Vortos audit spine: **one** append-only, hash-chained event store that every part of an application writes to, instead of each feature growing its own audit table. Auth logins, org membership changes, platform-operator actions, payments, domain events — all of it lands in a single `audit_events` ledger, queryable and verifiable from one place.
+
+The companion `vortos/vortos-audit-admin` package adds the HTTP console API (platform + org read / verify / signed-export endpoints) so apps don't hand-write audit controllers.
+
+## Why one spine
+
+Hand-rolled audit tables drift: three features end up with three shapes, three retention policies, three "is this tamper-evident?" answers, and no way to ask "show me everything user X did in July" across them. The spine collapses that into a single model:
+
+- **One record shape** — `AuditEvent` (actor, action, target, sensitivity, outcome, source, context, occurred_at) with a recursive `onBehalfOf` impersonation chain.
+- **Per-scope / per-tenant hash chains** — one chain for platform-operator events, one per tenant. Each record is content-hash-linked to the previous and HMAC-signed with an off-host key, so altering history is detectable, not merely disallowed.
+- **One controlled vocabulary** — actions are backed-enum keys registered through a provider; each carries a default sensitivity and scope.
+
+## What it does
+
+- **Async ingestion.** `record()` enqueues onto Kafka (keyed by chain, so a chain stays ordered on one partition); a consumer worker appends under a per-chain lock. The request path never blocks on the chain write. Ingestion is idempotent (Redis fast-path + the DB primary key), so at-least-once redelivery never duplicates or loses a record.
+- **Rich query.** Keyset pagination, action-prefix namespaces (`payment.`), free-text search (pluggable — Postgres full-text by default), and facet counts by action / sensitivity / outcome for a filter rail. Named, scope-bound **saved views**.
+- **Tenant isolation.** The query layer scopes every read; Postgres **row-level security** is a DB-enforced backstop on top.
+- **Retention + cold archive.** A scheduled sweep archives an aged, already-verified prefix to object storage, advances a per-chain checkpoint, then purges — so the remainder still verifies from the checkpoint.
+- **Signed export.** NDJSON plus a signed manifest (count, range, content SHA-256, HMAC) for SOC 2 / ISO evidence. Export is 2FA-gated.
+
+<Callout type="warn">
+Turning on async (`->async(true)`) requires the app to **declare a `vortos.audit` consumer** (`#[MessagingConfig]`) **and run a `vortos:consume vortos.audit` worker**. Without the worker, dispatched events sit on the topic and never land. See [Installation](/docs/audit/installation).
+</Callout>
+
+## Design posture
+
+Postgres-first, DB-agnostic by contract. The domain model, integrity (hash chain + HMAC), query, and search layers are pure interfaces — swap the store implementation freely. The per-chain append lock is a strategy: a `pg_advisory_xact_lock` on Postgres, a portable `SELECT … FOR UPDATE` row lock elsewhere. Full-text search sits behind a port; RLS is a toggle that no-ops off Postgres.
+
+## Where to go next
+
+- [Installation](/docs/audit/installation) — the two packages, `config/audit.php`, the async worker, and the Postgres extras installer.
+- [Configuration](/docs/audit/configuration) — every knob on the fluent `VortosAuditConfig`.
+- [Querying](/docs/audit/querying) — search, facets, saved views, and the console HTTP API.
+- [Security](/docs/audit/security) — HMAC signing, RLS, append-only guarantees, and the 2FA export gate.
+- [Retention](/docs/audit/retention) — the archive-then-purge sweep and cold storage.

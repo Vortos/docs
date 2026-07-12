@@ -1,0 +1,54 @@
+---
+title: Configuration
+description: Every knob on the fluent VortosAuditConfig, loaded from config/audit.php as a closure.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Configuration
+
+`config/audit.php` returns a closure taking `VortosAuditConfig`. A base file plus an optional `config/{env}/audit.php` (loaded after, so it overrides) is the whole story — every setting has a sensible default, so no config file is required for basic usage.
+
+<Callout type="warn">
+The HMAC signing key is referenced **by env-var name only** (`->hmacKeyFromSecret('VORTOS_AUDIT_HMAC_KEY')`). The secret value is resolved at container-build time from that env var and never stored in config — keep it in your sealed environment.
+</Callout>
+
+## Methods
+
+| Method | Default | What it does |
+|---|---|---|
+| `->strict(bool)` | `true` | Reject unknown actions instead of recording them at Normal. Set `false` for fail-open. |
+| `->async(bool)` | `false` | Enqueue records onto the bus instead of writing synchronously. Requires a declared consumer + running worker. |
+| `->consumer(string)` | `'vortos.audit'` | Logical consumer/topic name the async pipeline uses; must match your `#[MessagingConfig]`. |
+| `->failureMode(FailureMode)` | `Block` | On enqueue failure: `Block` (rethrow — compliance) or `Drop` (log + continue — availability). |
+| `->hmacKeyFromSecret(string)` | `VORTOS_AUDIT_HMAC_KEY` | Name of the env var holding the off-host signing key. |
+| `->idempotencyTtl(string\|int)` | `604800` (7d) | TTL for the ingestion idempotency key. Accepts `'48 hours'` or bare seconds. |
+| `->redisDsn(string)` | env / `''` | Redis DSN for the cross-process idempotency guard; empty → process-local. |
+| `->retention(platform:, tenant:)` | `730` / `365` | Default retention windows in days. `0` = never purge. |
+| `->retentionOverride(tenantId, days)` | — | Per-tenant window override (`0` = legal hold). |
+| `->coldArchive(bucket:, prefix:)` | `''` / `audit-archive` | Object-store cold-archive target for aged records. |
+| `->search(AuditSearchDriver)` | `PostgresFts` | `PostgresFts` (tsvector/GIN), `None` (portable LIKE), or `External` (app supplies the index). |
+| `->rowLevelSecurity(bool)` | `false` | Enable Postgres RLS tenant isolation + the per-request GUC middleware. No-op off Postgres. |
+| `->authEvents(unify:, scopeToTenantWhenKnown:)` | `false` / `true` | Fold auth/security events into the store; scope to the tenant when resolvable, else platform. |
+
+## Example
+
+```php
+use Vortos\Audit\DependencyInjection\VortosAuditConfig;
+use Vortos\Audit\Enum\AuditSearchDriver;
+use Vortos\Audit\Enum\FailureMode;
+
+return static function (VortosAuditConfig $config): void {
+    $config
+        ->strict(false)                 // fail-open vocabulary
+        ->async(true)
+        ->failureMode(FailureMode::Drop) // never take the request path down over a broker hiccup
+        ->hmacKeyFromSecret('VORTOS_AUDIT_HMAC_KEY')
+        ->authEvents(unify: true)
+        ->rowLevelSecurity(true)
+        ->search(AuditSearchDriver::PostgresFts)
+        ->retention(platform: 730, tenant: 365)
+        ->retentionOverride('org-under-legal-hold', 0)
+        ->coldArchive(bucket: 'acme-audit-archive', prefix: 'audit-archive');
+};
+```

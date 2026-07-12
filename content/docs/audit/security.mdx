@@ -1,0 +1,47 @@
+---
+title: Security
+description: HMAC-signed hash chains, append-only guarantees, Postgres RLS tenant isolation, least-privilege permissions with a 2FA export gate, and impersonation capture.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+# Security
+
+## Signed, tamper-evident chains
+
+Every record is content-hash-linked to the previous one **and** HMAC-signed with an off-host key (`->hmacKeyFromSecret('VORTOS_AUDIT_HMAC_KEY')`, value only in the sealed environment). `AuditChainVerifier` walks a chain and reports the first break — a mutated row, a gap, or a forged signature — with the exact sequence. This is cryptographic tamper-evidence, not DB triggers: it holds even against someone with direct table access, as long as they don't have the signing key.
+
+<Callout type="warn">
+With no HMAC key the chain is content-hashed but **unsigned** — detectable against casual edits, but an attacker who can recompute hashes could re-chain. `vortos:audit:doctor` warns until a key is set. Always set one in production.
+</Callout>
+
+## Append-only
+
+No code path issues `UPDATE`/`DELETE` on `audit_events` except the retention sweeper's archive-then-purge, which drops a contiguous, already-archived prefix and advances a checkpoint so the remainder still verifies. No API can edit history.
+
+## Tenant isolation (defense in depth)
+
+Two independent layers:
+
+1. **Query layer** — `.own` endpoints force `tenantId` from `TenantContext`; a tenant can never widen scope.
+2. **Postgres RLS** — a DB-enforced backstop. `vortos:audit:pg:install` enables + forces row-level security with a policy keyed on the `app.current_tenant` GUC. `AuditTenantRlsMiddleware` sets that GUC per request from `TenantContext` (cleared for platform/system requests), rewritten each request so a pooled or worker-mode connection never inherits a previous request's scope. The policy restricts **only when the GUC is set**, so the async write path and platform reads stay unrestricted.
+
+<Callout type="warn">
+Because the policy hides platform-scoped rows (`tenant_id IS NULL`) from a tenant-scoped session, an endpoint that returns the caller's **own cross-scope** data — e.g. their platform-scoped auth events — must **clear** the GUC for that query (`SELECT set_config('app.current_tenant', '', false)`). The actor/owner filter already confines the result to the caller, so there's no leak.
+</Callout>
+
+## Least privilege + 2FA on export
+
+`audit.read` / `audit.export` / `audit.verify` / `audit.admin` are split across `.own` and `.any`. `.any` and verify are platform-role only. Export is data-exfiltration-sensitive, so the export endpoints carry `#[Requires2FA]` — a caller without a 2FA-verified (step-up) session is blocked. No wildcard grants.
+
+## No secrets in the trail
+
+The HMAC key, DB creds, and DSNs are referenced by name only. The `context` blob must never carry secrets or full entity dumps — keep it a small structured detail object. `AuditSource` (ip / user-agent / session / request-id / device) is fine.
+
+## Impersonation captured
+
+Any on-behalf-of / support session records the full `onBehalfOf` actor chain on the `AuditActor`, surfaced recursively in the console as an "impersonations" lens.
+
+## Export integrity
+
+Exports carry a signed manifest (record count, time range, content SHA-256, HMAC). Verifying the manifest proves the body wasn't altered; tampering the NDJSON invalidates it.
